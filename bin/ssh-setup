@@ -6,7 +6,7 @@
 # User-invoked per host; re-running is a fast no-op when nothing changed.
 #
 # Remote changes (all under $HOME):
-#   ~/.local/bin/{yazi,ya,micro,glow}
+#   ~/.local/bin/{yazi,ya,micro,glow,glow-cached}  (glow-cached: yazi md previewer)
 #   ~/.config/yazi/            (local config; mdedit opener stripped)
 #   ~/.config/micro/settings.json
 #   ~/.claude/statusline.sh    (only this from ~/.claude; nothing else is copied)
@@ -67,7 +67,7 @@ ERRF="$(mktemp "${TMPDIR:-/tmp}/ssh-setup-err.XXXXXX")"
 # --- 2. probe the remote (one round trip) ----------------------------------
 probe="$(rsh 'uname -sm
 printf "stamp=%s\n" "$(cat "$HOME/.local/share/ssh-setup/stamp" 2>/dev/null || echo none)"
-for b in yazi ya micro glow jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
+for b in yazi ya micro glow glow-cached jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
 [ -x "$HOME/.claude/statusline.sh" ] || echo missing=statusline.sh
 grep -qF "\"statusLine\"" "$HOME/.claude/settings.json" 2>/dev/null || echo missing=statusLine
 # a usable jq outside ~/.local/bin (join/map need jq >= 1.5)
@@ -180,6 +180,10 @@ stage_configs() {
 	mkdir -p "$STAGE/.claude"
 	cp "$HOME/.claude/statusline.sh" "$STAGE/.claude/statusline.sh"
 	chmod 755 "$STAGE/.claude/statusline.sh"
+	# glow wrapper that yazi.toml's *.md previewer runs (caches rendered output)
+	[ -f "$HOME/.local/bin/glow-cached" ] || die "no local ~/.local/bin/glow-cached"
+	cp "$HOME/.local/bin/glow-cached" "$STAGE/.local/bin/glow-cached"
+	chmod 755 "$STAGE/.local/bin/glow-cached"
 	find "$STAGE" -name .DS_Store -delete
 	chmod -R u+w "$STAGE"
 }
@@ -209,7 +213,7 @@ STAMP="$(
 	{
 		printf 'format=%s arch=%s yazi=%s micro=%s glow=%s ship_jq=%s\n' "$FORMAT" "$ARCH" "$yazi_v" "$micro_v" "$glow_v" "$SHIP_JQ"
 		printf '%s\n' "$BASHRC_BLOCK" "$STATUSLINE_JSON"
-		(cd "$STAGE" && find .config .claude -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
+		(cd "$STAGE" && find .config .claude .local/bin/glow-cached -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
 	} | shasum -a 256 | awk '{ print $1 }'
 )"
 
@@ -217,7 +221,7 @@ summary_tail() {
 	echo "  pdftoppm on $HOST: $pdftoppm$([ "$pdftoppm" = no ] && echo ' (PDF previews unavailable; install poppler-utils to enable)')"
 	cat <<EOF
   undo on $HOST:
-    rm -f ~/.local/bin/{yazi,ya,micro,glow} ~/.config/micro/settings.json
+    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached} ~/.config/micro/settings.json
     rm -rf ~/.config/yazi ~/.local/share/ssh-setup
     sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc
     rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
@@ -319,7 +323,7 @@ if [ ! -f .local/share/ssh-setup/stamp ]; then
 	for d in .config/yazi .config/micro; do
 		if [ -e "$d" ] && [ ! -e "$d.bak-ssh-setup" ]; then cp -a "$d" "$d.bak-ssh-setup"; echo "backup: ~/$d.bak-ssh-setup"; fi
 	done
-	for b in yazi ya micro glow; do
+	for b in yazi ya micro glow glow-cached; do
 		f=".local/bin/$b"
 		if [ -e "$f" ] && [ ! -e "$f.bak-ssh-setup" ]; then cp -a "$f" "$f.bak-ssh-setup"; echo "backup: ~/$f.bak-ssh-setup"; fi
 	done
@@ -335,7 +339,7 @@ fi
 mkdir -p .local/bin .config
 [ -d .claude ] || mkdir -m 700 .claude
 tar -xf - -C "$HOME"
-chmod 755 .claude/statusline.sh
+chmod 755 .claude/statusline.sh .local/bin/glow-cached
 # merge only the statusLine key into ~/.claude/settings.json
 S=.claude/settings.json SL="$(cat .local/share/ssh-setup/statusline.json)"
 [ -L "$S" ] && S="$(readlink -f "$S")"   # edit a dotfiles-symlinked target in place
