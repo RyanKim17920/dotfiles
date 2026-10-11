@@ -1,0 +1,62 @@
+#!/bin/sh
+# mdview <file>
+#
+# Full-screen Markdown reader: render with glow (via glow-cached) at the
+# terminal width and page it with `less -R`, which passes colour escapes
+# through while still counting line widths correctly. (`glow -p` falls back to
+# `less -r` when $PAGER is unset, e.g. in GUI-spawned Yazi panes; raw mode
+# miscounts ANSI sequences and corrupts the screen while scrolling.)
+#
+# Used by Yazi's `R` binding. q returns.
+set -u
+
+# Yazi/WezTerm may start us with a minimal PATH.
+PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+if [ $# -ne 1 ]; then
+	echo "usage: mdview <file>" >&2
+	exit 2
+fi
+file=$1
+
+# Terminal width from the controlling tty ("rows cols"), minus a 2-col margin.
+cols=$(stty size 2>/dev/null </dev/tty) && cols=${cols#* } || cols=
+case $cols in
+'' | *[!0-9]*) cols=80 ;;
+esac
+width=$((cols - 2))
+[ "$width" -ge 20 ] || width=20
+
+# Render before paging so a failure is reported instead of an empty pager.
+# The trailing "." keeps command substitution from eating final blank lines.
+doc=$(glow-cached "$width" "$file" </dev/null && echo .) || {
+	echo "mdview: could not render $file" >&2
+	printf 'Press Enter to return.' >&2
+	read -r _ 2>/dev/null </dev/tty
+	exit 1
+}
+doc=${doc%.}
+
+# Not a terminal (piped/redirected): just print.
+if [ ! -t 1 ]; then
+	printf '%s' "$doc"
+	exit 0
+fi
+
+# Same flags as mdedit's preview: short prompt (percent / END), no quit at
+# EOF, alternate screen, blank lines past EOF, wheel scrolling, no history.
+# --mouse/--wheel-lines need less >= 550. Probing with `less --mouse -V` is
+# useless (less exits 0 even on unknown options), so compare the version.
+set -- -R -+F -+X -~ -Ps'?e(END):%pB\%.' -Pm'?e(END):%pB\%.'
+less_ver=$(less -V 2>/dev/null | sed -n '1s/^less \([0-9][0-9]*\).*/\1/p')
+if [ -n "$less_ver" ] && [ "$less_ver" -ge 550 ]; then
+	set -- "$@" --mouse --wheel-lines=3
+fi
+
+# Page a file, not a pipe: less needs the size for the percent prompt.
+tmpdir=${TMPDIR:-/tmp}
+tmp=$(mktemp "${tmpdir%/}/mdview.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 130' HUP INT TERM
+printf '%s' "$doc" >"$tmp"
+LESSHISTFILE=- less "$@" -- "$tmp"

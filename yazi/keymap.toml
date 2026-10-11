@@ -5,5 +5,5 @@ desc = "Maximize or restore the preview pane"
 
 [[mgr.prepend_keymap]]
 on   = "R"
-run  = "shell --block -- glow -p %s"
+run  = 'shell --block -- "$HOME/.local/bin/mdview" %s'
 desc = "Read markdown rendered, full screen (q to return)"

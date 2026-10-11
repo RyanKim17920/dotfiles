@@ -15,7 +15,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 | `yazi/` | `~/.config/yazi/` |
 | `yazi-sidebar/yazi.toml` | `~/.config/yazi-sidebar/yazi.toml` |
 | `micro/settings.json` | `~/.config/micro/settings.json` |
-| `bin/` | `~/.local/bin/` (`mdedit`, `yazi-open`, `clipimg-push`, `ssh-setup`) |
+| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`) |
 | `claude/statusline.sh` | `~/.claude/statusline.sh` (Claude Code status line) |
 | `zsh/snippets.zsh` | source it from `~/.zshrc` |
 
@@ -66,7 +66,7 @@ Host *
 | Key | Action |
 | --- | --- |
 | T | Maximize / restore the preview pane |
-| R | Read the hovered Markdown file full screen with glow (q returns) |
+| R | `mdview`: read the hovered Markdown file full screen (glow, paged with `less -R`; q returns) |
 | Enter on `.md` | `mdedit`: micro on the left, live glow preview on the right |
 
 Markdown previews in Yazi are rendered with glow (piper plugin).
