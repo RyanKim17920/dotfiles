@@ -69,6 +69,12 @@ Host *
 | R | `mdview`: read the hovered Markdown file full screen (glow, paged with `less -R`; q returns) |
 | Enter on `.md` | `mdedit`: micro on the left, live glow preview on the right |
 
+Side-by-side Markdown also works over SSH in WezTerm: on the remote host,
+`mdedit` sets a WezTerm user var and `~/.wezterm.lua` opens the preview
+(`ssh -t <host> mdpreview <file>`) next to the ssh pane, closing it when micro
+exits. Inside tmux this needs `set -g allow-passthrough on`; in other
+terminals it is plain micro.
+
 Markdown previews in Yazi are rendered with glow (piper plugin).
 
 ## Dependencies

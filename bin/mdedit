@@ -5,7 +5,15 @@
 #
 # Inside WezTerm ($WEZTERM_PANE set): splits the current pane to the RIGHT (50%)
 # with a preview loop for the first file, runs micro in the current pane, and
-# closes the preview pane when micro exits. Outside WezTerm: plain micro.
+# closes the preview pane when micro exits.
+#
+# Anywhere else (e.g. on a remote host over ssh, where there is no local
+# `wezterm cli`): sets the WezTerm user var `mdedit_preview` to "NONCE|PATH"
+# (OSC 1337 SetUserVar), runs micro, then sets `mdedit_close` to NONCE. The
+# `user-var-changed` handler in ~/.wezterm.lua on the Mac sees this on a local
+# pane running ssh and opens `ssh -t HOST mdpreview PATH` to the right, then
+# closes it again. Inside tmux this needs `set -g allow-passthrough on`.
+# Terminals without user vars ignore the OSC, leaving plain micro.
 #
 # The preview side (internal mode: mdedit --preview EDITOR_PID FILE) renders the
 # file with glow into a temp file and pages it with `less` (scrollable, mouse
@@ -84,8 +92,30 @@ fi
 
 micro=$(command -v micro) || { echo "mdedit: micro not found" >&2; exit 1; }
 
-if [ -z "${WEZTERM_PANE:-}" ] || ! command -v wezterm >/dev/null 2>&1; then
-  exec "$micro" "$@"
+# OSC 1337 SetUserVar NAME=VALUE to the terminal; tmux needs it wrapped in a
+# passthrough DCS (and `set -g allow-passthrough on`).
+uservar() {
+  v=$(printf '%s' "$2" | base64 | tr -d '\n')
+  {
+    if [ -n "${TMUX:-}" ]; then
+      printf '\033Ptmux;\033\033]1337;SetUserVar=%s=%s\007\033\\' "$1" "$v"
+    else
+      printf '\033]1337;SetUserVar=%s=%s\007' "$1" "$v"
+    fi
+  } 2>/dev/null >/dev/tty
+}
+
+# No usable local WezTerm CLI (ssh session, other terminal): let the WezTerm
+# GUI on the other end open the preview. The nonce makes every open a change,
+# so the event fires even when the same file is opened twice.
+if [ -z "${WEZTERM_PANE:-}" ] || [ -n "${SSH_CONNECTION:-}" ] \
+    || ! command -v wezterm >/dev/null 2>&1; then
+  nonce=$(date +%s).$$
+  uservar mdedit_preview "$nonce|$(abspath "$1")"
+  "$micro" "$@"
+  rc=$?
+  uservar mdedit_close "$nonce"
+  exit "$rc"
 fi
 
 self=$(abspath "$(command -v -- "$0" 2>/dev/null || echo "$0")")
