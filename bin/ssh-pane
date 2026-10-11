@@ -1,0 +1,112 @@
+#!/bin/sh
+# ssh-pane: run `ssh "$@"`, and offer to reconnect when the connection drops.
+#
+#   ssh-pane [ssh options] destination [command]
+#
+# After ssh exits the terminal modes a remote program may have left on are
+# reset (mouse reporting, alternate screen, hidden cursor, keypad mode), so a
+# dropped `micro`/`less`/`yazi` session doesn't flood the pane with mouse
+# escape codes. Then:
+#   * exit status 255 (connection failed or dropped): show
+#     "[disconnected from host — Enter: reconnect · q: close]".
+#     Enter or r re-runs the identical ssh command; q, Ctrl+D or Ctrl+C exits.
+#   * any other status (you typed `exit`, the remote command finished): exit
+#     with that status right away, so a WezTerm pane closes as usual.
+# Query/control invocations (-G -O -Q -V -W) and non-terminal use are passed
+# straight to ssh.
+
+# Terminal-mode reset: mouse tracking off (X10/button/any-event/UTF-8/SGR/
+# urxvt), leave the alternate screen, show the cursor, normal cursor keys and
+# keypad.
+reset_modes() {
+	printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l\033[?1049l\033[?25h\033[?1l\033>' >/dev/tty
+}
+
+# Destination (first non-option argument) and whether this is a query/control
+# invocation. Options taking a value are from `man ssh`.
+dest=
+passthrough=
+skip_next=
+for a in "$@"; do
+	if [ -n "$skip_next" ]; then
+		skip_next=
+		continue
+	fi
+	case $a in
+	--) continue ;;
+	-?*)
+		flags=${a#-}
+		while [ -n "$flags" ]; do
+			c=${flags%"${flags#?}"}
+			flags=${flags#?}
+			case $c in
+			[GOQVW]) passthrough=1 ;;
+			esac
+			case $c in
+			[bcDEeFIiJLlmOopQRSWw])
+				[ -z "$flags" ] && skip_next=1
+				break
+				;;
+			esac
+		done
+		;;
+	*)
+		dest=$a
+		break
+		;;
+	esac
+done
+
+if [ -n "$passthrough" ] || [ -z "$dest" ] || ! [ -t 0 ] || ! { : </dev/tty; } 2>/dev/null; then
+	exec ssh "$@"
+fi
+
+saved_tty=$(stty -g </dev/tty 2>/dev/null)
+fails=0
+
+while :; do
+	interrupted=
+	trap 'interrupted=1' INT
+	start=$(date +%s)
+	ssh "$@"
+	status=$?
+	trap - INT
+	reset_modes
+	[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
+
+	if [ "$status" -ne 255 ] || [ -n "$interrupted" ]; then
+		exit "$status"
+	fi
+
+	# Repeated connection failures within a few seconds: back off a little
+	if [ $(($(date +%s) - start)) -lt 5 ]; then
+		fails=$((fails + 1))
+	else
+		fails=0
+	fi
+
+	printf '\r\n\033[2m[disconnected from %s — Enter: reconnect · q: close]\033[0m' "$dest" >/dev/tty
+
+	# Read one key, unbuffered and unechoed; Ctrl+C still raises SIGINT
+	trap '[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null; printf "\r\n" >/dev/tty; exit 130' INT
+	stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null
+	while :; do
+		key=$(dd bs=1 count=1 </dev/tty 2>/dev/null | od -An -tx1 | tr -d ' \n')
+		case $key in
+		0a | 0d | 72 | 52) break ;;         # Enter, r, R: reconnect
+		71 | 51 | 04 | '') key=quit; break ;; # q, Q, Ctrl+D, EOF: close
+		esac
+	done
+	[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
+	trap - INT
+	printf '\r\n' >/dev/tty
+	[ "$key" = quit ] && exit "$status"
+
+	if [ "$fails" -ge 2 ]; then
+		wait_s=$((fails * 2))
+		[ "$wait_s" -gt 10 ] && wait_s=10
+		printf '\033[2m[reconnect failed %d times in a row, retrying in %ds]\033[0m\r\n' "$fails" "$wait_s" >/dev/tty
+		sleep "$wait_s"
+	fi
+	printf '\033[2m[reconnecting to %s…]\033[0m\r\n' "$dest" >/dev/tty
+done
