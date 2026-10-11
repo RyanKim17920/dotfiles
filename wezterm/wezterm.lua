@@ -1,0 +1,637 @@
+-- WezTerm config: pane/split keybindings mirroring Ghostty's macOS defaults.
+local wezterm = require 'wezterm'
+local act = wezterm.action
+
+local config = wezterm.config_builder()
+
+-- Match Ghostty's `working-directory = ~/Desktop`
+config.default_cwd = wezterm.home_dir .. '/Desktop'
+
+-- Make the inactive pane visibly dimmer so the focused split is obvious
+config.inactive_pane_hsb = { saturation = 0.8, brightness = 0.7 }
+
+-- Render at the MacBook's 120Hz ProMotion rate instead of the 60fps default
+config.max_fps = 120
+
+-- Render via WebGpu (Metal) instead of the OpenGL default: measured ~40% lower
+-- memory footprint (~70-118 MB vs ~137-187 MB with 3 panes), same look
+config.front_end = 'WebGpu'
+
+local RESIZE_STEP = 5 -- cells per keypress
+
+-- File sidebar (VS Code style): CMD+E toggles a narrow Yazi pane on the left
+-- of the tab. It uses ~/.config/yazi-sidebar (single column; text files open in
+-- micro in a new pane to its right via ~/.local/bin/yazi-open).
+local SIDEBAR_CELLS = 32
+local YAZI = '/opt/homebrew/bin/yazi'
+-- GUI-launched WezTerm has a minimal PATH; yazi needs brew tools
+local YAZI_PATH = '/opt/homebrew/bin:' .. wezterm.home_dir .. '/.local/bin:'
+  .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin')
+
+-- Directory of a pane: Url object on 20240203+, string on older builds,
+-- falling back to the foreground process's cwd.
+local function pane_cwd(pane)
+  local url = pane:get_current_working_dir()
+  if type(url) == 'userdata' and url.file_path then
+    return url.file_path
+  elseif type(url) == 'string' then
+    return (url:gsub('^file://[^/]*', ''))
+  end
+  local info = pane:get_foreground_process_info()
+  return info and info.cwd or wezterm.home_dir
+end
+
+local function toggle_sidebar(window, pane)
+  local tab = pane:tab()
+  -- Sidebar pane id per tab; wezterm.GLOBAL survives config reloads
+  local key = 'sidebar_pane_for_tab_' .. tab:tab_id()
+  local sidebar_id = wezterm.GLOBAL[key]
+
+  -- Sidebar already open in this tab: close it
+  for _, p in ipairs(tab:panes()) do
+    if p:pane_id() == sidebar_id then
+      p:activate()
+      window:perform_action(act.CloseCurrentPane { confirm = false }, p)
+      wezterm.GLOBAL[key] = nil
+      return
+    end
+  end
+
+  -- Yazi only exists on this Mac; don't try to run it inside ssh/mux domains
+  if pane:get_domain_name() ~= 'local' then
+    window:toast_notification('wezterm', 'File sidebar only works in local tabs', nil, 3000)
+    return
+  end
+
+  local cwd = pane_cwd(pane)
+  local sidebar = pane:split {
+    direction = 'Left',
+    top_level = true,
+    size = SIDEBAR_CELLS,
+    cwd = cwd,
+    -- Pass the dir explicitly: yazi trusts an inherited $PWD over the real cwd
+    args = { YAZI, cwd },
+    set_environment_variables = {
+      YAZI_SIDEBAR = '1',
+      YAZI_CONFIG_HOME = wezterm.home_dir .. '/.config/yazi-sidebar',
+      PATH = YAZI_PATH,
+    },
+  }
+  wezterm.GLOBAL[key] = sidebar:pane_id()
+end
+
+-- Clickable file paths: a single left click (no drag) on a path such as
+-- ~/.ssh/config, /Users/me/x.md, ./foo.py or ~/.wezterm.lua:42 opens a
+-- temporary Yazi pane on the right of the tab with the file hovered and the
+-- preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua), or the directory
+-- opened. q quits Yazi and closes the pane. OSC 8 file:// links (ls
+-- --hyperlink, Claude Code) are handled the same way; web URLs are untouched.
+local PEEK_SCHEME = 'yazi-open-path:'
+local PEEK_SIZE = 0.45
+
+local function is_dir(path)
+  local ok = pcall(wezterm.read_dir, path)
+  return ok
+end
+
+local function exists(path)
+  if is_dir(path) then return true end
+  local f = io.open(path, 'r')
+  if f then f:close() return true end
+  return false
+end
+
+-- Collapse `.`/`..`/empty segments of an absolute path
+local function normalize(path)
+  local parts = {}
+  for seg in path:gmatch '[^/]+' do
+    if seg == '..' then
+      table.remove(parts)
+    elseif seg ~= '.' then
+      table.insert(parts, seg)
+    end
+  end
+  return '/' .. table.concat(parts, '/')
+end
+
+local function percent_decode(s)
+  return (s:gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end))
+end
+
+-- uri -> local path text (may carry :line[:col]), or nil if not ours
+local function uri_to_path(uri)
+  if uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME then
+    return uri:sub(#PEEK_SCHEME + 1)
+  end
+  local host, path = uri:match '^file://([^/]*)(/.*)$'
+  if not path then return nil end
+  -- file://otherhost/... (e.g. ls --hyperlink inside ssh) isn't on this Mac
+  local here = wezterm.hostname()
+  if host ~= '' and host ~= 'localhost' and host ~= here
+      and host ~= here:gsub('%..*$', '') then
+    return nil
+  end
+  return percent_decode((path:gsub('[?#].*$', '')))
+end
+
+-- Existing absolute path for `text`, resolving ~ and relative paths against
+-- `cwd` and dropping a trailing :line or :line:col; nil if nothing exists.
+local function resolve_path(text, cwd)
+  local candidates = { text }
+  local stripped = text:match '^(.-):%d+:%d+$' or text:match '^(.-):%d+$'
+  if stripped and stripped ~= '' then table.insert(candidates, stripped) end
+  for _, c in ipairs(candidates) do
+    if c == '~' or c:sub(1, 2) == '~/' then
+      c = wezterm.home_dir .. c:sub(2)
+    elseif c:sub(1, 1) ~= '/' then
+      c = cwd .. '/' .. c
+    end
+    c = normalize(c)
+    if exists(c) then return c end
+  end
+  return nil
+end
+
+local function open_peek(window, pane, path)
+  local tab = pane:tab()
+  local key = 'peek_pane_for_tab_' .. tab:tab_id()
+
+  -- One peek pane per tab: replace the previous one if it's still open
+  for _, p in ipairs(tab:panes()) do
+    if p:pane_id() == wezterm.GLOBAL[key] and p:pane_id() ~= pane:pane_id() then
+      p:activate()
+      window:perform_action(act.CloseCurrentPane { confirm = false }, p)
+      pane:activate()
+      break
+    end
+  end
+
+  local dir = is_dir(path)
+  local env = { PATH = YAZI_PATH }
+  if not dir then env.YAZI_PEEK = path end
+  local peek = pane:split {
+    direction = 'Right',
+    top_level = true,
+    size = PEEK_SIZE,
+    cwd = dir and path or (path:match '^(.+)/' or '/'),
+    args = { YAZI, path },
+    set_environment_variables = env,
+  }
+  wezterm.GLOBAL[key] = peek:pane_id()
+end
+
+wezterm.on('open-uri', function(window, pane, uri)
+  local text = uri_to_path(uri)
+  if not text then return end -- web URL etc.: default opener
+  local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
+
+  local path = pane:get_domain_name() == 'local' and resolve_path(text, pane_cwd(pane))
+  if not path then
+    if custom then
+      window:toast_notification('wezterm', 'Not found locally: ' .. text, nil, 3000)
+      return false
+    end
+    return -- file:// we can't resolve: let the default opener try
+  end
+  open_peek(window, pane, path)
+  return false
+end)
+
+-- Paths start with ~/, ./, ../ or / at the start of a line or after
+-- whitespace/quote/backtick/bracket/= (so 1/2, and/or and the /a/b inside
+-- URLs never match). They stop at whitespace, quotes, backticks and brackets
+-- and never end in . , : ; ! ? so prose punctuation stays out. Group 1 is the
+-- path (with any :line[:col]).
+config.hyperlink_rules = wezterm.default_hyperlink_rules()
+table.insert(config.hyperlink_rules, {
+  regex = [=[(?:^|[\s"'`(\[{<=])((?:~|\.\.?)?/[^\s"'`()\[\]{}<>]*[^\s"'`()\[\]{}<>.,:;!?])]=],
+  format = PEEK_SCHEME .. '$1',
+  highlight = 1,
+})
+
+-- SSH-aware splits (VS Code style): splitting a local pane whose foreground
+-- process is plain `ssh` opens a fresh shell on the same host. Relies on
+-- ControlMaster in ~/.ssh/config, so the new connection is instant. The new
+-- pane runs ssh directly, so it closes when that session exits.
+
+-- ssh options that take a value (from `man ssh`)
+local SSH_OPTS_WITH_VALUE = {}
+for c in ('bcDEeFIiJLlmOopQRSWw'):gmatch '.' do SSH_OPTS_WITH_VALUE[c] = true end
+-- Of those, the ones carried over so the new connection matches
+local SSH_OPTS_KEPT = { l = true, p = true, F = true, J = true, i = true }
+
+-- argv of an ssh process -> args for a fresh `ssh` to the same destination
+-- (remote command dropped), or nil if no destination is found.
+local function ssh_split_args(argv)
+  local kept, i = {}, 2
+  while i <= #argv do
+    local a = argv[i]
+    if a == '--' then
+      i = i + 1
+      break
+    elseif a:sub(1, 1) ~= '-' or a == '-' then
+      break
+    end
+    -- Walk bundled flags like -tt or -4p2222
+    for j = 2, #a do
+      local c = a:sub(j, j)
+      if SSH_OPTS_WITH_VALUE[c] then
+        local value = a:sub(j + 1)
+        if value == '' then
+          i = i + 1
+          value = argv[i]
+        end
+        if value and SSH_OPTS_KEPT[c] then
+          table.insert(kept, '-' .. c)
+          table.insert(kept, value)
+        end
+        break
+      end
+    end
+    i = i + 1
+  end
+  local dest = argv[i]
+  if not dest then return nil end
+  local args = { 'ssh' }
+  for _, v in ipairs(kept) do table.insert(args, v) end
+  table.insert(args, dest)
+  return args
+end
+
+-- { 'ssh', <kept opts...>, dest } when the pane is a local pane whose
+-- foreground process is ssh, else nil. Shared by smart splits and image paste.
+local function pane_ssh_args(pane)
+  local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
+  local exe = info and (info.executable or ''):match '[^/]*$'
+  return info and (exe == 'ssh' or (info.argv[1] or ''):match '[^/]*$' == 'ssh')
+    and ssh_split_args(info.argv) or nil
+end
+
+local function smart_split(direction)
+  return wezterm.action_callback(function(window, pane)
+    local args = pane_ssh_args(pane)
+    if args then
+      pane:split {
+        direction = direction,
+        args = args,
+        cwd = pane_cwd(pane),
+        set_environment_variables = {
+          PATH = '/opt/homebrew/bin:' .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin'),
+        },
+      }
+    elseif direction == 'Right' then
+      window:perform_action(act.SplitHorizontal { domain = 'CurrentPaneDomain' }, pane)
+    else
+      window:perform_action(act.SplitVertical { domain = 'CurrentPaneDomain' }, pane)
+    end
+  end)
+end
+
+-- Unified copy/paste (VS Code terminal style): CMD+C, CMD+SHIFT+C,
+-- CTRL+SHIFT+C and CTRL+C all run smart_copy; the V variants run smart_paste.
+local CLIPIMG = wezterm.home_dir .. '/.local/bin/clipimg-push'
+
+-- Copy the selection (and clear it) if there is one. Otherwise CTRL+C passes
+-- through as a raw ^C so interrupt still works; CMD+C does nothing.
+local function smart_copy(passthrough)
+  return wezterm.action_callback(function(window, pane)
+    if window:get_selection_text_for_pane(pane) ~= '' then
+      window:perform_action(act.CopyTo 'ClipboardAndPrimarySelection', pane)
+      window:perform_action(act.ClearSelection, pane)
+    elseif passthrough then
+      window:perform_action(act.SendKey { key = 'c', mods = 'CTRL' }, pane)
+    end
+  end)
+end
+
+-- Paste, image-aware. `clipimg-push --check` (~0.1s, synchronous) decides:
+--  * image + local pane running ssh: Claude Code on the remote host can't read
+--    this Mac's clipboard but accepts a path, so clipimg-push uploads the image
+--    to ~/.cache/clipimg/ on that host (via the ControlMaster) in the
+--    background and types the remote path into the pane.
+--  * image + any other pane: send a raw Ctrl+V; local Claude Code reads the
+--    image from the macOS clipboard itself on that keypress.
+--  * no image: normal bracketed paste of the clipboard text.
+local smart_paste = wezterm.action_callback(function(window, pane)
+  if not wezterm.run_child_process { CLIPIMG, '--check' } then
+    window:perform_action(act.PasteFrom 'Clipboard', pane)
+    return
+  end
+  local args = pane_ssh_args(pane)
+  if args then
+    local cmd = { '/usr/bin/env', 'PATH=' .. YAZI_PATH, CLIPIMG, tostring(pane:pane_id()) }
+    for k = 2, #args do table.insert(cmd, args[k]) end -- drop leading 'ssh'
+    wezterm.background_child_process(cmd)
+  else
+    window:perform_action(act.SendKey { key = 'v', mods = 'CTRL' }, pane)
+  end
+end)
+
+-- SSH-aware new tab/window: from a local pane running ssh, open a fresh ssh
+-- to the same host (instant via ControlMaster); otherwise the default spawn.
+local function smart_spawn(new_window)
+  return wezterm.action_callback(function(window, pane)
+    local args = pane_ssh_args(pane)
+    if args then
+      local spec = {
+        args = args,
+        cwd = pane_cwd(pane),
+        set_environment_variables = {
+          PATH = '/opt/homebrew/bin:' .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin'),
+        },
+      }
+      window:perform_action(new_window and act.SpawnCommandInNewWindow(spec)
+        or act.SpawnCommandInNewTab(spec), pane)
+    else
+      window:perform_action(new_window and act.SpawnWindow or act.SpawnTab 'CurrentPaneDomain', pane)
+    end
+  end)
+end
+
+-- Layout-preserving merge. A WezTerm tab is a binary split tree, so its panes
+-- can always be divided by one full-height (vertical) or full-width
+-- (horizontal) cut into two groups. Recursing on that rebuilds the tree: the
+-- top-left pane of the tab moves over as a new tab, then each cut becomes a
+-- `split-pane --move-pane-id` of the first group's top-left pane, pulling in
+-- the second group's top-left pane at a proportional --percent.
+-- Pane records: { id, left, top, width, height } in cells (the shape of
+-- tab:panes_with_info() and `wezterm cli list --format json` geometry).
+local WEZTERM_CLI = '/opt/homebrew/bin/wezterm'
+
+-- Run `wezterm cli <args...>`; returns success, stderr
+local function cli(...)
+  local ok, _, err = wezterm.run_child_process { WEZTERM_CLI, 'cli', ... }
+  return ok, err
+end
+
+-- Top-left pane of a group
+local function anchor_of(group)
+  local a = group[1]
+  for _, p in ipairs(group) do
+    if p.top < a.top or (p.top == a.top and p.left < a.left) then a = p end
+  end
+  return a
+end
+
+local CUT_AXES = {
+  { pos = 'left', size = 'width', flag = '--right' },
+  { pos = 'top', size = 'height', flag = '--bottom' },
+}
+
+-- First full-length cut through `group`: returns first, second, flag, percent
+-- (second group's share of the span), or nil if no clean cut exists.
+local function find_cut(group)
+  for _, axis in ipairs(CUT_AXES) do
+    local lo, hi = math.huge, -math.huge
+    for _, p in ipairs(group) do
+      lo = math.min(lo, p[axis.pos])
+      hi = math.max(hi, p[axis.pos] + p[axis.size])
+    end
+    for _, cand in ipairs(group) do
+      local edge = cand[axis.pos] + cand[axis.size]
+      local first, second, clean = {}, {}, true
+      for _, p in ipairs(group) do
+        if p[axis.pos] + p[axis.size] <= edge then
+          table.insert(first, p)
+        elseif p[axis.pos] >= edge then
+          table.insert(second, p)
+        else
+          clean = false
+          break
+        end
+      end
+      if clean and #first > 0 and #second > 0 then
+        local start2 = math.huge
+        for _, p in ipairs(second) do start2 = math.min(start2, p[axis.pos]) end
+        -- WezTerm floors span * percent / 100, so round the percent up
+        local pct = math.ceil(100 * (hi - start2) / (hi - lo) - 1e-9)
+        return first, second, axis.flag, math.max(1, math.min(99, pct))
+      end
+    end
+  end
+  return nil
+end
+
+-- Split steps { target, flag, percent, move } that rebuild `group` from its
+-- anchor, appended to `steps`; false if some sub-group has no clean cut.
+local function plan_splits(group, steps)
+  if #group <= 1 then return true end
+  local first, second, flag, pct = find_cut(group)
+  if not first then return false end
+  table.insert(steps, {
+    target = anchor_of(first).id, flag = flag, percent = pct, move = anchor_of(second).id,
+  })
+  return plan_splits(first, steps) and plan_splits(second, steps)
+end
+
+-- Move one tab's panes into window `target_window` as a single new tab with the
+-- same layout. Panes that can't be placed (no clean cut, or a cli call
+-- failed) become separate tabs. Returns panes moved, whether layout was kept.
+local function merge_tab(panes, target_window)
+  local moved, pending = 0, {}
+  for _, p in ipairs(panes) do pending[p.id] = true end
+  local function to_new_tab(id)
+    pending[id] = nil
+    if cli('move-pane-to-new-tab', '--pane-id', tostring(id),
+        '--window-id', tostring(target_window)) then
+      moved = moved + 1
+      return true
+    end
+    return false
+  end
+
+  local steps = {}
+  local exact = plan_splits(panes, steps)
+  if not exact then steps = {} end
+  if to_new_tab(anchor_of(panes).id) then
+    for _, s in ipairs(steps) do
+      pending[s.move] = nil
+      if cli('split-pane', '--pane-id', tostring(s.target), s.flag,
+          '--percent', tostring(s.percent), '--move-pane-id', tostring(s.move)) then
+        moved = moved + 1
+      else
+        exact = false
+        break
+      end
+    end
+  else
+    exact = false
+  end
+  for _, p in ipairs(panes) do
+    if pending[p.id] then to_new_tab(p.id) end
+  end
+  return moved, exact
+end
+
+-- Merge every other window into this one, one new tab per source tab with its
+-- split layout kept, in window order then tab order. Emptied windows close on
+-- their own once their last pane leaves.
+local merge_windows = wezterm.action_callback(function(window, pane)
+  local cur = window:mux_window():window_id()
+  -- Capture all geometry before anything moves
+  local tabs = {}
+  for _, w in ipairs(wezterm.mux.all_windows()) do
+    if w:window_id() ~= cur then
+      for _, t in ipairs(w:tabs()) do
+        t:set_zoomed(false) -- zoom hides the other panes' real geometry
+        local panes = {}
+        for _, info in ipairs(t:panes_with_info()) do
+          table.insert(panes, {
+            id = info.pane:pane_id(), left = info.left, top = info.top,
+            width = info.width, height = info.height,
+          })
+        end
+        if #panes > 0 then table.insert(tabs, panes) end
+      end
+    end
+  end
+  local total, moved, lost = 0, 0, 0
+  for _, panes in ipairs(tabs) do
+    local n, exact = merge_tab(panes, cur)
+    total, moved = total + #panes, moved + n
+    if not exact and #panes > 1 then lost = lost + 1 end
+  end
+  local msg = string.format('Merged %d tab%s (%d pane%s)', #tabs, #tabs == 1 and '' or 's',
+    moved, moved == 1 and '' or 's')
+  if lost > 0 then msg = msg .. '; layout lost in ' .. lost .. ' (split into tabs)' end
+  if moved < total then msg = msg .. '; ' .. (total - moved) .. ' failed' end
+  window:toast_notification('wezterm', msg, nil, 4000)
+end)
+
+-- Move this pane into tab N of this window (1-based, tab bar order) as a
+-- split to the right of (flag '--right') or below ('--bottom') that tab's
+-- active pane, then switch to tab N and focus it. A single-pane source tab
+-- closes once its last pane leaves.
+local function move_to_tab(n, flag)
+  return wezterm.action_callback(function(window, pane)
+    local tabs = window:mux_window():tabs()
+    local target = tabs[n]
+    if not target then
+      window:toast_notification('wezterm', 'No tab ' .. n, nil, 2000)
+      return
+    end
+    if target:tab_id() == pane:tab():tab_id() then
+      window:toast_notification('wezterm', 'Already in tab ' .. n, nil, 2000)
+      return
+    end
+    local id = tostring(pane:pane_id())
+    local ok, err = cli('split-pane', '--pane-id', tostring(target:active_pane():pane_id()),
+      flag, '--percent', '50', '--move-pane-id', id)
+    if not ok then
+      window:toast_notification('wezterm', 'Move failed: ' .. (err or '?'), nil, 4000)
+      return
+    end
+    -- Activate the tab object, not index N-1: indices shift if the source tab closed
+    target:activate()
+    cli('activate-pane', '--pane-id', id)
+  end)
+end
+
+config.keys = {
+  -- Unified copy/paste (see smart_copy / smart_paste above)
+  { key = 'c', mods = 'CMD', action = smart_copy(false) },
+  { key = 'c', mods = 'CMD|SHIFT', action = smart_copy(false) },
+  { key = 'c', mods = 'CTRL|SHIFT', action = smart_copy(false) },
+  { key = 'c', mods = 'CTRL', action = smart_copy(true) },
+  { key = 'v', mods = 'CMD', action = smart_paste },
+  { key = 'v', mods = 'CMD|SHIFT', action = smart_paste },
+  { key = 'v', mods = 'CTRL|SHIFT', action = smart_paste },
+  { key = 'v', mods = 'CTRL', action = smart_paste },
+
+  -- Toggle the Yazi file sidebar for this tab
+  { key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle_sidebar) },
+
+  -- Splits (Ghostty: cmd+d = right, cmd+shift+d = down); ssh-aware
+  { key = 'd', mods = 'CMD', action = smart_split 'Right' },
+  { key = 'd', mods = 'CMD|SHIFT', action = smart_split 'Bottom' },
+
+  -- Close the focused pane instead of the whole tab (Ghostty: cmd+w)
+  -- Confirm with a picker so Enter (or y) closes and n/Esc cancels
+  { key = 'w', mods = 'CMD', action = act.InputSelector {
+    title = 'Close this pane?  (Enter/y = close, n/Esc = cancel)',
+    choices = { { id = 'yes', label = 'Yes, close it' }, { id = 'no', label = 'No' } },
+    alphabet = 'yn',
+    action = wezterm.action_callback(function(window, pane, id)
+      if id == 'yes' then
+        window:perform_action(act.CloseCurrentPane { confirm = false }, pane)
+      end
+    end),
+  } },
+
+  -- Cycle panes (Ghostty: cmd+[ / cmd+])
+  { key = '[', mods = 'CMD', action = act.ActivatePaneDirection 'Prev' },
+  { key = ']', mods = 'CMD', action = act.ActivatePaneDirection 'Next' },
+
+  -- Move focus directionally (Ghostty: cmd+opt+arrows)
+  { key = 'LeftArrow', mods = 'CMD|OPT', action = act.ActivatePaneDirection 'Left' },
+  { key = 'RightArrow', mods = 'CMD|OPT', action = act.ActivatePaneDirection 'Right' },
+  { key = 'UpArrow', mods = 'CMD|OPT', action = act.ActivatePaneDirection 'Up' },
+  { key = 'DownArrow', mods = 'CMD|OPT', action = act.ActivatePaneDirection 'Down' },
+
+  -- Resize focused pane (Ghostty: cmd+ctrl+arrows)
+  { key = 'LeftArrow', mods = 'CMD|CTRL', action = act.AdjustPaneSize { 'Left', RESIZE_STEP } },
+  { key = 'RightArrow', mods = 'CMD|CTRL', action = act.AdjustPaneSize { 'Right', RESIZE_STEP } },
+  { key = 'UpArrow', mods = 'CMD|CTRL', action = act.AdjustPaneSize { 'Up', RESIZE_STEP } },
+  { key = 'DownArrow', mods = 'CMD|CTRL', action = act.AdjustPaneSize { 'Down', RESIZE_STEP } },
+
+  -- Zoom/unzoom focused pane to fill the tab (Ghostty: cmd+shift+enter)
+  { key = 'Enter', mods = 'CMD|SHIFT', action = act.TogglePaneZoomState },
+
+  -- Reshape: swap the focused pane with one you pick (shows letter labels)
+  { key = 's', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'SwapWithActive' } },
+  -- Reshape: rotate pane positions within the tab
+  { key = 'r', mods = 'CMD|SHIFT', action = act.RotatePanes 'Clockwise' },
+  { key = 'r', mods = 'CMD|SHIFT|OPT', action = act.RotatePanes 'CounterClockwise' },
+  -- Jump to any pane by label
+  { key = 'p', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'Activate' } },
+
+  -- Reorder tabs: move the current tab one slot left/right
+  { key = 'LeftArrow', mods = 'CMD|SHIFT', action = act.MoveTabRelative(-1) },
+  { key = 'RightArrow', mods = 'CMD|SHIFT', action = act.MoveTabRelative(1) },
+
+  -- New tab/window, ssh-aware (see smart_spawn); CMD+SHIFT variants are always local
+  { key = 't', mods = 'CMD', action = smart_spawn(false) },
+  { key = 'n', mods = 'CMD', action = smart_spawn(true) },
+  { key = 't', mods = 'CMD|SHIFT', action = act.SpawnTab 'DefaultDomain' },
+  { key = 'n', mods = 'CMD|SHIFT', action = act.SpawnWindow },
+
+  -- Move the focused pane out into a new tab / new window
+  { key = 't', mods = 'CMD|OPT', action = wezterm.action_callback(function(_, pane)
+    pane:move_to_new_tab()
+  end) },
+  { key = 'n', mods = 'CMD|OPT', action = wezterm.action_callback(function(_, pane)
+    pane:move_to_new_window()
+  end) },
+  -- Pull every other window's tabs into this window, keeping split layouts
+  { key = 'm', mods = 'CMD|SHIFT', action = merge_windows },
+}
+
+-- Move the focused pane into tab N (1-9) as a split: CMD+OPT+N = right of
+-- that tab's active pane, CMD+OPT+SHIFT+N = below it. phys: keys so Option/
+-- Shift symbols (¡, !, ...) don't stop the digits from matching.
+for n = 1, 9 do
+  table.insert(config.keys, { key = 'phys:' .. n, mods = 'CMD|OPT', action = move_to_tab(n, '--right') })
+  table.insert(config.keys, { key = 'phys:' .. n, mods = 'CMD|OPT|SHIFT', action = move_to_tab(n, '--bottom') })
+end
+
+-- CMD+click opens links/paths even inside apps that capture the mouse
+-- (Claude Code, less, micro). mouse_reporting=true covers those apps; the
+-- plain entries cover normal shells. The Down events are swallowed so the
+-- click isn't also sent to the app or start a selection.
+config.mouse_bindings = {}
+for _, reporting in ipairs { false, true } do
+  table.insert(config.mouse_bindings, {
+    event = { Down = { streak = 1, button = 'Left' } },
+    mods = 'CMD',
+    mouse_reporting = reporting,
+    action = act.Nop,
+  })
+  table.insert(config.mouse_bindings, {
+    event = { Up = { streak = 1, button = 'Left' } },
+    mods = 'CMD',
+    mouse_reporting = reporting,
+    action = act.OpenLinkAtMouseCursor,
+  })
+end
+
+return config
