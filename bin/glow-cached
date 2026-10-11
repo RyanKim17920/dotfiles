@@ -1,0 +1,125 @@
+#!/bin/sh
+# glow-cached <width> <file>
+#
+# Render a Markdown file with glow (dark style, forced colour) and cache the
+# result, so repeated renders of an unchanged file are just a `cat`.
+# Meant for previewers that re-run their command on every scroll step
+# (e.g. Yazi's piper plugin).
+#
+# Cache key: absolute path + mtime + size + width + style + glow binary stamp.
+# Cache dir: ${XDG_CACHE_HOME:-$HOME/.cache}/glow-cached
+# Entries older than 7 days are pruned on roughly 1 in 50 runs.
+# Exits non-zero (with glow's error on stderr) if rendering fails.
+
+set -u
+
+STYLE=dark
+
+usage() {
+	echo "usage: glow-cached <width> <file>" >&2
+	exit 2
+}
+
+[ $# -eq 2 ] || usage
+width=$1
+file=$2
+
+case $width in
+'' | *[!0-9]*) usage ;;
+esac
+
+if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+	echo "glow-cached: cannot read file: $file" >&2
+	exit 1
+fi
+
+glow_bin=$(command -v glow) || {
+	echo "glow-cached: glow not found on PATH" >&2
+	exit 127
+}
+
+# Print "<mtime> <size>" for each argument, in one stat call.
+# BSD/macOS syntax is tried first; on Linux `stat -f` means filesystem status
+# (no error, but no "<digits> <digits>" lines either), so the output is
+# validated and GNU syntax is used as the fallback.
+file_stat() {
+	_n=$#
+	_out=$(stat -L -f '%m %z' "$@" 2>/dev/null)
+	if ! stat_ok "$_n" "$_out"; then
+		_out=$(stat -L -c '%Y %s' "$@" 2>/dev/null)
+		stat_ok "$_n" "$_out" || return 1
+	fi
+	printf '%s\n' "$_out"
+}
+
+# stat_ok <expected-line-count> <output>
+stat_ok() {
+	_want=$1 _lines=0
+	[ -n "$2" ] || return 1
+	while IFS= read -r _l; do
+		case $_l in
+		*[!0-9\ ]* | '' | ' '* | *' ' | *' '*' '*) return 1 ;;
+		*' '*) _lines=$((_lines + 1)) ;;
+		*) return 1 ;;
+		esac
+	done <<EOF_STAT
+$2
+EOF_STAT
+	[ "$_lines" -eq "$_want" ]
+}
+
+# Content-address the key; output is "<hex>  -", trimmed by the caller.
+hash() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256
+	else
+		cksum
+	fi
+}
+
+case $file in
+/*) abs=$file ;;
+*) abs=$PWD/$file ;;
+esac
+
+# Including glow's own mtime/size means a glow upgrade invalidates old renders.
+meta=$(file_stat "$abs" "$glow_bin") || {
+	echo "glow-cached: cannot stat: $abs" >&2
+	exit 1
+}
+
+key=$(printf '%s\n' "$abs" "$meta" "$width" "$STYLE" "$glow_bin" | hash)
+key=${key%% *}
+
+dir=${XDG_CACHE_HOME:-$HOME/.cache}/glow-cached
+out=$dir/$key
+
+if [ -f "$out" ]; then
+	exec cat "$out"
+fi
+
+mkdir -p "$dir" || exit 1
+
+# Occasional, cheap pruning (PID-based since POSIX sh has no $RANDOM).
+# Also clears temp files orphaned by a killed render.
+if [ $(($$ % 50)) -eq 0 ]; then
+	find "$dir" -type f -mtime +7 -delete 2>/dev/null
+fi
+
+tmp=$(mktemp "$dir/.tmp.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 130' HUP INT TERM
+
+# stdin from /dev/null: glow prefers piped stdin over the file argument and
+# would hang (or render the wrong input) if it inherited one.
+CLICOLOR_FORCE=1 "$glow_bin" -w="$width" -s="$STYLE" "$abs" </dev/null >"$tmp"
+status=$?
+if [ "$status" -ne 0 ]; then
+	echo "glow-cached: glow failed (exit $status) on $abs" >&2
+	exit "$status"
+fi
+
+mv -f "$tmp" "$out" || exit 1
+cat "$out"

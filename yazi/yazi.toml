@@ -10,7 +10,8 @@ image_filter  = "lanczos3"
 
 [[plugin.prepend_previewers]]
 url = "*.md"
-run = 'piper -- CLICOLOR_FORCE=1 glow -w=$w -s=dark "$1"'
+# glow-cached caches renders: piper re-runs this on every scroll step
+run = 'piper -- "$HOME/.local/bin/glow-cached" "$w" "$1"'
 
 # Enter on Markdown: micro + live glow preview split (WezTerm), see ~/.local/bin/mdedit
 [opener]

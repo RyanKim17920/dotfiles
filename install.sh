@@ -37,7 +37,7 @@ done
 
 link "$REPO/micro/settings.json" "$HOME/.config/micro/settings.json"
 
-for f in mdedit yazi-open clipimg-push ssh-setup; do
+for f in mdedit yazi-open clipimg-push ssh-setup glow-cached; do
 	link "$REPO/bin/$f" "$HOME/.local/bin/$f"
 done
 
