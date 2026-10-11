@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# ssh-setup <host>
+#
+# Install yazi (+ ya), micro and glow plus this Mac's yazi/micro configs and
+# Claude Code status line into YOUR OWN home directory on a remote Linux host. No sudo, nothing system-wide.
+# User-invoked per host; re-running is a fast no-op when nothing changed.
+#
+# Remote changes (all under $HOME):
+#   ~/.local/bin/{yazi,ya,micro,glow}
+#   ~/.config/yazi/            (local config; mdedit opener stripped)
+#   ~/.config/micro/settings.json
+#   ~/.claude/statusline.sh    (only this from ~/.claude; nothing else is copied)
+#   ~/.claude/settings.json    (only the "statusLine" key is set; others untouched)
+#   ~/.local/bin/jq            (only if the remote has no usable system jq)
+#   ~/.local/share/ssh-setup/stamp      (version/config hash for idempotency)
+#   ~/.bashrc                  (one block between the ssh-setup markers)
+# Pre-existing ~/.config/{yazi,micro}, binaries, ~/.claude/statusline.sh and
+# ~/.claude/settings.json are backed up once to *.bak-ssh-setup before the
+# first install that touches them.
+set -euo pipefail
+
+FORMAT=1   # bump when the remote layout or bashrc block changes
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ssh-setup"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
+MARK_BEGIN='# >>> ssh-setup >>>'
+MARK_END='# <<< ssh-setup <<<'
+# Space-separated hosts to refuse (e.g. a forced-command bastion that cannot
+# run arbitrary commands). Matched by alias and by resolved hostname.
+BLOCKED_HOSTS="${SSH_SETUP_SKIP_HOSTS:-}"
+
+die()  { printf 'ssh-setup: %s\n' "$*" >&2; exit 1; }
+info() { printf '  %s\n' "$*"; }
+warn() { printf 'ssh-setup: warning: %s\n' "$*" >&2; }
+
+usage() {
+	cat <<EOF
+usage: ssh-setup <host>
+Installs yazi, ya, micro, glow, your yazi/micro configs and your Claude Code
+status line (~/.claude/statusline.sh + the settings.json statusLine key) into ~ on <host>.
+EOF
+}
+
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+case "$1" in -h|--help) usage; exit 0 ;; esac
+HOST="$1"
+
+# --- 1. refuse skipped hosts (by alias and by resolved hostname) ----------
+resolved() { ssh -G "$1" 2>/dev/null | awk '$1 == "hostname" { print $2; exit }'; }
+for b in $BLOCKED_HOSTS; do
+	[ "$HOST" = "$b" ] && die "refusing to target $b (listed in SSH_SETUP_SKIP_HOSTS)"
+	bh="$(resolved "$b")"
+	if [ -n "$bh" ] && [ "$(resolved "$HOST")" = "$bh" ]; then
+		die "refusing: $HOST resolves to the same host as $b"
+	fi
+done
+
+for c in curl jq shasum unzip bsdtar ssh awk; do
+	command -v "$c" >/dev/null || die "missing local dependency: $c"
+done
+
+START=$SECONDS
+# Run a POSIX sh script remotely regardless of the remote login shell.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+rsh() { ssh "${SSH_OPTS[@]}" "$HOST" "sh -c $(sq "$1")"; }
+ERRF="$(mktemp "${TMPDIR:-/tmp}/ssh-setup-err.XXXXXX")"
+
+# --- 2. probe the remote (one round trip) ----------------------------------
+probe="$(rsh 'uname -sm
+printf "stamp=%s\n" "$(cat "$HOME/.local/share/ssh-setup/stamp" 2>/dev/null || echo none)"
+for b in yazi ya micro glow jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
+[ -x "$HOME/.claude/statusline.sh" ] || echo missing=statusline.sh
+grep -qF "\"statusLine\"" "$HOME/.claude/settings.json" 2>/dev/null || echo missing=statusLine
+# a usable jq outside ~/.local/bin (join/map need jq >= 1.5)
+IFS=:; for d in $PATH; do
+	[ "$d" = "$HOME/.local/bin" ] && continue
+	if [ -x "$d/jq" ] && [ "$("$d/jq" -nr "[1,2] | map(tostring) | join(\",\")" 2>/dev/null)" = "1,2" ]; then echo "jq_sys=$d/jq"; break; fi
+done; unset IFS
+command -v pdftoppm >/dev/null 2>&1 && echo pdftoppm=yes || echo pdftoppm=no' 2>"$ERRF")" || {
+	rc=$?
+	cat "$ERRF" >&2
+	if [ $rc -eq 255 ]; then
+		if ! ssh -O check "$HOST" >/dev/null 2>&1; then
+			die "cannot connect to $HOST non-interactively and there is no live master connection.
+  If $HOST needs a password or Duo, run 'ssh $HOST' in another terminal first, then re-run."
+		fi
+		die "ssh to $HOST failed (exit 255) even though a master connection exists"
+	fi
+	die "remote probe on $HOST failed (exit $rc)"
+}
+
+read -r os rarch <<<"$(printf '%s\n' "$probe" | head -1)"
+[ "$os" = "Linux" ] || die "$HOST runs '$os $rarch'; only Linux x86_64/aarch64 are supported"
+case "$rarch" in
+	x86_64)        ARCH=x86_64;  YAZI_T=x86_64;  MICRO_T=linux64-static; GLOW_T=Linux_x86_64 ;;
+	aarch64|arm64) ARCH=aarch64; YAZI_T=aarch64; MICRO_T=linux-arm64;    GLOW_T=Linux_arm64 ;;
+	*) die "$HOST is Linux $rarch; only x86_64 and aarch64 are supported" ;;
+esac
+remote_stamp="$(printf '%s\n' "$probe" | sed -n 's/^stamp=//p')"
+remote_missing="$(printf '%s\n' "$probe" | sed -n 's/^missing=//p' | tr '\n' ' ')"
+pdftoppm="$(printf '%s\n' "$probe" | sed -n 's/^pdftoppm=//p')"
+jq_sys="$(printf '%s\n' "$probe" | sed -n 's/^jq_sys=//p')"
+# ship a static jq only when the remote has no usable one (statusline.sh needs it)
+if [ -n "$jq_sys" ]; then SHIP_JQ=no; else SHIP_JQ=yes; fi
+# ~/.local/bin/jq only counts as missing when we are the ones shipping it
+remote_missing="$(printf '%s\n' $remote_missing | { [ "$SHIP_JQ" = yes ] && cat || { grep -vx jq || true; }; } | tr '\n' ' ' | sed 's/ *$//')"
+case "$ARCH" in x86_64) JQ_T=jq-linux-amd64 ;; aarch64) JQ_T=jq-linux-arm64 ;; esac
+
+# --- local versions (what we try to match) ----------------------------------
+yazi_v="$(yazi --version 2>/dev/null | awk '/Version:/ { print $2; exit }' || true)"
+micro_v="$(micro --version 2>/dev/null | awk '/Version:/ { print $2; exit }' || true)"
+glow_v="$(glow --version 2>/dev/null | awk '{ print $3; exit }' || true)"
+
+# --- stage configs (cheap; needed for the idempotency hash) ----------------
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ssh-setup.XXXXXX")"
+trap 'rm -rf "$STAGE" "$ERRF"' EXIT
+
+# Strip the local-only mdedit opener from yazi.toml: drop comment lines that
+# mention it, arrays/entries that reference it, and sections left empty.
+filter_yazi_toml() {
+	awk '
+	function flush_array(   i, keep, n) {
+		if (arr_body !~ /mdedit/) { out(arr_head); for (i = 1; i <= arr_n; i++) out(arr[i]); out(arr_tail); return }
+		if (arr_head ~ /^[ \t]*mdedit[ \t]*=/) return
+		n = 0
+		for (i = 1; i <= arr_n; i++) if (arr[i] !~ /mdedit/) keep[++n] = arr[i]
+		if (n == 0) return
+		out(arr_head); for (i = 1; i <= n; i++) out(keep[i]); out(arr_tail)
+	}
+	function out(l) { buf[++nb] = l }
+	in_arr {
+		if ($0 ~ /^[ \t]*\][ \t]*$/) { arr_tail = $0; in_arr = 0; flush_array(); next }
+		arr[++arr_n] = $0; arr_body = arr_body "\n" $0; next
+	}
+	/^[ \t]*#/ && /mdedit/ { next }
+	/^[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*\[[ \t]*$/ { in_arr = 1; arr_head = $0; arr_n = 0; arr_body = $0; next }
+	/mdedit/ { next }
+	{ out($0) }
+	END {
+		# drop [section] headers that only have blank lines before the next header / EOF
+		for (i = 1; i <= nb; i++) {
+			if (buf[i] ~ /^[ \t]*\[[^\[]/) {
+				empty = 1
+				for (j = i + 1; j <= nb && buf[j] !~ /^[ \t]*\[/; j++) if (buf[j] !~ /^[ \t]*$/) { empty = 0; break }
+				if (empty) { drop[i] = 1 }
+			}
+		}
+		# print, collapsing runs of blank lines and trimming trailing blanks
+		last = ""; pending = 0
+		for (i = 1; i <= nb; i++) {
+			if (drop[i]) continue
+			if (buf[i] ~ /^[ \t]*$/) { pending = 1; continue }
+			if (pending && printed) print ""
+			pending = 0; printed = 1; print buf[i]
+		}
+	}' "$1"
+}
+
+stage_configs() {
+	local src="$HOME/.config/yazi" dst="$STAGE/.config/yazi"
+	[ -d "$src" ] || die "no local ~/.config/yazi"
+	mkdir -p "$dst" "$STAGE/.config/micro" "$STAGE/.local/bin" "$STAGE/.local/share/ssh-setup"
+	local f
+	for f in yazi.toml keymap.toml theme.toml package.toml init.lua; do
+		[ -f "$src/$f" ] && cp "$src/$f" "$dst/$f"
+	done
+	for f in plugins flavors; do
+		[ -d "$src/$f" ] && cp -R "$src/$f" "$dst/$f"
+	done
+	if [ -f "$src/yazi.toml" ]; then
+		filter_yazi_toml "$src/yazi.toml" >"$dst/yazi.toml"
+		grep -q mdedit "$dst/yazi.toml" && die "failed to strip mdedit from yazi.toml"
+		if command -v python3 >/dev/null; then
+			python3 -I -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$dst/yazi.toml" \
+				|| die "filtered yazi.toml is not valid TOML"
+		fi
+	fi
+	[ -f "$HOME/.config/micro/settings.json" ] && cp "$HOME/.config/micro/settings.json" "$STAGE/.config/micro/"
+	# Claude Code status line: the script only (never anything else from ~/.claude)
+	[ -f "$HOME/.claude/statusline.sh" ] || die "no local ~/.claude/statusline.sh"
+	mkdir -p "$STAGE/.claude"
+	cp "$HOME/.claude/statusline.sh" "$STAGE/.claude/statusline.sh"
+	chmod 755 "$STAGE/.claude/statusline.sh"
+	find "$STAGE" -name .DS_Store -delete
+	chmod -R u+w "$STAGE"
+}
+stage_configs
+
+# statusLine value for the remote settings.json: mirror the local one, if set
+STATUSLINE_JSON='{"type":"command","command":"~/.claude/statusline.sh","padding":0}'
+if local_sl="$(jq -ce '.statusLine | select(type == "object")' "$HOME/.claude/settings.json" 2>/dev/null)"; then
+	STATUSLINE_JSON="$local_sl"
+fi
+printf '%s\n' "$STATUSLINE_JSON" >"$STAGE/.local/share/ssh-setup/statusline.json"
+
+BASHRC_BLOCK="$MARK_BEGIN (added by ssh-setup; delete this block to undo)
+case \":\$PATH:\" in *\":\$HOME/.local/bin:\"*) ;; *) export PATH=\"\$HOME/.local/bin:\$PATH\" ;; esac
+export EDITOR=micro
+y() {
+	local tmp cwd
+	tmp=\"\$(mktemp -t yazi-cwd.XXXXXX)\"
+	command yazi \"\$@\" --cwd-file=\"\$tmp\"
+	IFS= read -r -d '' cwd < \"\$tmp\"
+	[ -n \"\$cwd\" ] && [ \"\$cwd\" != \"\$PWD\" ] && builtin cd -- \"\$cwd\"
+	rm -f -- \"\$tmp\"
+}
+$MARK_END"
+
+STAMP="$(
+	{
+		printf 'format=%s arch=%s yazi=%s micro=%s glow=%s ship_jq=%s\n' "$FORMAT" "$ARCH" "$yazi_v" "$micro_v" "$glow_v" "$SHIP_JQ"
+		printf '%s\n' "$BASHRC_BLOCK" "$STATUSLINE_JSON"
+		(cd "$STAGE" && find .config .claude -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
+	} | shasum -a 256 | awk '{ print $1 }'
+)"
+
+summary_tail() {
+	echo "  pdftoppm on $HOST: $pdftoppm$([ "$pdftoppm" = no ] && echo ' (PDF previews unavailable; install poppler-utils to enable)')"
+	cat <<EOF
+  undo on $HOST:
+    rm -f ~/.local/bin/{yazi,ya,micro,glow} ~/.config/micro/settings.json
+    rm -rf ~/.config/yazi ~/.local/share/ssh-setup
+    sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc
+    rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
+    $([ "$SHIP_JQ" = yes ] && echo '~/.local/bin/jq' || echo jq) 'del(.statusLine)' ~/.claude/settings.json > ~/.claude/s.tmp && mv ~/.claude/s.tmp ~/.claude/settings.json
+    # or restore ~/.claude/{settings.json,statusline.sh}.bak-ssh-setup if present
+    # then restore any ~/.config/{yazi,micro}.bak-ssh-setup or ~/.local/bin/*.bak-ssh-setup
+EOF
+}
+
+if [ "$remote_stamp" = "$STAMP" ] && [ -z "$remote_missing" ]; then
+	echo "ssh-setup: $HOST ($ARCH) already up to date (yazi $yazi_v, micro $micro_v, glow $glow_v) [$((SECONDS - START))s]"
+	summary_tail
+	exit 0
+fi
+
+# --- 3. fetch release binaries (cached per arch/version) -------------------
+api() {
+	local auth=()
+	[ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+	curl -fsSL "${auth[@]+"${auth[@]}"}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$1"
+}
+
+# fetch_release <repo> <version|""> <asset-name-template with {v}>  -> prints "path version"
+fetch_release() {
+	local repo="$1" want="$2" tmpl="$3" rel ver name url digest dir file
+	rel=""
+	if [ -n "$want" ]; then rel="$(api "$repo/releases/tags/v$want" 2>/dev/null || true)"; fi
+	if [ -z "$rel" ]; then
+		[ -n "$want" ] && warn "$repo has no release v$want; using latest"
+		rel="$(api "$repo/releases/latest")" || die "cannot query GitHub releases for $repo"
+	fi
+	ver="$(jq -r '.tag_name' <<<"$rel" | sed 's/^v//')"
+	name="${tmpl//\{v\}/$ver}"
+	url="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$rel")"
+	digest="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .digest // empty' <<<"$rel")"
+	[ -n "$url" ] || die "$repo v$ver has no asset $name"
+	dir="$CACHE/$ARCH/dl"; mkdir -p "$dir"; file="$dir/$name"
+	if [ ! -s "$file" ]; then
+		echo "  downloading $name" >&2
+		curl -fsSL -o "$file.part" "$url" || die "download failed: $url"
+		mv "$file.part" "$file"
+	fi
+	if [ -z "$digest" ]; then
+		# fall back to a published checksum file (checksums.txt or <asset>.sha)
+		local sums
+		sums="$(jq -r --arg n "$name" '.assets[] | select(.name == "checksums.txt" or .name == "sha256sum.txt" or .name == ($n + ".sha")) | .browser_download_url' <<<"$rel" | head -1)"
+		[ -n "$sums" ] && digest="sha256:$(curl -fsSL "$sums" | awk -v n="$name" '$2 == n || $2 == "*" n || NF == 1 { print $1; exit }')"
+	fi
+	if [ -n "$digest" ] && [ "$digest" != "sha256:" ]; then
+		local got; got="sha256:$(shasum -a 256 "$file" | awk '{ print $1 }')"
+		[ "$got" = "$digest" ] || { rm -f "$file"; die "checksum mismatch for $name ($got != $digest)"; }
+	else
+		warn "no published checksum for $name; not verified"
+	fi
+	printf '%s %s\n' "$file" "$ver"
+}
+
+# get_tool <tool> <repo> <want-version> <template> <binaries...>: cache dir with extracted binaries
+get_tool() {
+	local tool="$1" repo="$2" want="$3" tmpl="$4"; shift 4
+	local bdir="$CACHE/$ARCH/$tool-${want:-latest}" b ok=1
+	for b in "$@"; do [ -x "$bdir/$b" ] || ok=0; done
+	if [ $ok -eq 0 ] || [ -z "$want" ]; then
+		local out file ver x
+		out="$(fetch_release "$repo" "$want" "$tmpl")" || exit 1
+		file="${out% *}"; ver="${out##* }"
+		bdir="$CACHE/$ARCH/$tool-$ver"
+		x="$(mktemp -d "${TMPDIR:-/tmp}/ssh-setup-x.XXXXXX")"
+		case "$file" in
+			*.zip)    unzip -q "$file" -d "$x" ;;
+			*.tar.gz) tar -xzf "$file" -C "$x" ;;
+			*)        cp "$file" "$x/$1"; chmod 755 "$x/$1" ;;   # bare binary asset
+		esac
+		rm -rf "$bdir"; mkdir -p "$bdir"
+		for b in "$@"; do
+			local p; p="$(find "$x" -type f -name "$b" -perm -u+x | head -1)"
+			[ -n "$p" ] || { rm -rf "$x"; die "$b not found in $(basename "$file")"; }
+			cp "$p" "$bdir/$b"; chmod 755 "$bdir/$b"
+		done
+		rm -rf "$x"
+	fi
+	printf '%s\n' "$bdir"
+}
+
+echo "ssh-setup: $HOST is Linux $ARCH; preparing binaries"
+d="$(get_tool yazi  sxyazi/yazi           "$yazi_v"  "yazi-$YAZI_T-unknown-linux-musl.zip" yazi ya)"; cp "$d/yazi" "$d/ya" "$STAGE/.local/bin/"
+d="$(get_tool micro zyedidia/micro        "$micro_v" "micro-{v}-$MICRO_T.tar.gz" micro)";              cp "$d/micro" "$STAGE/.local/bin/"
+d="$(get_tool glow  charmbracelet/glow    "$glow_v"  "glow_{v}_$GLOW_T.tar.gz" glow)";                cp "$d/glow" "$STAGE/.local/bin/"
+if [ "$SHIP_JQ" = yes ]; then
+	d="$(get_tool jq jqlang/jq "" "$JQ_T" jq)";                                                        cp "$d/jq" "$STAGE/.local/bin/"
+fi
+printf '%s\n' "$STAMP" >"$STAGE/.local/share/ssh-setup/stamp"
+printf '%s\n' "$BASHRC_BLOCK" >"$STAGE/.local/share/ssh-setup/bashrc-block"
+
+# --- 4. one tar stream; remote backs up, extracts, appends bashrc block -----
+REMOTE_SCRIPT='set -e
+cd "$HOME"
+if [ ! -f .local/share/ssh-setup/stamp ]; then
+	for d in .config/yazi .config/micro; do
+		if [ -e "$d" ] && [ ! -e "$d.bak-ssh-setup" ]; then cp -a "$d" "$d.bak-ssh-setup"; echo "backup: ~/$d.bak-ssh-setup"; fi
+	done
+	for b in yazi ya micro glow; do
+		f=".local/bin/$b"
+		if [ -e "$f" ] && [ ! -e "$f.bak-ssh-setup" ]; then cp -a "$f" "$f.bak-ssh-setup"; echo "backup: ~/$f.bak-ssh-setup"; fi
+	done
+fi
+# first status-line install: back up what it is about to replace (once)
+if [ ! -e .local/share/ssh-setup/statusline-installed ]; then
+	for f in .claude/statusline.sh .claude/settings.json; do
+		if [ -e "$f" ] && [ ! -e "$f.bak-ssh-setup" ]; then cp -p "$f" "$f.bak-ssh-setup"; echo "backup: ~/$f.bak-ssh-setup"; fi
+	done
+	f=.local/bin/jq
+	if [ "$SHIP_JQ" = yes ] && [ -e "$f" ] && [ ! -e "$f.bak-ssh-setup" ]; then cp -a "$f" "$f.bak-ssh-setup"; echo "backup: ~/$f.bak-ssh-setup"; fi
+fi
+mkdir -p .local/bin .config
+[ -d .claude ] || mkdir -m 700 .claude
+tar -xf - -C "$HOME"
+chmod 755 .claude/statusline.sh
+# merge only the statusLine key into ~/.claude/settings.json
+S=.claude/settings.json SL="$(cat .local/share/ssh-setup/statusline.json)"
+[ -L "$S" ] && S="$(readlink -f "$S")"   # edit a dotfiles-symlinked target in place
+if [ -x .local/bin/jq ]; then JQ=.local/bin/jq; else JQ="$JQ_SYS"; fi
+[ -e "$S" ] || { (umask 077; printf "{}\n" > "$S"); echo "settings: created ~/$S"; }
+if [ -n "$JQ" ]; then
+	if ! "$JQ" -e "type == \"object\"" "$S" >/dev/null 2>&1; then
+		echo "WARNING: ~/$S is not a valid JSON object; left unchanged (statusLine NOT set)"
+	elif "$JQ" -e --argjson sl "$SL" ".statusLine == \$sl" "$S" >/dev/null; then
+		echo "settings: statusLine already set"
+	else
+		cp -p "$S" "$S.tmp-ssh-setup" && "$JQ" --argjson sl "$SL" ".statusLine = \$sl" "$S" > "$S.tmp-ssh-setup" \
+			&& mv "$S.tmp-ssh-setup" "$S" && echo "settings: statusLine merged into ~/$S" \
+			|| { rm -f "$S.tmp-ssh-setup"; echo "WARNING: failed to update ~/$S; left unchanged"; }
+	fi
+elif command -v python3 >/dev/null 2>&1; then
+	python3 -I -c "
+import json, os, shutil, sys
+p, sl = sys.argv[1], json.loads(sys.argv[2])
+try:
+    d = json.load(open(p))
+    assert isinstance(d, dict)
+except Exception:
+    print(\"WARNING: ~/\" + p + \" is not a valid JSON object; left unchanged (statusLine NOT set)\"); sys.exit(0)
+if d.get(\"statusLine\") == sl:
+    print(\"settings: statusLine already set\"); sys.exit(0)
+d[\"statusLine\"] = sl
+t = p + \".tmp-ssh-setup\"
+shutil.copy2(p, t)
+with open(t, \"w\") as f: json.dump(d, f, indent=2); f.write(\"\\n\")
+os.replace(t, p)
+print(\"settings: statusLine merged into ~/\" + p)
+" "$S" "$SL"
+else
+	echo "WARNING: no jq or python3 on remote; ~/$S statusLine NOT set"
+fi
+touch .local/share/ssh-setup/statusline-installed
+touch .bashrc
+if ! grep -qF "'"$MARK_BEGIN"'" .bashrc; then
+	{ [ -s .bashrc ] && [ -n "$(tail -c1 .bashrc)" ] && echo; echo; cat .local/share/ssh-setup/bashrc-block; } >> .bashrc
+	echo "bashrc: block appended"
+else
+	echo "bashrc: block already present"
+fi
+echo "installed: yazi $(.local/bin/yazi --version 2>&1 | awk "/Version:/{print \$2; exit}"), micro $(.local/bin/micro --version 2>&1 | awk "/Version:/{print \$2; exit}"), glow $(.local/bin/glow --version 2>&1 | awk "{print \$3; exit}"), statusline (jq: $(${JQ:-false} --version 2>/dev/null || echo none))"'
+
+REMOTE_SCRIPT="JQ_SYS=$(sq "$jq_sys") SHIP_JQ=$SHIP_JQ
+$REMOTE_SCRIPT"
+
+echo "ssh-setup: pushing to $HOST"
+COPYFILE_DISABLE=1 bsdtar -c -f - --format=ustar --uid 0 --gid 0 --uname root --gname root \
+	-C "$STAGE" .local .config .claude/statusline.sh \
+	| rsh "$REMOTE_SCRIPT" | sed 's/^/  /' || die "remote install on $HOST failed"
+
+echo "ssh-setup: done [$((SECONDS - START))s]"
+summary_tail

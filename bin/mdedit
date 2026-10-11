@@ -1,0 +1,111 @@
+#!/bin/sh
+# mdedit: edit Markdown in micro with a live glow preview in a WezTerm split.
+#
+#   mdedit FILE.md [more files...]
+#
+# Inside WezTerm ($WEZTERM_PANE set): splits the current pane to the RIGHT (50%)
+# with a preview loop for the first file, runs micro in the current pane, and
+# closes the preview pane when micro exits. Outside WezTerm: plain micro.
+#
+# The preview side (internal mode: mdedit --preview EDITOR_PID FILE) renders the
+# file with glow into a temp file and pages it with `less` (scrollable, mouse
+# wheel). A background watcher polls mtime+size and the pane width every 0.5s,
+# re-renders on change and sends `R` to less so it reloads in place. Quitting
+# less (q) just closes the preview; it also ends once EDITOR_PID dies.
+set -u
+
+# Yazi/WezTerm may start us with a minimal PATH.
+PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+
+# Absolute path of $1 (directory must exist; the file itself need not).
+abspath() {
+  d=$(cd "$(dirname -- "$1")" 2>/dev/null && pwd) || d=$(dirname -- "$1")
+  printf '%s/%s\n' "$d" "$(basename -- "$1")"
+}
+
+preview() {
+  editor_pid=$1 file=$2
+  dir=$(mktemp -d -t mdedit) || exit 1
+  doc=$dir/doc
+  watcher=
+  trap '[ -n "$watcher" ] && kill "$watcher" 2>/dev/null; rm -rf "$dir"' EXIT
+  trap 'exit 0' HUP INT TERM
+
+  # Render $file at width $1 into $doc. glow writes a side temp first; the
+  # result is then copied over $doc IN PLACE (not mv): less keeps its fd open,
+  # so `R` only sees new content if the same inode is rewritten.
+  render() {
+    if [ -e "$file" ]; then
+      CLICOLOR_FORCE=1 glow -s dark -w "$(($1 - 2))" -- "$file" >"$dir/new" 2>&1
+    else
+      printf '\n  (%s does not exist yet; save to preview)\n' "${file##*/}" >"$dir/new"
+    fi
+    cat "$dir/new" >"$doc"
+  }
+  # Pane width from the controlling tty (a background job's stdin is /dev/null).
+  width() { w=$(stty size </dev/tty 2>/dev/null) && w=${w#* } && echo "${w:-80}" || echo 80; }
+
+  last=$(stat -f '%Fm %z' -- "$file" 2>/dev/null) cols=$(width)
+  render "$cols"
+
+  # Watcher: re-render on file change (mtime+size) or pane width change, then
+  # send `R` to less in this pane (re-reads the file, keeps the top line).
+  # Exits when the editor dies, taking less (and so this pane) with it.
+  (
+    trap 'exit 0' HUP INT TERM
+    while kill -0 "$editor_pid" 2>/dev/null; do
+      sleep 0.5
+      cur=$(stat -f '%Fm %z' -- "$file" 2>/dev/null) c=$(width)
+      if [ "$cur" != "$last" ] || [ "$c" != "$cols" ]; then
+        last=$cur cols=$c
+        render "$cols"
+        wezterm cli send-text --pane-id "$WEZTERM_PANE" --no-paste R 2>/dev/null
+      fi
+    done
+    pkill -P "$$" -x less 2>/dev/null
+  ) &
+  watcher=$!
+
+  # Short prompt (percent / END), no quit-at-EOF, wheel scrolling, no history.
+  LESSHISTFILE=- less -R -+F -+X -~ --mouse --wheel-lines=3 \
+    -Ps'?e(END):%pB\%.' -Pm'?e(END):%pB\%.' -- "$doc"
+  exit 0
+}
+
+if [ "${1:-}" = "--preview" ]; then
+  [ "$#" -eq 3 ] || exit 2
+  preview "$2" "$3"
+fi
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: mdedit FILE.md [more files...]" >&2
+  exit 2
+fi
+
+micro=$(command -v micro) || { echo "mdedit: micro not found" >&2; exit 1; }
+
+if [ -z "${WEZTERM_PANE:-}" ] || ! command -v wezterm >/dev/null 2>&1; then
+  exec "$micro" "$@"
+fi
+
+self=$(abspath "$(command -v -- "$0" 2>/dev/null || echo "$0")")
+file=$(abspath "$1")
+
+pane=$(wezterm cli split-pane --pane-id "$WEZTERM_PANE" --right --percent 50 \
+  --cwd "$(dirname -- "$file")" -- "$self" --preview "$$" "$file" 2>/dev/null) || pane=
+[ -n "$pane" ] || exec "$micro" "$@"       # split failed: just edit
+
+cleanup() { wezterm cli kill-pane --pane-id "$pane" 2>/dev/null; }
+trap cleanup EXIT
+
+wezterm cli activate-pane --pane-id "$WEZTERM_PANE" 2>/dev/null
+
+# Run micro as a child we `wait` on (not in the foreground) so a SIGHUP from
+# closing this pane interrupts the wait at once and is forwarded to micro;
+# a foreground child would defer the trap until micro exits (it never would).
+# Same process group as the shell (no job control), so micro owns the tty.
+"$micro" "$@" </dev/tty &
+mpid=$!
+trap 'kill -HUP "$mpid" 2>/dev/null; exit 129' HUP
+trap 'kill -TERM "$mpid" 2>/dev/null; exit 143' INT TERM
+wait "$mpid"

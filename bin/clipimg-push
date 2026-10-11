@@ -1,0 +1,86 @@
+#!/bin/bash
+# Paste the Mac clipboard image into a remote program (e.g. Claude Code) over ssh.
+#
+#   clipimg-push --check
+#       exit 0 if the clipboard holds an image, 2 if not
+#   clipimg-push <pane_id> <ssh args...>
+#       save the clipboard image as PNG, upload it to ~/.cache/clipimg/ on the
+#       ssh destination (reusing the ControlMaster), then type the remote
+#       absolute path plus a space into WezTerm pane <pane_id>.
+#
+# Exit codes: 0 ok, 2 no image on clipboard, 1 upload/usage error (a macOS
+# notification is shown for errors since this usually runs in the background).
+#
+# Called by the CMD+SHIFT+V binding in ~/.wezterm.lua.
+
+set -u
+PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+WEZTERM="${WEZTERM_CLI:-/opt/homebrew/bin/wezterm}"
+
+notify() {
+  osascript - "$1" >/dev/null 2>&1 <<'EOF'
+on run argv
+  display notification (item 1 of argv) with title "clipimg-push"
+end run
+EOF
+  echo "clipimg-push: $1" >&2
+}
+
+has_image() {
+  # PNGf, or TIFF which AppleScript can coerce to PNGf (e.g. some apps' copies)
+  osascript -e 'clipboard info' 2>/dev/null | grep -qE '«class PNGf»|TIFF picture'
+}
+
+if [ "${1:-}" = "--check" ]; then
+  has_image && exit 0 || exit 2
+fi
+
+if [ $# -lt 2 ]; then
+  echo "usage: clipimg-push --check | clipimg-push <pane_id> <ssh args...>" >&2
+  exit 1
+fi
+pane_id=$1
+shift
+
+has_image || exit 2
+
+tmp=$(mktemp -t clipimg) || { notify "mktemp failed"; exit 1; }
+trap 'rm -f "$tmp"' EXIT
+
+if ! osascript - "$tmp" >/dev/null 2>&1 <<'EOF'
+on run argv
+  set d to the clipboard as «class PNGf»
+  set f to open for access (POSIX file (item 1 of argv)) with write permission
+  try
+    set eof f to 0
+    write d to f
+    close access f
+  on error e
+    close access f
+    error e
+  end try
+end run
+EOF
+then
+  exit 2 # clipboard changed or couldn't be coerced to PNG
+fi
+[ -s "$tmp" ] || exit 2
+
+name="$(date +%Y%m%d-%H%M%S)-$$.png"
+# One round trip: prune week-old images, store this one, print its absolute path.
+# BatchMode/ConnectTimeout: never block on a password/Duo prompt if no master.
+remote_cmd="mkdir -p ~/.cache/clipimg && find ~/.cache/clipimg -name '*.png' -mtime +7 -delete 2>/dev/null; cat > ~/.cache/clipimg/$name && echo \"\$HOME/.cache/clipimg/$name\""
+if ! out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$@" "$remote_cmd" <"$tmp" 2>&1); then
+  notify "Upload failed: $(printf '%s' "$out" | tail -n 1)"
+  exit 1
+fi
+remote_path=$(printf '%s' "$out" | tail -n 1)
+case "$remote_path" in
+  /*.png) ;;
+  *) notify "Unexpected reply from remote: $remote_path"; exit 1 ;;
+esac
+
+if ! "$WEZTERM" cli send-text --pane-id "$pane_id" --no-paste "$remote_path "; then
+  notify "Uploaded to $remote_path but couldn't type it into pane $pane_id"
+  exit 1
+fi

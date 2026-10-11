@@ -1,0 +1,32 @@
+#!/bin/sh
+# yazi-open: opener used by the WezTerm sidebar Yazi (~/.config/yazi-sidebar).
+# Opens the given files in micro in a NEW pane to the right of the sidebar:
+#   - pane already to the right  -> split it, editor on top (60%)
+#   - nothing to the right       -> split the sidebar itself, editor on the right (80%)
+# The sidebar pane is $WEZTERM_PANE (set by WezTerm for every pane).
+# Markdown (first file *.md) opens via mdedit instead: micro plus a live glow
+# preview split to the right of the editor pane.
+set -eu
+[ "$#" -gt 0 ] || exit 0
+
+# Yazi may have been started by the WezTerm GUI with a minimal PATH.
+PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+micro=$(command -v micro)
+case "$1" in
+  *.md|*.MD|*.markdown) micro="$HOME/.local/bin/mdedit" ;;
+esac
+
+# Not inside WezTerm: nothing to split, hand off to the default macOS app.
+if [ -z "${WEZTERM_PANE:-}" ]; then
+  exec open "$@"
+fi
+
+dir=$(cd "$(dirname "$1")" && pwd)
+
+right=$(wezterm cli get-pane-direction Right --pane-id "$WEZTERM_PANE" 2>/dev/null || true)
+if [ -n "$right" ]; then
+  new=$(wezterm cli split-pane --pane-id "$right" --top --percent 60 --cwd "$dir" -- "$micro" "$@")
+else
+  new=$(wezterm cli split-pane --pane-id "$WEZTERM_PANE" --right --percent 80 --cwd "$dir" -- "$micro" "$@")
+fi
+wezterm cli activate-pane --pane-id "$new"
