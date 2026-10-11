@@ -212,7 +212,8 @@ table.insert(config.hyperlink_rules, {
 -- SSH-aware splits (VS Code style): splitting a local pane whose foreground
 -- process is plain `ssh` opens a fresh shell on the same host. Relies on
 -- ControlMaster in ~/.ssh/config, so the new connection is instant. The new
--- pane runs ssh directly, so it closes when that session exits.
+-- pane runs ssh through ssh-pane: it closes when that session exits normally,
+-- but a dropped connection leaves it open with Enter to reconnect.
 
 -- ssh options that take a value (from `man ssh`)
 local SSH_OPTS_WITH_VALUE = {}
@@ -220,10 +221,13 @@ for c in ('bcDEeFIiJLlmOopQRSWw'):gmatch '.' do SSH_OPTS_WITH_VALUE[c] = true en
 -- Of those, the ones carried over so the new connection matches
 local SSH_OPTS_KEPT = { l = true, p = true, F = true, J = true, i = true }
 
--- argv of an ssh process -> args for a fresh `ssh` to the same destination
+-- ssh wrapper that offers Enter-to-reconnect when the connection drops
+local SSH_PANE = wezterm.home_dir .. '/.local/bin/ssh-pane'
+
+-- argv of an ssh process -> args for a fresh ssh-pane to the same destination
 -- (remote command dropped), or nil if no destination is found.
-local function ssh_split_args(argv)
-  local kept, i = {}, 2
+local function ssh_split_args(argv, first)
+  local kept, i = {}, (first or 1) + 1
   while i <= #argv do
     local a = argv[i]
     if a == '--' then
@@ -252,19 +256,27 @@ local function ssh_split_args(argv)
   end
   local dest = argv[i]
   if not dest then return nil end
-  local args = { 'ssh' }
+  local args = { SSH_PANE }
   for _, v in ipairs(kept) do table.insert(args, v) end
   table.insert(args, dest)
   return args
 end
 
--- { 'ssh', <kept opts...>, dest } when the pane is a local pane whose
--- foreground process is ssh, else nil. Shared by smart splits and image paste.
+-- { SSH_PANE, <kept opts...>, dest } when the pane is a local pane whose
+-- foreground process is ssh or ssh-pane, else nil. Shared by smart splits and
+-- image paste. ssh-pane is a #!/bin/sh script, so its argv is
+-- { '/bin/sh', '.../ssh-pane', <ssh args...> }: parse from the ssh-pane entry.
 local function pane_ssh_args(pane)
   local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
-  local exe = info and (info.executable or ''):match '[^/]*$'
-  return info and (exe == 'ssh' or (info.argv[1] or ''):match '[^/]*$' == 'ssh')
-    and ssh_split_args(info.argv) or nil
+  if not info then return nil end
+  local argv = info.argv or {}
+  local function base(k) return (argv[k] or ''):match '[^/]*$' end
+  if (info.executable or ''):match '[^/]*$' == 'ssh' or base(1) == 'ssh' or base(1) == 'ssh-pane' then
+    return ssh_split_args(argv, 1)
+  elseif base(2) == 'ssh-pane' then
+    return ssh_split_args(argv, 2)
+  end
+  return nil
 end
 
 local function smart_split(direction)
@@ -320,15 +332,16 @@ local smart_paste = wezterm.action_callback(function(window, pane)
   local args = pane_ssh_args(pane)
   if args then
     local cmd = { '/usr/bin/env', 'PATH=' .. YAZI_PATH, CLIPIMG, tostring(pane:pane_id()) }
-    for k = 2, #args do table.insert(cmd, args[k]) end -- drop leading 'ssh'
+    for k = 2, #args do table.insert(cmd, args[k]) end -- drop leading ssh-pane
     wezterm.background_child_process(cmd)
   else
     window:perform_action(act.SendKey { key = 'v', mods = 'CTRL' }, pane)
   end
 end)
 
--- SSH-aware new tab/window: from a local pane running ssh, open a fresh ssh
--- to the same host (instant via ControlMaster); otherwise the default spawn.
+-- SSH-aware new tab/window: from a local pane running ssh, open a fresh
+-- ssh-pane to the same host (instant via ControlMaster); otherwise the default
+-- spawn.
 local function smart_spawn(new_window)
   return wezterm.action_callback(function(window, pane)
     local args = pane_ssh_args(pane)
