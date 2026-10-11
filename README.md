@@ -15,7 +15,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 | `yazi/` | `~/.config/yazi/` |
 | `yazi-sidebar/yazi.toml` | `~/.config/yazi-sidebar/yazi.toml` |
 | `micro/settings.json` | `~/.config/micro/settings.json` |
-| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`) |
+| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`, `ssh-pane`) |
 | `claude/statusline.sh` | `~/.claude/statusline.sh` (Claude Code status line) |
 | `zsh/snippets.zsh` | source it from `~/.zshrc` |
 
@@ -31,7 +31,7 @@ them from `yazi/package.toml`.
 
 | Keys | Action |
 | --- | --- |
-| CMD+D / CMD+SHIFT+D | Split right / down. In a pane running `ssh`, the new pane opens ssh to the same host |
+| CMD+D / CMD+SHIFT+D | Split right / down. In a pane running `ssh`, the new pane opens ssh (via `ssh-pane`) to the same host |
 | CMD+T / CMD+N | New tab / window, ssh-aware the same way |
 | CMD+SHIFT+T / CMD+SHIFT+N | New tab / window, always local |
 | CMD+OPT+T / CMD+OPT+N | Move the focused pane to a new tab / window |
@@ -142,6 +142,29 @@ Caveats:
   can be refused by alias or resolved hostname:
   `export SSH_SETUP_SKIP_HOSTS="bastion other-host"`.
 - Set `GITHUB_TOKEN` if you hit GitHub API rate limits.
+
+## Disconnects & reconnecting
+
+`bin/ssh-pane` wraps ssh. The ssh-aware WezTerm splits/tabs use it, and the
+`ssh` function in `zsh/snippets.zsh` routes interactive `ssh` through it.
+
+- When the connection drops (ssh exits 255) the pane stays open with
+  `[disconnected from host — Enter: reconnect · q: close]`. Enter (or `r`)
+  re-runs the identical ssh command; `q`, Ctrl+D or Ctrl+C closes. Quick
+  repeated failures back off a few seconds between attempts.
+- A normal exit (you typed `exit`, the remote command finished) closes the
+  pane as before.
+- After ssh exits, mouse reporting, a stuck alternate screen, a hidden cursor
+  and keypad mode are reset (zsh also resets all but the alternate screen
+  before every prompt), so a dropped `micro`/`less`/`yazi` no longer floods
+  the shell with mouse escape codes.
+- `ssh -G/-O/-Q/-V/-W`, pipes and scripts (git, scp, rsync) bypass it.
+
+Programs on the server still die with the connection. Run them inside tmux on
+the server so they survive drops; since a reconnect re-runs the same command,
+`ssh -t host tmux new -A -s work` puts you straight back in the session.
+`ServerAliveInterval 15` / `ServerAliveCountMax 4` under `Host *` makes a dead
+connection show up in about a minute instead of hanging.
 
 ## License
 
