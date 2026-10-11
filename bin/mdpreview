@@ -1,0 +1,14 @@
+#!/bin/sh
+# mdpreview <file>
+#
+# Live Markdown preview: `mdview --watch` (glow render paged in less -R,
+# re-rendered and reloaded in place whenever the file or the pane width
+# changes). Run by the preview pane that ~/.wezterm.lua opens when `mdedit`
+# is used over ssh; works locally too. q quits.
+set -u
+here=$(dirname -- "$0")
+if [ -x "$here/mdview" ]; then
+	exec "$here/mdview" --watch "$@"
+fi
+PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+exec mdview --watch "$@"

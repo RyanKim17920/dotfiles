@@ -1,5 +1,5 @@
 #!/bin/sh
-# mdview <file>
+# mdview [--watch] <file>
 #
 # Full-screen Markdown reader: render with glow (via glow-cached) at the
 # terminal width and page it with `less -R`, which passes colour escapes
@@ -8,39 +8,104 @@
 # miscounts ANSI sequences and corrupts the screen while scrolling.)
 #
 # Used by Yazi's `R` binding. q returns.
+#
+# --watch (what `mdpreview` runs, e.g. in the preview pane mdedit opens over
+# ssh): a background watcher polls the file's mtime+size and the terminal
+# width every 0.5s, re-renders on change and asks WezTerm to reload less in
+# place by setting the user var `mdpreview_reload` (OSC 1337 SetUserVar; the
+# `user-var-changed` handler in ~/.wezterm.lua sends `R` to this pane). Other
+# terminals ignore the OSC, so the preview just stays static there.
 set -u
 
 # Yazi/WezTerm may start us with a minimal PATH.
 PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
 
+watch=
+if [ "${1:-}" = --watch ]; then
+	watch=1
+	shift
+fi
 if [ $# -ne 1 ]; then
-	echo "usage: mdview <file>" >&2
+	echo "usage: mdview [--watch] <file>" >&2
 	exit 2
 fi
 file=$1
 
-# Terminal width from the controlling tty ("rows cols"), minus a 2-col margin.
-cols=$(stty size 2>/dev/null </dev/tty) && cols=${cols#* } || cols=
-case $cols in
-'' | *[!0-9]*) cols=80 ;;
-esac
-width=$((cols - 2))
-[ "$width" -ge 20 ] || width=20
-
-# Render before paging so a failure is reported instead of an empty pager.
-# The trailing "." keeps command substitution from eating final blank lines.
-doc=$(glow-cached "$width" "$file" </dev/null && echo .) || {
-	echo "mdview: could not render $file" >&2
-	printf 'Press Enter to return.' >&2
-	read -r _ 2>/dev/null </dev/tty
-	exit 1
+# Terminal width from the controlling tty ("rows cols"); works from the
+# background watcher too, whose stdin is /dev/null.
+term_cols() {
+	_c=$(stty size 2>/dev/null </dev/tty) && _c=${_c#* } || _c=
+	case $_c in
+	'' | *[!0-9]*) _c=80 ;;
+	esac
+	echo "$_c"
 }
-doc=${doc%.}
 
-# Not a terminal (piped/redirected): just print.
-if [ ! -t 1 ]; then
-	printf '%s' "$doc"
-	exit 0
+# "<mtime> <size>" of $file, empty if missing. GNU syntax first: on Linux
+# `stat -f` means filesystem status and would "succeed" with the wrong data.
+file_stamp() {
+	stat -L -c '%y %s' -- "$file" 2>/dev/null || stat -L -f '%Fm %z' -- "$file" 2>/dev/null
+}
+
+# OSC 1337 SetUserVar NAME=VALUE to the terminal (tmux needs passthrough:
+# `set -g allow-passthrough on`). Terminals without user vars ignore it.
+uservar() {
+	_v=$(printf '%s' "$2" | base64 | tr -d '\n')
+	{
+		if [ -n "${TMUX:-}" ]; then
+			printf '\033Ptmux;\033\033]1337;SetUserVar=%s=%s\007\033\\' "$1" "$_v"
+		else
+			printf '\033]1337;SetUserVar=%s=%s\007' "$1" "$_v"
+		fi
+	} 2>/dev/null >/dev/tty
+}
+
+# Page a file, not a pipe: less needs the size for the percent prompt.
+tmpdir=${TMPDIR:-/tmp}
+dir=$(mktemp -d "${tmpdir%/}/mdview.XXXXXX") || exit 1
+doc=$dir/doc
+watcher=
+trap '[ -n "$watcher" ] && kill "$watcher" 2>/dev/null; rm -rf "$dir"' EXIT
+trap 'exit 130' HUP INT TERM
+
+# Render $file for a terminal of $1 columns (2-col margin) into $dir/new.
+render() {
+	_w=$(($1 - 2))
+	[ "$_w" -ge 20 ] || _w=20
+	glow-cached "$_w" "$file" </dev/null >"$dir/new"
+}
+
+# Watch-mode render: never fails, shows a placeholder instead. The result is
+# copied over $doc IN PLACE (not mv): less keeps its fd open, so `R` only
+# sees new content if the same inode is rewritten.
+render_doc() {
+	if ! render "$1" 2>/dev/null; then
+		if [ -e "$file" ]; then
+			printf '\n  (could not render %s)\n' "${file##*/}" >"$dir/new"
+		else
+			printf '\n  (%s does not exist yet; save to preview)\n' "${file##*/}" >"$dir/new"
+		fi
+	fi
+	cat "$dir/new" >"$doc"
+}
+
+cols=$(term_cols)
+if [ -n "$watch" ]; then
+	render_doc "$cols"
+else
+	# Render before paging so a failure is reported instead of an empty pager.
+	render "$cols" || {
+		echo "mdview: could not render $file" >&2
+		printf 'Press Enter to return.' >&2
+		read -r _ 2>/dev/null </dev/tty
+		exit 1
+	}
+	cat "$dir/new" >"$doc"
+	# Not a terminal (piped/redirected): just print.
+	if [ ! -t 1 ]; then
+		cat "$doc"
+		exit 0
+	fi
 fi
 
 # Same flags as mdedit's preview: short prompt (percent / END), no quit at
@@ -53,10 +118,23 @@ if [ -n "$less_ver" ] && [ "$less_ver" -ge 550 ]; then
 	set -- "$@" --mouse --wheel-lines=3
 fi
 
-# Page a file, not a pipe: less needs the size for the percent prompt.
-tmpdir=${TMPDIR:-/tmp}
-tmp=$(mktemp "${tmpdir%/}/mdview.XXXXXX") || exit 1
-trap 'rm -f "$tmp"' EXIT
-trap 'exit 130' HUP INT TERM
-printf '%s' "$doc" >"$tmp"
-LESSHISTFILE=- less "$@" -- "$tmp"
+if [ -n "$watch" ]; then
+	# Exits with this shell (EXIT trap kills it; kill -0 covers a SIGKILL).
+	(
+		trap 'exit 0' HUP INT TERM
+		last=$(file_stamp) n=0
+		while kill -0 "$$" 2>/dev/null; do
+			sleep 0.5
+			cur=$(file_stamp) c=$(term_cols)
+			if [ "$cur" != "$last" ] || [ "$c" != "$cols" ]; then
+				last=$cur cols=$c n=$((n + 1))
+				render_doc "$cols"
+				# a fresh value every time, so the change event always fires
+				uservar mdpreview_reload "$$.$n"
+			fi
+		done
+	) </dev/null &
+	watcher=$!
+fi
+
+LESSHISTFILE=- less "$@" -- "$doc"

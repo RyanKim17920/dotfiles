@@ -15,7 +15,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 | `yazi/` | `~/.config/yazi/` |
 | `yazi-sidebar/yazi.toml` | `~/.config/yazi-sidebar/yazi.toml` |
 | `micro/settings.json` | `~/.config/micro/settings.json` |
-| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`) |
+| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`) |
 | `claude/statusline.sh` | `~/.claude/statusline.sh` (Claude Code status line) |
 | `zsh/snippets.zsh` | source it from `~/.zshrc` |
 
