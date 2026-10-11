@@ -6,9 +6,12 @@
 # User-invoked per host; re-running is a fast no-op when nothing changed.
 #
 # Remote changes (all under $HOME):
-#   ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview}  (glow-cached: yazi md
-#                              previewer; mdview: yazi R full-screen reader)
-#   ~/.config/yazi/            (local config; mdedit opener stripped)
+#   ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview}
+#                              (glow-cached: yazi md previewer; mdview: yazi R
+#                              full-screen reader; mdedit + mdpreview: Enter on
+#                              .md opens micro with a live preview split, opened
+#                              by ~/.wezterm.lua on this Mac via user vars)
+#   ~/.config/yazi/            (local config, as is)
 #   ~/.config/micro/settings.json
 #   ~/.claude/statusline.sh    (only this from ~/.claude; nothing else is copied)
 #   ~/.claude/settings.json    (only the "statusLine" key is set; others untouched)
@@ -68,7 +71,7 @@ ERRF="$(mktemp "${TMPDIR:-/tmp}/ssh-setup-err.XXXXXX")"
 # --- 2. probe the remote (one round trip) ----------------------------------
 probe="$(rsh 'uname -sm
 printf "stamp=%s\n" "$(cat "$HOME/.local/share/ssh-setup/stamp" 2>/dev/null || echo none)"
-for b in yazi ya micro glow glow-cached mdview jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
+for b in yazi ya micro glow glow-cached mdview mdedit mdpreview jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
 [ -x "$HOME/.claude/statusline.sh" ] || echo missing=statusline.sh
 grep -qF "\"statusLine\"" "$HOME/.claude/settings.json" 2>/dev/null || echo missing=statusLine
 # a usable jq outside ~/.local/bin (join/map need jq >= 1.5)
@@ -115,47 +118,6 @@ glow_v="$(glow --version 2>/dev/null | awk '{ print $3; exit }' || true)"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ssh-setup.XXXXXX")"
 trap 'rm -rf "$STAGE" "$ERRF"' EXIT
 
-# Strip the local-only mdedit opener from yazi.toml: drop comment lines that
-# mention it, arrays/entries that reference it, and sections left empty.
-filter_yazi_toml() {
-	awk '
-	function flush_array(   i, keep, n) {
-		if (arr_body !~ /mdedit/) { out(arr_head); for (i = 1; i <= arr_n; i++) out(arr[i]); out(arr_tail); return }
-		if (arr_head ~ /^[ \t]*mdedit[ \t]*=/) return
-		n = 0
-		for (i = 1; i <= arr_n; i++) if (arr[i] !~ /mdedit/) keep[++n] = arr[i]
-		if (n == 0) return
-		out(arr_head); for (i = 1; i <= n; i++) out(keep[i]); out(arr_tail)
-	}
-	function out(l) { buf[++nb] = l }
-	in_arr {
-		if ($0 ~ /^[ \t]*\][ \t]*$/) { arr_tail = $0; in_arr = 0; flush_array(); next }
-		arr[++arr_n] = $0; arr_body = arr_body "\n" $0; next
-	}
-	/^[ \t]*#/ && /mdedit/ { next }
-	/^[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*\[[ \t]*$/ { in_arr = 1; arr_head = $0; arr_n = 0; arr_body = $0; next }
-	/mdedit/ { next }
-	{ out($0) }
-	END {
-		# drop [section] headers that only have blank lines before the next header / EOF
-		for (i = 1; i <= nb; i++) {
-			if (buf[i] ~ /^[ \t]*\[[^\[]/) {
-				empty = 1
-				for (j = i + 1; j <= nb && buf[j] !~ /^[ \t]*\[/; j++) if (buf[j] !~ /^[ \t]*$/) { empty = 0; break }
-				if (empty) { drop[i] = 1 }
-			}
-		}
-		# print, collapsing runs of blank lines and trimming trailing blanks
-		last = ""; pending = 0
-		for (i = 1; i <= nb; i++) {
-			if (drop[i]) continue
-			if (buf[i] ~ /^[ \t]*$/) { pending = 1; continue }
-			if (pending && printed) print ""
-			pending = 0; printed = 1; print buf[i]
-		}
-	}' "$1"
-}
-
 stage_configs() {
 	local src="$HOME/.config/yazi" dst="$STAGE/.config/yazi"
 	[ -d "$src" ] || die "no local ~/.config/yazi"
@@ -167,14 +129,6 @@ stage_configs() {
 	for f in plugins flavors; do
 		[ -d "$src/$f" ] && cp -R "$src/$f" "$dst/$f"
 	done
-	if [ -f "$src/yazi.toml" ]; then
-		filter_yazi_toml "$src/yazi.toml" >"$dst/yazi.toml"
-		grep -q mdedit "$dst/yazi.toml" && die "failed to strip mdedit from yazi.toml"
-		if command -v python3 >/dev/null; then
-			python3 -I -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$dst/yazi.toml" \
-				|| die "filtered yazi.toml is not valid TOML"
-		fi
-	fi
 	[ -f "$HOME/.config/micro/settings.json" ] && cp "$HOME/.config/micro/settings.json" "$STAGE/.config/micro/"
 	# Claude Code status line: the script only (never anything else from ~/.claude)
 	[ -f "$HOME/.claude/statusline.sh" ] || die "no local ~/.claude/statusline.sh"
@@ -185,10 +139,13 @@ stage_configs() {
 	[ -f "$HOME/.local/bin/glow-cached" ] || die "no local ~/.local/bin/glow-cached"
 	cp "$HOME/.local/bin/glow-cached" "$STAGE/.local/bin/glow-cached"
 	chmod 755 "$STAGE/.local/bin/glow-cached"
-	# full-screen Markdown reader that keymap.toml's R binding runs
-	[ -f "$HOME/.local/bin/mdview" ] || die "no local ~/.local/bin/mdview"
-	cp "$HOME/.local/bin/mdview" "$STAGE/.local/bin/mdview"
-	chmod 755 "$STAGE/.local/bin/mdview"
+	# mdview: full-screen Markdown reader that keymap.toml's R binding runs;
+	# mdedit: yazi.toml's Enter-on-.md opener; mdpreview: its preview pane
+	for f in mdview mdedit mdpreview; do
+		[ -f "$HOME/.local/bin/$f" ] || die "no local ~/.local/bin/$f"
+		cp "$HOME/.local/bin/$f" "$STAGE/.local/bin/$f"
+		chmod 755 "$STAGE/.local/bin/$f"
+	done
 	find "$STAGE" -name .DS_Store -delete
 	chmod -R u+w "$STAGE"
 }
@@ -218,7 +175,7 @@ STAMP="$(
 	{
 		printf 'format=%s arch=%s yazi=%s micro=%s glow=%s ship_jq=%s\n' "$FORMAT" "$ARCH" "$yazi_v" "$micro_v" "$glow_v" "$SHIP_JQ"
 		printf '%s\n' "$BASHRC_BLOCK" "$STATUSLINE_JSON"
-		(cd "$STAGE" && find .config .claude .local/bin/glow-cached .local/bin/mdview -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
+		(cd "$STAGE" && find .config .claude .local/bin/glow-cached .local/bin/mdview .local/bin/mdedit .local/bin/mdpreview -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
 	} | shasum -a 256 | awk '{ print $1 }'
 )"
 
@@ -226,7 +183,7 @@ summary_tail() {
 	echo "  pdftoppm on $HOST: $pdftoppm$([ "$pdftoppm" = no ] && echo ' (PDF previews unavailable; install poppler-utils to enable)')"
 	cat <<EOF
   undo on $HOST:
-    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview} ~/.config/micro/settings.json
+    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview} ~/.config/micro/settings.json
     rm -rf ~/.config/yazi ~/.local/share/ssh-setup
     sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc
     rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
@@ -328,7 +285,7 @@ if [ ! -f .local/share/ssh-setup/stamp ]; then
 	for d in .config/yazi .config/micro; do
 		if [ -e "$d" ] && [ ! -e "$d.bak-ssh-setup" ]; then cp -a "$d" "$d.bak-ssh-setup"; echo "backup: ~/$d.bak-ssh-setup"; fi
 	done
-	for b in yazi ya micro glow glow-cached mdview; do
+	for b in yazi ya micro glow glow-cached mdview mdedit mdpreview; do
 		f=".local/bin/$b"
 		if [ -e "$f" ] && [ ! -e "$f.bak-ssh-setup" ]; then cp -a "$f" "$f.bak-ssh-setup"; echo "backup: ~/$f.bak-ssh-setup"; fi
 	done
@@ -344,7 +301,7 @@ fi
 mkdir -p .local/bin .config
 [ -d .claude ] || mkdir -m 700 .claude
 tar -xf - -C "$HOME"
-chmod 755 .claude/statusline.sh .local/bin/glow-cached .local/bin/mdview
+chmod 755 .claude/statusline.sh .local/bin/glow-cached .local/bin/mdview .local/bin/mdedit .local/bin/mdpreview
 # merge only the statusLine key into ~/.claude/settings.json
 S=.claude/settings.json SL="$(cat .local/share/ssh-setup/statusline.json)"
 [ -L "$S" ] && S="$(readlink -f "$S")"   # edit a dotfiles-symlinked target in place

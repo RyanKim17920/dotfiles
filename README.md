@@ -135,7 +135,8 @@ Caveats:
 - Needs non-interactive ssh. If the host wants a password or 2FA, open a
   `ssh <host>` session first so a ControlMaster connection exists.
 - Local tools required: `curl jq shasum unzip bsdtar`.
-- The `mdedit` opener is stripped from the remote `yazi.toml` (it needs WezTerm's CLI locally).
+- `mdedit` and `mdpreview` are shipped too, so Enter on `.md` in remote Yazi
+  opens the side-by-side preview when you are in WezTerm (see above).
 - PDF previews on the remote need `pdftoppm` (poppler-utils).
 - Hosts that cannot run arbitrary commands (e.g. a forced-command bastion)
   can be refused by alias or resolved hostname:
