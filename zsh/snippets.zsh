@@ -50,3 +50,28 @@ function y() {
 # --- Default editor (used by yazi and others) ---
 export EDITOR=micro
 export VISUAL=micro
+
+# --- Terminal-mode reset before each prompt ---
+# A remote program that dies with the connection (micro, less, yazi over a
+# dropped ssh) can leave mouse reporting on, so every mouse move prints escape
+# codes into this shell. Turn mouse tracking off, show the cursor and reset
+# cursor-key/keypad modes before each prompt. Cheap (one printf), and precmd
+# runs before a prompt is drawn, never on the theme's TRAPALRM redraw.
+autoload -Uz add-zsh-hook
+_reset_term_modes() {
+  [[ -t 1 ]] && printf '\e[?1000l\e[?1002l\e[?1003l\e[?1005l\e[?1006l\e[?1015l\e[?25h\e[?1l\e>'
+  return 0
+}
+add-zsh-hook precmd _reset_term_modes
+
+# --- ssh: offer to reconnect when an interactive session drops ---
+# Interactive `ssh` goes through ssh-pane (Enter reconnects, q closes; see
+# README). Scripts, git, scp and rsync don't use shell functions, and ssh-pane
+# itself passes -G/-O/-Q/-V/-W queries and non-terminal use straight to ssh.
+ssh() {
+  if [[ -t 0 && -t 1 && -x ~/.local/bin/ssh-pane ]]; then
+    ~/.local/bin/ssh-pane "$@"
+  else
+    command ssh "$@"
+  fi
+}
