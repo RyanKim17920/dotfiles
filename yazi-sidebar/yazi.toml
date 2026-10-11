@@ -1,0 +1,23 @@
+# Yazi config for the WezTerm sidebar (CMD+E). Loaded via YAZI_CONFIG_HOME;
+# keymap/theme/plugins/flavors are symlinks to ~/.config/yazi.
+
+[mgr]
+# Narrow pane: show only the current directory (no parent column, no preview)
+ratio = [ 0, 1, 0 ]
+
+# Text/code files open in micro in a new WezTerm pane to the right of the
+# sidebar instead of replacing it. Everything else (PDF, images...) keeps the
+# default `open` (Preview) rules.
+[opener]
+edit = [
+	{ run = '"$HOME/.local/bin/yazi-open" %s', desc = "micro (WezTerm split)", orphan = true, for = "unix" },
+]
+cd_here = [
+	{ run = 'ya emit cd %s1', desc = "Enter directory", for = "unix" },
+]
+
+[open]
+# Enter (or right-click) on a folder navigates into it instead of opening micro
+prepend_rules = [
+	{ mime = "folder/*", use = [ "cd_here", "reveal" ] },
+]
