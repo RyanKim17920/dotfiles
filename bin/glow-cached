@@ -13,6 +13,9 @@
 
 set -u
 
+# Non-interactive shells (ssh, Yazi) may lack ~/.local/bin, where glow often lives.
+PATH="$HOME/.local/bin:$PATH"
+
 STYLE=dark
 
 usage() {
