@@ -153,9 +153,12 @@ Caveats:
   reconnects with the same ssh command; `q`, Ctrl+D or Ctrl+C closes. Quick
   repeated failures back off a few seconds between attempts.
 - If you started tmux by hand after a plain `ssh host`, the reconnect brings
-  you back into it: one quick extra ssh call lists detached tmux sessions on
-  the server active in the last 10 minutes (`SSH_PANE_TMUX_WINDOW`, in
-  seconds). Exactly one is re-attached automatically; several show a picker
+  you back into it: one quick extra ssh call lists tmux sessions on the
+  server active in the last 10 minutes (`SSH_PANE_TMUX_WINDOW`, in seconds).
+  Sessions still marked attached count too, since after a Wi-Fi drop the
+  server may not have noticed the dead client yet; attaching alongside it
+  never kicks another client. Exactly one is re-attached automatically;
+  several show a picker, detached ones first and the rest marked "attached"
   (number: attach · Enter: plain shell · q: close); none means a plain shell.
   After another drop the session attached last is preferred. Detaching or
   ending the session closes the pane like a normal exit. Invocations with a

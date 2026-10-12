@@ -11,8 +11,9 @@
 #     "[disconnected from host — Enter: reconnect · q: close]".
 #     Enter or r reconnects; q, Ctrl+D or Ctrl+C exits.
 #     If the original command had no remote command (plain `ssh host`), the
-#     reconnect first asks the server for detached tmux sessions active in the
-#     last $SSH_PANE_TMUX_WINDOW seconds (default 600): exactly one is
+#     reconnect first asks the server for tmux sessions active in the last
+#     $SSH_PANE_TMUX_WINDOW seconds (default 600), attached or not, since a
+#     dead client can linger after an abrupt drop: exactly one is
 #     re-attached with `ssh -t ... tmux attach`; several bring up a picker
 #     (number: attach · Enter: plain shell · q: close); none, no tmux or a
 #     failed probe means a plain reconnect. After a later drop the session
@@ -118,31 +119,36 @@ choose_tmux() {
 	now=${probe%%"
 "*}
 	case $now in '' | *[!0-9]*) return 0 ;; esac
-	# Detached sessions active within the window, most recent first: "age name"
+	# Sessions active within the window, detached first, then most recent
+	# first: "attached age name". Attached ones are included because after an
+	# abrupt drop the server may not have noticed the dead client yet; tmux lets
+	# several clients share a session, so attaching never kicks anyone.
 	cands=$(printf '%s\n' "$probe" | sed 1d | while read -r att act name; do
 		case $att$act in (*[!0-9]* | '') continue ;; esac
-		[ "$att" -eq 0 ] || continue
 		[ -n "$name" ] || continue
 		age=$((now - act))
 		[ "$age" -lt 0 ] && age=0
-		[ "$age" -le "$tmux_window" ] && printf '%s %s\n' "$age" "$name"
-	done | sort -n)
+		[ "$att" -gt 0 ] && att=1
+		[ "$age" -le "$tmux_window" ] && printf '%s %s %s\n' "$att" "$age" "$name"
+	done | sort -k1,1n -k2,2n)
 	[ -n "$cands" ] || return 0
 	count=$(printf '%s\n' "$cands" | wc -l | tr -d ' ')
-	if [ -n "$last_attach" ] && printf '%s\n' "$cands" | cut -d' ' -f2- | grep -Fxq -- "$last_attach"; then
+	if [ -n "$last_attach" ] && printf '%s\n' "$cands" | cut -d' ' -f3- | grep -Fxq -- "$last_attach"; then
 		attach=$last_attach
 		return 0
 	fi
 	if [ "$count" -eq 1 ]; then
-		attach=${cands#* }
+		attach=${cands#* * }
 		return 0
 	fi
 	[ "$count" -gt 9 ] && count=9
-	printf '\033[2m[detached tmux sessions on %s]\033[0m\r\n' "$dest" >/dev/tty
+	printf '\033[2m[recent tmux sessions on %s]\033[0m\r\n' "$dest" >/dev/tty
 	i=0
-	printf '%s\n' "$cands" | head -n 9 | while read -r age name; do
+	printf '%s\n' "$cands" | head -n 9 | while read -r att age name; do
 		i=$((i + 1))
-		printf '  %d) %s \033[2m(active %ss ago)\033[0m\r\n' "$i" "$name" "$age" >/dev/tty
+		label=
+		[ "$att" -eq 1 ] && label=', attached'
+		printf '  %d) %s \033[2m(active %ss ago%s)\033[0m\r\n' "$i" "$name" "$age" "$label" >/dev/tty
 	done
 	printf '\033[2m[1-%d: attach · Enter: plain shell · q: close]\033[0m' "$count" >/dev/tty
 	while :; do
@@ -152,7 +158,7 @@ choose_tmux() {
 			n=$((${key#3}))
 			[ "$n" -le "$count" ] || continue
 			attach=$(printf '%s\n' "$cands" | sed -n "${n}p")
-			attach=${attach#* }
+			attach=${attach#* * }
 			break
 			;;
 		0a | 0d) break ;;
