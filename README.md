@@ -24,8 +24,9 @@ sidebar. It has its own `yazi.toml` (single column, opens files in a split) and
 symlinks `keymap.toml`, `theme.toml`, `package.toml`, `plugins` and `flavors`
 to `../yazi/`.
 
-Yazi `plugins/` and `flavors/` are not committed; `ya pkg install` fetches
-them from `yazi/package.toml`.
+Yazi `plugins/` and `flavors/` from `ya pkg` are not committed; `ya pkg install`
+fetches them from `yazi/package.toml`. The one custom plugin,
+`yazi/plugins/upscale.yazi`, is committed and symlinked by `install.sh`.
 
 ## WezTerm keys
 
@@ -77,11 +78,17 @@ terminals it is plain micro.
 
 Markdown previews in Yazi are rendered with glow (piper plugin).
 
+Small raster images (icons, small screenshots) are enlarged to about 80% of the
+preview pane (at most 8x) by the `upscale` previewer instead of being drawn at
+native pixel size. It resizes with `sips` on macOS or ImageMagick
+(`magick`/`convert`) on Linux into Yazi's cache; without either it falls back
+to the normal preview. SVG previews need `resvg`.
+
 ## Dependencies
 
 ```sh
 brew install --cask wezterm
-brew install yazi poppler glow micro fzf jq
+brew install yazi poppler glow micro fzf jq resvg
 ```
 
 Zsh snippets assume [oh-my-zsh](https://ohmyz.sh) plus these third-party plugins:
@@ -123,7 +130,7 @@ Make sure `~/.local/bin` is on your `PATH`. For the status line, point
 ssh-setup <host>
 ```
 
-Installs yazi, ya, micro and glow (static release binaries matching your local
+Installs yazi, ya, micro, glow and resvg (static release binaries matching your local
 versions, checksum-verified), your yazi/micro configs and the status line into
 your home directory on a remote Linux host (x86_64 or aarch64). No sudo. It
 adds one marked block to the remote `~/.bashrc` (PATH, `EDITOR=micro`, `y`),
@@ -138,6 +145,8 @@ Caveats:
 - `mdedit` and `mdpreview` are shipped too, so Enter on `.md` in remote Yazi
   opens the side-by-side preview when you are in WezTerm (see above).
 - PDF previews on the remote need `pdftoppm` (poppler-utils).
+- resvg (SVG previews) is only shipped to x86_64 hosts; upstream publishes no
+  Linux aarch64 binary. Small-image upscaling on the remote needs ImageMagick.
 - Hosts that cannot run arbitrary commands (e.g. a forced-command bastion)
   can be refused by alias or resolved hostname:
   `export SSH_SETUP_SKIP_HOSTS="bastion other-host"`.
