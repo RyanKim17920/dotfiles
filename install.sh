@@ -28,6 +28,8 @@ link "$REPO/wezterm/wezterm.lua" "$HOME/.wezterm.lua"
 for f in yazi.toml keymap.toml theme.toml package.toml init.lua; do
 	link "$REPO/yazi/$f" "$HOME/.config/yazi/$f"
 done
+# Custom (non-package) Yazi plugins; the ya-pkg ones come from package.toml
+link "$REPO/yazi/plugins/upscale.yazi" "$HOME/.config/yazi/plugins/upscale.yazi"
 
 # Sidebar Yazi (CMD+E): own yazi.toml, everything else shared with ~/.config/yazi
 link "$REPO/yazi-sidebar/yazi.toml" "$HOME/.config/yazi-sidebar/yazi.toml"
