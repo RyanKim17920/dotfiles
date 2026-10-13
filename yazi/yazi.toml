@@ -13,6 +13,12 @@ url = "*.md"
 # glow-cached caches renders: piper re-runs this on every scroll step
 run = 'piper -- "$HOME/.local/bin/glow-cached" "$w" "$1"'
 
+# Small raster images (icons, small screenshots) are enlarged to ~80% of the
+# preview pane instead of drawn at native pixel size; see plugins/upscale.yazi
+[[plugin.prepend_previewers]]
+mime = "image/{png,jpeg,gif,webp,bmp,x-ms-bmp}"
+run  = "upscale"
+
 # Enter on Markdown: micro + live glow preview split (WezTerm), see ~/.local/bin/mdedit
 [opener]
 mdedit = [
