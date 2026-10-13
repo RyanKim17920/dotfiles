@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ssh-setup <host>
 #
-# Install yazi (+ ya), micro and glow plus this Mac's yazi/micro configs and
+# Install yazi (+ ya), micro, glow and resvg plus this Mac's yazi/micro configs and
 # Claude Code status line into YOUR OWN home directory on a remote Linux host. No sudo, nothing system-wide.
 # User-invoked per host; re-running is a fast no-op when nothing changed.
 #
@@ -11,6 +11,8 @@
 #                              full-screen reader; mdedit + mdpreview: Enter on
 #                              .md opens micro with a live preview split, opened
 #                              by ~/.wezterm.lua on this Mac via user vars)
+#   ~/.local/bin/resvg         (yazi's SVG previewer; x86_64 only, as upstream
+#                              publishes no Linux aarch64 binary)
 #   ~/.config/yazi/            (local config, as is)
 #   ~/.config/micro/settings.json
 #   ~/.claude/statusline.sh    (only this from ~/.claude; nothing else is copied)
@@ -71,7 +73,7 @@ ERRF="$(mktemp "${TMPDIR:-/tmp}/ssh-setup-err.XXXXXX")"
 # --- 2. probe the remote (one round trip) ----------------------------------
 probe="$(rsh 'uname -sm
 printf "stamp=%s\n" "$(cat "$HOME/.local/share/ssh-setup/stamp" 2>/dev/null || echo none)"
-for b in yazi ya micro glow glow-cached mdview mdedit mdpreview jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
+for b in yazi ya micro glow glow-cached mdview mdedit mdpreview resvg jq; do [ -x "$HOME/.local/bin/$b" ] || echo "missing=$b"; done
 [ -x "$HOME/.claude/statusline.sh" ] || echo missing=statusline.sh
 grep -qF "\"statusLine\"" "$HOME/.claude/settings.json" 2>/dev/null || echo missing=statusLine
 # a usable jq outside ~/.local/bin (join/map need jq >= 1.5)
@@ -108,11 +110,17 @@ if [ -n "$jq_sys" ]; then SHIP_JQ=no; else SHIP_JQ=yes; fi
 # ~/.local/bin/jq only counts as missing when we are the ones shipping it
 remote_missing="$(printf '%s\n' $remote_missing | { [ "$SHIP_JQ" = yes ] && cat || { grep -vx jq || true; }; } | tr '\n' ' ' | sed 's/ *$//')"
 case "$ARCH" in x86_64) JQ_T=jq-linux-amd64 ;; aarch64) JQ_T=jq-linux-arm64 ;; esac
+# resvg (SVG previews): upstream only publishes a Linux x86_64 binary
+case "$ARCH" in x86_64) RESVG_T=resvg-linux-x86_64.tar.gz; SHIP_RESVG=yes ;; *) RESVG_T=; SHIP_RESVG=no ;; esac
+if [ "$SHIP_RESVG" = no ]; then
+	remote_missing="$(printf '%s\n' $remote_missing | { grep -vx resvg || true; } | tr '\n' ' ' | sed 's/ *$//')"
+fi
 
 # --- local versions (what we try to match) ----------------------------------
 yazi_v="$(yazi --version 2>/dev/null | awk '/Version:/ { print $2; exit }' || true)"
 micro_v="$(micro --version 2>/dev/null | awk '/Version:/ { print $2; exit }' || true)"
 glow_v="$(glow --version 2>/dev/null | awk '{ print $3; exit }' || true)"
+resvg_v="$(resvg --version 2>/dev/null | awk 'NR == 1 { print $NF }' || true)"
 
 # --- stage configs (cheap; needed for the idempotency hash) ----------------
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ssh-setup.XXXXXX")"
@@ -127,7 +135,8 @@ stage_configs() {
 		[ -f "$src/$f" ] && cp "$src/$f" "$dst/$f"
 	done
 	for f in plugins flavors; do
-		[ -d "$src/$f" ] && cp -R "$src/$f" "$dst/$f"
+		# -L: custom plugins may be symlinks into a dotfiles checkout
+		[ -d "$src/$f" ] && cp -RL "$src/$f" "$dst/$f"
 	done
 	[ -f "$HOME/.config/micro/settings.json" ] && cp "$HOME/.config/micro/settings.json" "$STAGE/.config/micro/"
 	# Claude Code status line: the script only (never anything else from ~/.claude)
@@ -173,7 +182,7 @@ $MARK_END"
 
 STAMP="$(
 	{
-		printf 'format=%s arch=%s yazi=%s micro=%s glow=%s ship_jq=%s\n' "$FORMAT" "$ARCH" "$yazi_v" "$micro_v" "$glow_v" "$SHIP_JQ"
+		printf 'format=%s arch=%s yazi=%s micro=%s glow=%s ship_jq=%s resvg=%s\n' "$FORMAT" "$ARCH" "$yazi_v" "$micro_v" "$glow_v" "$SHIP_JQ" "$([ "$SHIP_RESVG" = yes ] && echo "${resvg_v:-latest}" || echo none)"
 		printf '%s\n' "$BASHRC_BLOCK" "$STATUSLINE_JSON"
 		(cd "$STAGE" && find .config .claude .local/bin/glow-cached .local/bin/mdview .local/bin/mdedit .local/bin/mdpreview -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
 	} | shasum -a 256 | awk '{ print $1 }'
@@ -181,9 +190,10 @@ STAMP="$(
 
 summary_tail() {
 	echo "  pdftoppm on $HOST: $pdftoppm$([ "$pdftoppm" = no ] && echo ' (PDF previews unavailable; install poppler-utils to enable)')"
+	[ "$SHIP_RESVG" = yes ] || echo "  resvg: not shipped (no Linux $ARCH release upstream; SVG previews unavailable)"
 	cat <<EOF
   undo on $HOST:
-    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview} ~/.config/micro/settings.json
+    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview,resvg} ~/.config/micro/settings.json
     rm -rf ~/.config/yazi ~/.local/share/ssh-setup
     sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc
     rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
@@ -194,7 +204,7 @@ EOF
 }
 
 if [ "$remote_stamp" = "$STAMP" ] && [ -z "$remote_missing" ]; then
-	echo "ssh-setup: $HOST ($ARCH) already up to date (yazi $yazi_v, micro $micro_v, glow $glow_v) [$((SECONDS - START))s]"
+	echo "ssh-setup: $HOST ($ARCH) already up to date (yazi $yazi_v, micro $micro_v, glow $glow_v$([ "$SHIP_RESVG" = yes ] && echo ", resvg $resvg_v")) [$((SECONDS - START))s]"
 	summary_tail
 	exit 0
 fi
@@ -272,6 +282,9 @@ echo "ssh-setup: $HOST is Linux $ARCH; preparing binaries"
 d="$(get_tool yazi  sxyazi/yazi           "$yazi_v"  "yazi-$YAZI_T-unknown-linux-musl.zip" yazi ya)"; cp "$d/yazi" "$d/ya" "$STAGE/.local/bin/"
 d="$(get_tool micro zyedidia/micro        "$micro_v" "micro-{v}-$MICRO_T.tar.gz" micro)";              cp "$d/micro" "$STAGE/.local/bin/"
 d="$(get_tool glow  charmbracelet/glow    "$glow_v"  "glow_{v}_$GLOW_T.tar.gz" glow)";                cp "$d/glow" "$STAGE/.local/bin/"
+if [ "$SHIP_RESVG" = yes ]; then
+	d="$(get_tool resvg linebender/resvg  "$resvg_v" "$RESVG_T" resvg)";                              cp "$d/resvg" "$STAGE/.local/bin/"
+fi
 if [ "$SHIP_JQ" = yes ]; then
 	d="$(get_tool jq jqlang/jq "" "$JQ_T" jq)";                                                        cp "$d/jq" "$STAGE/.local/bin/"
 fi
@@ -285,7 +298,7 @@ if [ ! -f .local/share/ssh-setup/stamp ]; then
 	for d in .config/yazi .config/micro; do
 		if [ -e "$d" ] && [ ! -e "$d.bak-ssh-setup" ]; then cp -a "$d" "$d.bak-ssh-setup"; echo "backup: ~/$d.bak-ssh-setup"; fi
 	done
-	for b in yazi ya micro glow glow-cached mdview mdedit mdpreview; do
+	for b in yazi ya micro glow glow-cached mdview mdedit mdpreview resvg; do
 		f=".local/bin/$b"
 		if [ -e "$f" ] && [ ! -e "$f.bak-ssh-setup" ]; then cp -a "$f" "$f.bak-ssh-setup"; echo "backup: ~/$f.bak-ssh-setup"; fi
 	done
@@ -346,7 +359,7 @@ if ! grep -qF "'"$MARK_BEGIN"'" .bashrc; then
 else
 	echo "bashrc: block already present"
 fi
-echo "installed: yazi $(.local/bin/yazi --version 2>&1 | awk "/Version:/{print \$2; exit}"), micro $(.local/bin/micro --version 2>&1 | awk "/Version:/{print \$2; exit}"), glow $(.local/bin/glow --version 2>&1 | awk "{print \$3; exit}"), statusline (jq: $(${JQ:-false} --version 2>/dev/null || echo none))"'
+echo "installed: yazi $(.local/bin/yazi --version 2>&1 | awk "/Version:/{print \$2; exit}"), micro $(.local/bin/micro --version 2>&1 | awk "/Version:/{print \$2; exit}"), glow $(.local/bin/glow --version 2>&1 | awk "{print \$3; exit}"), resvg $(.local/bin/resvg --version 2>/dev/null || echo none), statusline (jq: $(${JQ:-false} --version 2>/dev/null || echo none))"'
 
 REMOTE_SCRIPT="JQ_SYS=$(sq "$jq_sys") SHIP_JQ=$SHIP_JQ
 $REMOTE_SCRIPT"
