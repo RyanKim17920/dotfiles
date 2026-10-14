@@ -9,15 +9,7 @@
 # escape codes. Then:
 #   * exit status 255 (connection failed or dropped): show
 #     "[disconnected from host — Enter: reconnect · q: close]".
-#     Enter or r reconnects; q, Ctrl+D or Ctrl+C exits.
-#     If the original command had no remote command (plain `ssh host`), the
-#     reconnect first asks the server for tmux sessions active in the last
-#     $SSH_PANE_TMUX_WINDOW seconds (default 600), attached or not, since a
-#     dead client can linger after an abrupt drop: exactly one is
-#     re-attached with `ssh -t ... tmux attach`; several bring up a picker
-#     (number: attach · Enter: plain shell · q: close); none, no tmux or a
-#     failed probe means a plain reconnect. After a later drop the session
-#     attached last is preferred while it is still a candidate.
+#     Enter or r re-runs the identical ssh command; q, Ctrl+D or Ctrl+C exits.
 #   * any other status (you typed `exit`, the remote command finished): exit
 #     with that status right away, so a WezTerm pane closes as usual.
 # Query/control invocations (-G -O -Q -V -W) and non-terminal use are passed
@@ -30,52 +22,39 @@ reset_modes() {
 	printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l\033[?1049l\033[?25h\033[?1l\033>' >/dev/tty
 }
 
-# Destination (first non-option argument), whether a remote command follows it
-# (ssh also accepts options after the destination) and whether this is a
-# query/control invocation. Options taking a value are from `man ssh`.
+# Destination (first non-option argument) and whether this is a query/control
+# invocation. Options taking a value are from `man ssh`.
 dest=
-has_cmd=
 passthrough=
-no_tmux=
 skip_next=
-end_opts=
 for a in "$@"; do
 	if [ -n "$skip_next" ]; then
 		skip_next=
 		continue
 	fi
-	if [ -z "$end_opts" ]; then
-		case $a in
-		--)
-			end_opts=1
-			continue
-			;;
-		-?*)
-			flags=${a#-}
-			while [ -n "$flags" ]; do
-				c=${flags%"${flags#?}"}
-				flags=${flags#?}
-				case $c in
-				[GOQVW]) passthrough=1 ;;
-				[NTs]) no_tmux=1 ;; # no shell, no tty, or a subsystem: never reattach
-				esac
-				case $c in
-				[bcDEeFIiJLlmOopQRSWw])
-					[ -z "$flags" ] && skip_next=1
-					break
-					;;
-				esac
-			done
-			continue
-			;;
-		esac
-	fi
-	if [ -z "$dest" ]; then
+	case $a in
+	--) continue ;;
+	-?*)
+		flags=${a#-}
+		while [ -n "$flags" ]; do
+			c=${flags%"${flags#?}"}
+			flags=${flags#?}
+			case $c in
+			[GOQVW]) passthrough=1 ;;
+			esac
+			case $c in
+			[bcDEeFIiJLlmOopQRSWw])
+				[ -z "$flags" ] && skip_next=1
+				break
+				;;
+			esac
+		done
+		;;
+	*)
 		dest=$a
-	else
-		has_cmd=1
 		break
-	fi
+		;;
+	esac
 done
 
 if [ -n "$passthrough" ] || [ -z "$dest" ] || ! [ -t 0 ] || ! { : </dev/tty; } 2>/dev/null; then
@@ -84,106 +63,12 @@ fi
 
 saved_tty=$(stty -g </dev/tty 2>/dev/null)
 fails=0
-tmux_window=${SSH_PANE_TMUX_WINDOW:-600}
-case $tmux_window in '' | *[!0-9]*) tmux_window=600 ;; esac
-attach=      # tmux session to attach on the next connect (empty: plain ssh)
-last_attach= # session attached most recently, preferred after another drop
-
-dim() {
-	printf '\033[2m%s\033[0m\r\n' "$*" >/dev/tty
-}
-
-# Read one key, unbuffered and unechoed, and print it as hex. Ctrl+C still
-# raises SIGINT, which closes the pane.
-read_key() {
-	trap '[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null; printf "\r\n" >/dev/tty; exit 130' INT
-	stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null
-	dd bs=1 count=1 </dev/tty 2>/dev/null | od -An -tx1 | tr -d ' \n'
-	[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
-	trap - INT
-}
-
-# Single-quote a string for the remote POSIX shell.
-shquote() {
-	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
-
-# Ask the server for tmux sessions worth re-attaching and set $attach.
-# Returns 1 when the pane should close (q in the picker).
-choose_tmux() {
-	attach=
-	probe=$(ssh -n -T -o BatchMode=yes -o ConnectTimeout=10 "$@" \
-		"date +%s; tmux list-sessions -F '#{session_attached} #{session_activity} #{session_name}' 2>/dev/null" \
-		2>/dev/null | tr -d '\r')
-	[ -n "$probe" ] || return 0
-	now=${probe%%"
-"*}
-	case $now in '' | *[!0-9]*) return 0 ;; esac
-	# Sessions active within the window, detached first, then most recent
-	# first: "attached age name". Attached ones are included because after an
-	# abrupt drop the server may not have noticed the dead client yet; tmux lets
-	# several clients share a session, so attaching never kicks anyone.
-	cands=$(printf '%s\n' "$probe" | sed 1d | while read -r att act name; do
-		case $att$act in (*[!0-9]* | '') continue ;; esac
-		[ -n "$name" ] || continue
-		age=$((now - act))
-		[ "$age" -lt 0 ] && age=0
-		[ "$att" -gt 0 ] && att=1
-		[ "$age" -le "$tmux_window" ] && printf '%s %s %s\n' "$att" "$age" "$name"
-	done | sort -k1,1n -k2,2n)
-	[ -n "$cands" ] || return 0
-	count=$(printf '%s\n' "$cands" | wc -l | tr -d ' ')
-	if [ -n "$last_attach" ] && printf '%s\n' "$cands" | cut -d' ' -f3- | grep -Fxq -- "$last_attach"; then
-		attach=$last_attach
-		return 0
-	fi
-	if [ "$count" -eq 1 ]; then
-		attach=${cands#* * }
-		return 0
-	fi
-	[ "$count" -gt 9 ] && count=9
-	printf '\033[2m[recent tmux sessions on %s]\033[0m\r\n' "$dest" >/dev/tty
-	i=0
-	printf '%s\n' "$cands" | head -n 9 | while read -r att age name; do
-		i=$((i + 1))
-		label=
-		[ "$att" -eq 1 ] && label=', attached'
-		printf '  %d) %s \033[2m(active %ss ago%s)\033[0m\r\n' "$i" "$name" "$age" "$label" >/dev/tty
-	done
-	printf '\033[2m[1-%d: attach · Enter: plain shell · q: close]\033[0m' "$count" >/dev/tty
-	while :; do
-		key=$(read_key)
-		case $key in
-		3[1-9])
-			n=$((${key#3}))
-			[ "$n" -le "$count" ] || continue
-			attach=$(printf '%s\n' "$cands" | sed -n "${n}p")
-			attach=${attach#* * }
-			break
-			;;
-		0a | 0d) break ;;
-		71 | 51 | 04 | '')
-			printf '\r\n' >/dev/tty
-			return 1
-			;;
-		esac
-	done
-	printf '\r\n' >/dev/tty
-	return 0
-}
 
 while :; do
 	interrupted=
 	trap 'interrupted=1' INT
 	start=$(date +%s)
-	if [ -n "$attach" ]; then
-		dim "[reattaching tmux session $attach]"
-		last_attach=$attach
-		# Fall back to a login shell if the session vanished since the probe
-		ssh -t "$@" "tmux attach-session -t $(shquote "=$attach") || exec \"\$SHELL\" -l"
-	else
-		ssh "$@"
-	fi
+	ssh "$@"
 	status=$?
 	trap - INT
 	reset_modes
@@ -202,13 +87,18 @@ while :; do
 
 	printf '\r\n\033[2m[disconnected from %s — Enter: reconnect · q: close]\033[0m' "$dest" >/dev/tty
 
+	# Read one key, unbuffered and unechoed; Ctrl+C still raises SIGINT
+	trap '[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null; printf "\r\n" >/dev/tty; exit 130' INT
+	stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null
 	while :; do
-		key=$(read_key)
+		key=$(dd bs=1 count=1 </dev/tty 2>/dev/null | od -An -tx1 | tr -d ' \n')
 		case $key in
-		0a | 0d | 72 | 52) break ;;           # Enter, r, R: reconnect
+		0a | 0d | 72 | 52) break ;;         # Enter, r, R: reconnect
 		71 | 51 | 04 | '') key=quit; break ;; # q, Q, Ctrl+D, EOF: close
 		esac
 	done
+	[ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
+	trap - INT
 	printf '\r\n' >/dev/tty
 	[ "$key" = quit ] && exit "$status"
 
@@ -219,8 +109,4 @@ while :; do
 		sleep "$wait_s"
 	fi
 	printf '\033[2m[reconnecting to %s…]\033[0m\r\n' "$dest" >/dev/tty
-	attach=
-	if [ -z "$has_cmd" ] && [ -z "$no_tmux" ]; then
-		choose_tmux "$@" || exit "$status"
-	fi
 done

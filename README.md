@@ -159,19 +159,8 @@ Caveats:
 
 - When the connection drops (ssh exits 255) the pane stays open with
   `[disconnected from host — Enter: reconnect · q: close]`. Enter (or `r`)
-  reconnects with the same ssh command; `q`, Ctrl+D or Ctrl+C closes. Quick
+  re-runs the identical ssh command; `q`, Ctrl+D or Ctrl+C closes. Quick
   repeated failures back off a few seconds between attempts.
-- If you started tmux by hand after a plain `ssh host`, the reconnect brings
-  you back into it: one quick extra ssh call lists tmux sessions on the
-  server active in the last 10 minutes (`SSH_PANE_TMUX_WINDOW`, in seconds).
-  Sessions still marked attached count too, since after a Wi-Fi drop the
-  server may not have noticed the dead client yet; attaching alongside it
-  never kicks another client. Exactly one is re-attached automatically;
-  several show a picker, detached ones first and the rest marked "attached"
-  (number: attach · Enter: plain shell · q: close); none means a plain shell.
-  After another drop the session attached last is preferred. Detaching or
-  ending the session closes the pane like a normal exit. Invocations with a
-  remote command (or `-N`/`-T`/`-s`) always just re-run as typed.
 - A normal exit (you typed `exit`, the remote command finished) closes the
   pane as before.
 - After ssh exits, mouse reporting, a stuck alternate screen, a hidden cursor
@@ -181,9 +170,8 @@ Caveats:
 - `ssh -G/-O/-Q/-V/-W`, pipes and scripts (git, scp, rsync) bypass it.
 
 Programs on the server still die with the connection. Run them inside tmux on
-the server so they survive drops: either start tmux after logging in (the
-reconnect re-attaches it, see above) or use `ssh -t host tmux new -A -s work`,
-which a reconnect re-runs as is.
+the server so they survive drops; since a reconnect re-runs the same command,
+`ssh -t host tmux new -A -s work` puts you straight back in the session.
 `ServerAliveInterval 15` / `ServerAliveCountMax 4` under `Host *` makes a dead
 connection show up in about a minute instead of hanging.
 
