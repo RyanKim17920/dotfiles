@@ -429,21 +429,94 @@ for p in %s; do
 done
 exit 1]]
 
--- kind ('f' or 'd') and absolute path of `text` on the pane's host, or nil
--- and a message
-local function resolve_remote(ssh, text, rcwd)
+-- kind ('f' or 'd') and absolute path on the pane's host of the first of
+-- `texts` that exists there, or nil and a message
+local function resolve_remote(ssh, texts, rcwd)
   if not ssh_master_pid(ssh) then
     return nil, 'ssh: no live connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
   end
   local words = {}
-  for _, v in ipairs(path_variants(text)) do table.insert(words, remote_word(v, rcwd)) end
+  for _, text in ipairs(texts) do
+    for _, v in ipairs(path_variants(text)) do table.insert(words, remote_word(v, rcwd)) end
+  end
   local cmd = ssh_batch_cmd(ssh)
   table.insert(cmd, 'sh -c ' .. sh_quote(string.format(REMOTE_RESOLVE, table.concat(words, ' '))))
   local ok, out = wezterm.run_child_process(cmd)
   local kind, path
   if ok then kind, path = out:match '^([fd]) (/[^\n]*)' end
-  if not kind then return nil, 'Path: not found on ' .. ssh_host(ssh) .. ': ' .. text end
+  if not kind then return nil, 'Path: not found on ' .. ssh_host(ssh) .. ': ' .. texts[1] end
   return kind, path
+end
+
+-- Hard-wrapped paths: TUIs like Claude Code break long lines themselves
+-- (newline + indentation, often behind a gutter such as │ or ⎿), so a click
+-- sees only one piece of a long path. wrapped_candidates rebuilds it from
+-- the pane's recent text: the clicked piece plus the path characters that
+-- continue it at the start of the next lines and/or end the previous ones,
+-- longest first. `wrapped` is true when the piece ends its line and a
+-- continuation follows, i.e. on its own it is likely a cut-off prefix.
+local WRAP_LINES = 3 -- lines joined at most in each direction
+local WRAP_SCAN_LINES = 500
+local WRAP_GUTTERS = { '│', '┃', '⎿', '●', '⏺', '▎', '▏', '•', '>', '*', '`', '|' }
+local PATH_CHARS = '[%w%._~/@+%%:-]'
+
+-- `s` without leading (or, with at_end, trailing) whitespace and gutter marks
+local function strip_gutter(s, at_end)
+  repeat
+    local before = s
+    s = at_end and (s:gsub('%s+$', '')) or (s:gsub('^%s+', ''))
+    for _, g in ipairs(WRAP_GUTTERS) do
+      if at_end and s:sub(-#g) == g then
+        s = s:sub(1, -#g - 1)
+      elseif not at_end and s:sub(1, #g) == g then
+        s = s:sub(#g + 1)
+      end
+    end
+  until s == before
+  return s
+end
+
+local function wrapped_candidates(pane, text)
+  local ok, all = pcall(pane.get_lines_as_text, pane, WRAP_SCAN_LINES)
+  local lines = {}
+  for line in ((ok and all or '') .. '\n'):gmatch '([^\n]*)\n' do table.insert(lines, line) end
+  for i = #lines, 1, -1 do
+    local first, last = lines[i]:find(text, 1, true)
+    if first then
+      local prefixes, suffixes = { '' }, { '' }
+      if strip_gutter(lines[i]:sub(last + 1), true) == '' then
+        local acc = ''
+        for k = i + 1, math.min(i + WRAP_LINES, #lines) do
+          local rest = strip_gutter(lines[k], false)
+          local frag = rest:match('^' .. PATH_CHARS .. '+')
+          if not frag then break end
+          acc = acc .. frag
+          table.insert(suffixes, acc)
+          if frag ~= (rest:gsub('%s+$', '')) then break end -- the path ends on this line
+        end
+      end
+      if strip_gutter(lines[i]:sub(1, first - 1), false) == '' then
+        local acc = ''
+        for k = i - 1, math.max(i - WRAP_LINES, 1), -1 do
+          local rest = strip_gutter(lines[k], true)
+          local frag = rest:match(PATH_CHARS .. '+$')
+          if not frag then break end
+          acc = frag .. acc
+          table.insert(prefixes, acc)
+          if frag ~= strip_gutter(rest, false) then break end -- the path starts on this line
+        end
+      end
+      local cands = {}
+      for _, pre in ipairs(prefixes) do
+        for _, suf in ipairs(suffixes) do
+          if pre ~= '' or suf ~= '' then table.insert(cands, pre .. text .. suf) end
+        end
+      end
+      table.sort(cands, function(a, b) return #a > #b end)
+      return cands, #suffixes > 1
+    end
+  end
+  return {}, false
 end
 
 local function open_remote_peek(window, pane, ssh, kind, path)
@@ -1006,7 +1079,19 @@ wezterm.on('open-uri', function(window, pane, uri)
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
 
   if ssh then
-    local kind, path = resolve_remote(ssh, text, remote_cwd(pane))
+    local rcwd = remote_cwd(pane)
+    local kind, path = resolve_remote(ssh, { text }, rcwd)
+    if custom and kind ~= 'f' then
+      local cands, wrapped = wrapped_candidates(pane, text)
+      local full_kind, full = nil, nil
+      if #cands > 0 then full_kind, full = resolve_remote(ssh, cands, rcwd) end
+      if full_kind then
+        kind, path = full_kind, full
+      elseif kind == 'd' and wrapped then
+        toast(window, "Path: couldn't resolve wrapped path: " .. text)
+        return false
+      end
+    end
     if not kind then
       toast(window, path)
       return false
@@ -1020,7 +1105,23 @@ wezterm.on('open-uri', function(window, pane, uri)
   end
   -- Outside ssh a file:// host is this Mac under some name (OSC 7 / ls
   -- --hyperlink use the DHCP name, which changes): use the path if it exists
-  local path = pane:get_domain_name() == 'local' and resolve_path(text, pane_cwd(pane))
+  local cwd = pane_cwd(pane)
+  local path = pane:get_domain_name() == 'local' and resolve_path(text, cwd)
+  if custom and path ~= false and not (path and not is_dir(path)) then
+    -- Missing, or a directory that may be the cut-off start of a wrapped path
+    local cands, wrapped = wrapped_candidates(pane, text)
+    local full
+    for _, c in ipairs(cands) do
+      full = resolve_path(c, cwd)
+      if full then break end
+    end
+    if full then
+      path = full
+    elseif path and wrapped then
+      toast(window, "Path: couldn't resolve wrapped path: " .. text)
+      return false
+    end
+  end
   if not path then
     if custom then
       toast(window, 'Path: not found: ' .. text, 2000)
