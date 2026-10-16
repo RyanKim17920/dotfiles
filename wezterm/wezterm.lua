@@ -903,7 +903,9 @@ local function forward_command(window, pane, text)
   end
   local msg = 'Forward: ' .. table.concat(done, ' · ')
   if open_port then
-    local url = open_url or parse_loopback_url('http://localhost:' .. open_port .. '/')
+    -- No URL printed: a token hint alone still gets the token in (Jupyter-style ?token=)
+    local url = open_url or parse_loopback_url('http://localhost:' .. open_port
+      .. (token_path and '/?token=<token>' or '/'))
     local token_note
     local opened = open_local(master, url, open_port, token_path, function(n) token_note = n end)
     msg = msg .. ' → opened ' .. opened .. (token_note and ('; ' .. token_note) or '')
