@@ -652,8 +652,11 @@ end
 --    (this works from a local pane too); otherwise, in an ssh pane, the same
 --    port on that host's localhost is forwarded. Then the URL opens locally,
 --    path and query kept. A placeholder like ?token=<token> is filled from
---    the most recent `cat .../token` in the scrollback, read over the same
---    master; the token is never logged, shown or written to disk.
+--    a token file read over the same master: the most recent `cat .../token`
+--    in this pane's scrollback, else in the window's other panes (newest
+--    first), else the file that last worked for that host and remote port
+--    (see TOKEN_PATHS_FILE). The token is never logged, shown or written to
+--    disk; only the file's path is remembered.
 -- Local port conflicts: a forward of ours for another target is cancelled
 -- and replaced; one added through the master some other way is cancelled if
 -- its -L spec shows up in the scrollback or a running ssh command line; a
@@ -1018,13 +1021,97 @@ local function read_remote_token(ssh, path)
   return ok and out:match '^%s*(%S+)%s*$' or nil
 end
 
+-- Token-file paths that worked, per "<ssh hostname> <remote port>", so a
+-- later click finds the token without a `cat` hint even when the server
+-- moved to another node. One "host port path" line each; paths only, never
+-- tokens. Cached in wezterm.GLOBAL (TOKEN_PATH_KEY .. key).
+local TOKEN_PATHS_FILE = wezterm.home_dir .. '/.local/state/wezterm/token-paths'
+local TOKEN_PATH_KEY = 'token_path_'
+
+local function read_token_paths()
+  local paths = {}
+  local f = io.open(TOKEN_PATHS_FILE)
+  if not f then return paths end
+  for line in f:lines() do
+    local host, port, path = line:match '^(%S+) (%d+) (.+)$'
+    if host then paths[host .. ' ' .. port] = path end
+  end
+  f:close()
+  return paths
+end
+
+local function remembered_token_path(key)
+  if not wezterm.GLOBAL.token_paths_loaded then
+    for k, path in pairs(read_token_paths()) do wezterm.GLOBAL[TOKEN_PATH_KEY .. k] = path end
+    wezterm.GLOBAL.token_paths_loaded = true
+  end
+  return wezterm.GLOBAL[TOKEN_PATH_KEY .. key]
+end
+
+local function remember_token_path(key, path)
+  if remembered_token_path(key) == path then return end
+  wezterm.GLOBAL[TOKEN_PATH_KEY .. key] = path
+  local paths = read_token_paths()
+  paths[key] = path
+  -- Private file (mode 600) in a private dir, created before anything is written
+  local dir = TOKEN_PATHS_FILE:match '^(.*)/'
+  wezterm.run_child_process { '/bin/sh', '-c',
+    'umask 077 && mkdir -p "$1" && touch "$2" && chmod 600 "$2"', 'sh', dir, TOKEN_PATHS_FILE }
+  local lines = {}
+  for k, v in pairs(paths) do table.insert(lines, k .. ' ' .. v) end
+  table.sort(lines)
+  local f = io.open(TOKEN_PATHS_FILE, 'w')
+  if f then
+    f:write(table.concat(lines, '\n') .. '\n')
+    f:close()
+  end
+end
+
+-- Memoized finder for the token of the server on remote port `rport` behind
+-- master `ssh`, trying in order: `hint` (this pane's `cat` path), `cat`
+-- paths in the window's other panes (newest first), the remembered path for
+-- that host and port. A path that yields a token is remembered.
+local function token_finder(window, pane, ssh, rport, hint)
+  local done, token
+  return function()
+    if done then return token end
+    done = true
+    local host = ssh_identity(ssh)
+    local key = host and rport and (host .. ' ' .. rport)
+    local tried = {}
+    local function try(path)
+      if token or not path or tried[path] then return end
+      tried[path] = true
+      token = read_remote_token(ssh, path)
+      if token and key then remember_token_path(key, path) end
+    end
+    try(hint)
+    if not token then
+      local others = {}
+      local ok, tabs = pcall(function() return window:mux_window():tabs() end)
+      for _, tab in ipairs(ok and tabs or {}) do
+        for _, p in ipairs(tab:panes()) do
+          if p:pane_id() ~= pane:pane_id() then table.insert(others, p) end
+        end
+      end
+      table.sort(others, function(a, b) return a:pane_id() > b:pane_id() end)
+      for _, p in ipairs(others) do
+        local _, path = scrollback_hints(p)
+        try(path)
+      end
+    end
+    if key then try(remembered_token_path(key)) end
+    return token
+  end
+end
+
 -- Open loopback `url` in the browser on local port `lport`, its token
--- placeholder (if any) filled from `token_path` read over master `ssh`;
+-- placeholder (if any) filled from `get_token()` (a token_finder);
 -- `notify` gets a note about the token. Returns "host:port" opened.
-local function open_local(ssh, url, lport, token_path, notify)
+local function open_local(url, lport, get_token, notify)
   local rest, has_placeholder = fill_placeholder(url.rest, nil)
   if has_placeholder then
-    local token = token_path and read_remote_token(ssh, token_path)
+    local token = get_token()
     if token then
       rest = fill_placeholder(url.rest, url_encode(token))
       notify 'token filled in'
@@ -1059,23 +1146,24 @@ local function forward_command(window, pane, text)
   end
   local tunnels, token_path, urls = scrollback_hints(pane)
   local seen = all_forwards(tunnels)
-  local done, open_url, open_port = {}, nil, nil
+  local done, open_url, open_port, open_rport = {}, nil, nil, nil
   for _, f in ipairs(forwards) do
     local lport, how, note = ssh_forward(master, pid, f.host, f.rport, f.lport, seen)
     table.insert(done, lport and describe_forward(master, lport, f.host, f.rport, how, note) or how)
     -- Open one: the first forward with a URL in the scrollback, else the first
     local url = lport and latest_url(urls, f.lport)
     if lport and (not open_port or (url and not open_url)) then
-      open_url, open_port = url, lport
+      open_url, open_port, open_rport = url, lport, f.rport
     end
   end
   local msg = 'Forward: ' .. table.concat(done, ' · ')
   if open_port then
-    -- No URL printed: a token hint alone still gets the token in (Jupyter-style ?token=)
+    -- No URL printed: a findable token still gets in (Jupyter-style ?token=)
+    local get_token = token_finder(window, pane, master, open_rport, token_path)
     local url = open_url or parse_loopback_url('http://localhost:' .. open_port
-      .. (token_path and '/?token=<token>' or '/'))
+      .. (get_token() and '/?token=<token>' or '/'))
     local token_note
-    local opened = open_local(master, url, open_port, token_path, function(n) token_note = n end)
+    local opened = open_local(url, open_port, get_token, function(n) token_note = n end)
     msg = msg .. ' → opened ' .. opened .. (token_note and ('; ' .. token_note) or '')
   end
   toast(window, msg, 5000)
@@ -1103,7 +1191,8 @@ local function open_forwarded(window, pane, url)
     return true
   end
   local msg = 'Forward: ' .. describe_forward(master, lport, target, rport, how, note)
-  open_local(master, url, lport, token_path, function(n) msg = msg .. '; ' .. n end)
+  open_local(url, lport, token_finder(window, pane, master, rport, token_path),
+    function(n) msg = msg .. '; ' .. n end)
   toast(window, msg, 5000)
   return true
 end
