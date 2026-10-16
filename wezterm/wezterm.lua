@@ -402,15 +402,108 @@ local function reveal_remote(window, ssh, kind, path)
   toast(window, 'Copying ' .. host .. ':' .. path .. ' to ~/Downloads/' .. sub .. '/')
 end
 
+-- Localhost links from ssh panes: http://localhost:8888/?token=... printed
+-- by Jupyter, TensorBoard, vite, ... on the remote host. Clicking one adds a
+-- local forward on the pane's existing ControlMaster (`ssh -O forward`,
+-- never a new login) and opens the URL locally, path and query kept. A busy
+-- local port moves to the next free one (the URL is rewritten to match);
+-- ports below 1024 map to 8000+port. Forwards are remembered per host and
+-- port in wezterm.GLOBAL and reused while the master still listens on them.
+
+-- Remote target per URL host, also the host used in the rewritten URL
+local LOOPBACK = {
+  localhost = 'localhost', ['127.0.0.1'] = '127.0.0.1', ['0.0.0.0'] = 'localhost', ['[::1]'] = '[::1]',
+}
+local FORWARD_KEY = 'ssh_forward_' -- .. ssh args .. '|' .. target:port -> local port
+
+-- { scheme, host, rport, rest } for a loopback http(s) URL, else nil
+local function parse_loopback_url(uri)
+  local scheme, host, port, rest = uri:match '^(https?)://(%[::1%])(:?%d*)(.*)$'
+  if not scheme then
+    scheme, host, port, rest = uri:match '^(https?)://([^/:?#]+)(:?%d*)(.*)$'
+  end
+  if not scheme or not LOOPBACK[host:lower()] or not (rest == '' or rest:match '^[/?#]') then
+    return nil
+  end
+  local rport = tonumber(port:sub(2)) or (scheme == 'https' and 443 or 80)
+  return { scheme = scheme, host = host:lower(), rport = rport, rest = rest }
+end
+
+-- pid (string) of the process listening on local TCP `port`, or nil
+local function listener_pid(port)
+  local ok, out = wezterm.run_child_process {
+    '/usr/sbin/lsof', '-nP', '-iTCP:' .. port, '-sTCP:LISTEN', '-t',
+  }
+  return ok and out:match '%d+' or nil
+end
+
+-- Forward remote target:rport over the pane's master. Returns the local
+-- port and whether it was reused, or nil and a message.
+local function ssh_forward(ssh, target, rport)
+  local pid = ssh_master_pid(ssh)
+  if not pid then
+    return nil, 'No live ssh connection to ' .. ssh_host(ssh) .. ' (ControlMaster); not forwarding'
+  end
+  local key = FORWARD_KEY .. table.concat(ssh, ' ', 2) .. '|' .. target .. ':' .. rport
+  local known = wezterm.GLOBAL[key]
+  if known and listener_pid(known) == pid then return known, true end
+  local first = rport >= 1024 and rport or 8000 + rport
+  for lport = first, math.min(first + 20, 65535) do
+    -- lsof can't see other users' listeners; a failed bind just moves on
+    if not listener_pid(lport) and wezterm.run_child_process(
+        ssh_cmd(ssh, '-O', 'forward', '-L', lport .. ':' .. target .. ':' .. rport)) then
+      wezterm.GLOBAL[key] = lport
+      return lport, false
+    end
+  end
+  return nil, 'No free local port in ' .. first .. '-' .. math.min(first + 20, 65535)
+end
+
+local function open_forwarded(window, ssh, url)
+  local target = LOOPBACK[url.host]
+  local lport, reused = ssh_forward(ssh, target, url.rport)
+  if not lport then
+    toast(window, reused, 4000)
+    return
+  end
+  toast(window, (reused and 'Using forward ' or 'Forwarded ') .. ssh_host(ssh) .. ':' .. url.rport
+    .. ' → localhost:' .. lport)
+  wezterm.open_with(url.scheme .. '://' .. target .. ':' .. lport .. url.rest)
+end
+
+-- CMD+SHIFT+L: forward a port (or a pasted localhost URL) without a click
+local forward_prompt = act.PromptInputLine {
+  description = 'Forward remote port (or paste a localhost URL):',
+  action = wezterm.action_callback(function(window, pane, line)
+    line = (line or ''):match '^%s*(.-)%s*$'
+    if line == '' then return end
+    local ssh = pane_ssh_args(pane)
+    local url = parse_loopback_url(line:match '^%d+$' and ('http://localhost:' .. line .. '/') or line)
+    if not ssh then
+      toast(window, 'Not an ssh pane')
+    elseif not url then
+      toast(window, 'Expected a port number or a localhost URL')
+    else
+      open_forwarded(window, ssh, url)
+    end
+  end),
+}
+
 wezterm.on('open-uri', function(window, pane, uri)
   local clicked = wezterm.GLOBAL[REVEAL_KEY]
   wezterm.GLOBAL[REVEAL_KEY] = nil
   local reveal = clicked ~= nil and os.time() - clicked <= 2
+  local ssh = pane_ssh_args(pane)
+  local url = ssh and parse_loopback_url(uri)
+  if url then
+    open_forwarded(window, ssh, url)
+    return false
+  end
+
   local text, host = uri_to_path(uri)
   if not text then return end -- web URL etc.: default opener
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
 
-  local ssh = pane_ssh_args(pane)
   if ssh then
     local kind, path = resolve_remote(ssh, text, remote_cwd(pane))
     if not kind then
@@ -908,6 +1001,8 @@ config.keys = {
   end) },
   -- Pull every other window's tabs into this window, keeping split layouts
   { key = 'm', mods = 'CMD|SHIFT', action = merge_windows },
+  -- ssh pane: forward a remote port to this Mac and open it (see open_forwarded)
+  { key = 'l', mods = 'CMD|SHIFT', action = forward_prompt },
 }
 
 -- Move the focused pane into tab N (1-9) as a split: CMD+OPT+N = right of

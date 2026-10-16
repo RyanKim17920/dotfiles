@@ -44,6 +44,8 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+click a path | Open it in a Yazi peek pane (file hovered, preview maximized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links |
 | CMD+OPT+click a path | Reveal it in Finder (`open -R`; directories open) so you can drag it into a browser upload, Slack, etc. In an ssh pane the file is first copied to `~/Downloads/<host>/` over the existing ControlMaster |
 | CMD+click a path in an ssh pane | Open it in remote Yazi on that host (split via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Relative paths resolve against the remote cwd if the remote shell reports it (OSC 7), else the remote home |
+| CMD+click a localhost link in an ssh pane | `http://localhost:PORT` / `127.0.0.1` / `0.0.0.0` from Jupyter, TensorBoard, vite... on the remote: adds `ssh -O forward -L` on the existing ControlMaster (never a new login) and opens it locally, `?token=` kept. A busy local port moves to the next free one; forwards are reused |
+| CMD+SHIFT+L | Same without a click: prompt for a remote port (or paste a localhost URL) in an ssh pane |
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | CMD+W | Close pane, confirm with Enter or y (n/Esc cancels) |
 | CMD+[ / CMD+] | Previous / next pane |
