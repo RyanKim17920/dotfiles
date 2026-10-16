@@ -42,6 +42,7 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+SHIFT+← / → | Reorder tabs |
 | CMD+E | Toggle the Yazi file sidebar (local tabs only) |
 | CMD+click a path | Open it in a Yazi peek pane (file hovered, preview maximized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links |
+| CMD+click a path in an ssh pane | Open it in remote Yazi on that host (split via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Relative paths resolve against the remote cwd if the remote shell reports it (OSC 7), else the remote home |
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | CMD+W | Close pane, confirm with Enter or y (n/Esc cancels) |
 | CMD+[ / CMD+] | Previous / next pane |

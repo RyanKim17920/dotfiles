@@ -156,6 +156,33 @@ local function pane_ssh_args(pane)
   return nil
 end
 
+-- `ssh <opts...> <kept opts...> dest` for a pane_ssh_args result, run with
+-- SPAWN_PATH so it is the same ssh as the pane's and computes the same
+-- ControlPath (%C)
+local function ssh_cmd(ssh, ...)
+  local cmd = { '/usr/bin/env', 'PATH=' .. SPAWN_PATH, 'ssh', ... }
+  for k = 2, #ssh do table.insert(cmd, ssh[k]) end
+  return cmd
+end
+
+-- ssh_cmd that can only ride an existing ControlMaster: never prompts, never
+-- logs in on its own
+local function ssh_batch_cmd(ssh)
+  return ssh_cmd(ssh, '-o', 'BatchMode=yes', '-o', 'ControlMaster=no')
+end
+
+-- pid (string) of the live ControlMaster for the pane's host, or nil. Only
+-- asks the master socket (-O check), so it never connects or prompts.
+local function ssh_master_pid(ssh)
+  local ok, _, err = wezterm.run_child_process(ssh_cmd(ssh, '-O', 'check'))
+  return ok and ((err or ''):match 'pid=(%d+)' or '?') or nil
+end
+
+-- Destination without user@, for messages and file names
+local function ssh_host(ssh)
+  return (ssh[#ssh]:gsub('^.*@', ''))
+end
+
 -- Clickable file paths: CMD+click on a path such as ~/.ssh/config,
 -- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
 -- temporary Yazi pane on the right of the tab with the file hovered and the
@@ -198,20 +225,22 @@ local function percent_decode(s)
   return (s:gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end))
 end
 
--- uri -> local path text (may carry :line[:col]), or nil if not ours
+local function is_local_host(host)
+  local here = wezterm.hostname()
+  return host == '' or host == 'localhost' or host == here or host == (here:gsub('%..*$', ''))
+end
+
+-- uri -> path text (may carry :line[:col]) plus, for file://otherhost/...
+-- (e.g. ls --hyperlink inside ssh), that host; nil if not ours
 local function uri_to_path(uri)
   if uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME then
     return uri:sub(#PEEK_SCHEME + 1)
   end
   local host, path = uri:match '^file://([^/]*)(/.*)$'
   if not path then return nil end
-  -- file://otherhost/... (e.g. ls --hyperlink inside ssh) isn't on this Mac
-  local here = wezterm.hostname()
-  if host ~= '' and host ~= 'localhost' and host ~= here
-      and host ~= here:gsub('%..*$', '') then
-    return nil
-  end
-  return percent_decode((path:gsub('[?#].*$', '')))
+  path = percent_decode((path:gsub('[?#].*$', '')))
+  if is_local_host(host) then return path end
+  return path, host
 end
 
 -- Spellings of a clicked path to try in order: as is, without a trailing
@@ -242,11 +271,11 @@ local function resolve_path(text, cwd)
   return nil
 end
 
-local function open_peek(window, pane, path)
+-- Split the peek pane off `pane` from `spec` (cwd, args, env). One peek
+-- pane per tab: the previous one is closed if it's still open.
+local function replace_peek(window, pane, spec)
   local tab = pane:tab()
   local key = 'peek_pane_for_tab_' .. tab:tab_id()
-
-  -- One peek pane per tab: replace the previous one if it's still open
   for _, p in ipairs(tab:panes()) do
     if p:pane_id() == wezterm.GLOBAL[key] and p:pane_id() ~= pane:pane_id() then
       p:activate()
@@ -255,25 +284,105 @@ local function open_peek(window, pane, path)
       break
     end
   end
+  spec.direction, spec.top_level, spec.size = 'Right', true, PEEK_SIZE
+  wezterm.GLOBAL[key] = pane:split(spec):pane_id()
+end
 
+local function open_peek(window, pane, path)
   local dir = is_dir(path)
   local env = { PATH = YAZI_PATH }
   if not dir then env.YAZI_PEEK = path end
-  local peek = pane:split {
-    direction = 'Right',
-    top_level = true,
-    size = PEEK_SIZE,
+  replace_peek(window, pane, {
     cwd = dir and path or (path:match '^(.+)/' or '/'),
     args = { YAZI, path },
     set_environment_variables = env,
-  }
-  wezterm.GLOBAL[key] = peek:pane_id()
+  })
+end
+
+-- Paths clicked in a local pane running ssh live on the remote host. They
+-- are resolved there over the existing ControlMaster and opened in remote
+-- Yazi (installed by ssh-setup, whose synced init.lua handles YAZI_PEEK)
+-- through ssh-pane. Relative paths resolve against the remote shell's cwd
+-- when it reports one with OSC 7, else against the remote home.
+
+-- The remote shell's cwd from OSC 7 (file://<remote host>/dir), or nil
+local function remote_cwd(pane)
+  local url = pane:get_current_working_dir()
+  if type(url) == 'userdata' and url.host and not is_local_host(url.host) then
+    return url.file_path
+  end
+  return nil
+end
+
+-- Shell word for path text on the remote: ~ becomes "$HOME"
+local function remote_word(text, rcwd)
+  if text == '~' then return '"$HOME"' end
+  if text:sub(1, 2) == '~/' then return '"$HOME"' .. sh_quote(text:sub(2)) end
+  if text:sub(1, 1) == '/' then return sh_quote(text) end
+  if rcwd then return sh_quote(rcwd .. '/' .. text) end
+  return '"$HOME"/' .. sh_quote(text)
+end
+
+-- Prints "d <dir>" or "f <file>" (absolute, ./.. collapsed) for the first
+-- candidate that exists; exit 1 if none does
+local REMOTE_RESOLVE = [[
+for p in %s; do
+  if [ -d "$p" ]; then
+    cd -- "$p" && printf 'd %%s\n' "$(pwd)" && exit 0
+  elif [ -e "$p" ]; then
+    d=$(cd -- "$(dirname -- "$p")" && pwd) && printf 'f %%s\n' "${d%%/}/$(basename -- "$p")" && exit 0
+  fi
+done
+exit 1]]
+
+-- kind ('f' or 'd') and absolute path of `text` on the pane's host, or nil
+-- and a message
+local function resolve_remote(ssh, text, rcwd)
+  if not ssh_master_pid(ssh) then
+    return nil, 'No live ssh connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
+  end
+  local words = {}
+  for _, v in ipairs(path_variants(text)) do table.insert(words, remote_word(v, rcwd)) end
+  local cmd = ssh_batch_cmd(ssh)
+  table.insert(cmd, 'sh -c ' .. sh_quote(string.format(REMOTE_RESOLVE, table.concat(words, ' '))))
+  local ok, out = wezterm.run_child_process(cmd)
+  local kind, path
+  if ok then kind, path = out:match '^([fd]) (/[^\n]*)' end
+  if not kind then return nil, 'Not found on ' .. ssh_host(ssh) .. ': ' .. text end
+  return kind, path
+end
+
+local function open_remote_peek(window, pane, ssh, kind, path)
+  -- $HOME/.local/bin first: ssh-setup's yazi and its previewers, else any yazi
+  local script = 'export PATH="$HOME/.local/bin:$PATH"; '
+    .. (kind == 'f' and ('export YAZI_PEEK=' .. sh_quote(path) .. '; ') or '')
+    .. 'exec yazi ' .. sh_quote(path)
+  local args = { SSH_PANE, '-t' }
+  for k = 2, #ssh do table.insert(args, ssh[k]) end
+  table.insert(args, 'sh -c ' .. sh_quote(script))
+  replace_peek(window, pane, {
+    cwd = wezterm.home_dir,
+    args = args,
+    set_environment_variables = { PATH = SPAWN_PATH },
+  })
 end
 
 wezterm.on('open-uri', function(window, pane, uri)
-  local text = uri_to_path(uri)
+  local text, host = uri_to_path(uri)
   if not text then return end -- web URL etc.: default opener
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
+
+  local ssh = pane_ssh_args(pane)
+  if ssh then
+    local kind, path = resolve_remote(ssh, text, remote_cwd(pane))
+    if not kind then
+      toast(window, path)
+      return false
+    end
+    open_remote_peek(window, pane, ssh, kind, path)
+    return false
+  end
+  if host then return end -- file://otherhost outside ssh: default opener
 
   local path = pane:get_domain_name() == 'local' and resolve_path(text, pane_cwd(pane))
   if not path then
