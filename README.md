@@ -57,6 +57,11 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+SHIFT+R / CMD+CTRL+R | Rename the tab / window (empty input restores the automatic title) |
 | CMD+SHIFT+P | Jump to a pane by label |
 
+The tab bar, prompts and pickers use the Catppuccin Mocha palette (same as
+the Yazi flavor). Each tab shows its number, an icon and its title: the name
+you gave it (CMD+SHIFT+R), else the host for ssh tabs (server icon), else the
+pane title or the cwd's name.
+
 The ssh-aware actions reuse the original pane's `-l -p -F -J -i` options and
 are instant if you use `ControlMaster` in `~/.ssh/config`, e.g.
 
