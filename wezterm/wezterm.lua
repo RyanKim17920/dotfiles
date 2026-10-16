@@ -53,6 +53,13 @@ local function toast(window, msg, ms)
   end)
 end
 
+-- Pane by id, or nil once it's gone: wezterm.mux.get_pane raises for a
+-- missing pane on 20240203 instead of returning nil
+local function mux_pane(id)
+  local ok, pane = pcall(wezterm.mux.get_pane, id)
+  return ok and pane or nil
+end
+
 -- Heading for PromptInputLine: accent icon, bold title, dim hint below
 local function prompt_text(icon, title, hint)
   return wezterm.format {
@@ -359,7 +366,7 @@ exit $s]]
 -- tab of `pane`. One peek tab at a time: the previous one is closed first.
 local function replace_peek(window, pane, spec, path)
   local old = wezterm.GLOBAL[PEEK_KEY]
-  if old and old ~= pane:pane_id() and wezterm.mux.get_pane(old) then
+  if old and old ~= pane:pane_id() and mux_pane(old) then
     cli('kill-pane', '--pane-id', tostring(old))
   end
   local origin = pane:tab():tab_id()
@@ -1528,7 +1535,7 @@ local function tab_label(tab)
   local proc = (p.foreground_process_name or ''):match '[^/]*$'
   local ssh
   if proc == 'ssh' or proc == 'sh' then -- ssh-pane runs under /bin/sh
-    local pane = wezterm.mux.get_pane(p.pane_id)
+    local pane = mux_pane(p.pane_id)
     ssh = pane and pane_ssh_args(pane)
   end
   local icon, text = ICON.console, p.title
