@@ -41,7 +41,7 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+SHIFT+M | Merge all other windows into this one, keeping split layouts |
 | CMD+SHIFT+= | Fix layout: if the tab's panes spill past the window edge (a WezTerm 20240203 bug no resize undoes), rebuild the tab with the same proportions, position, title and focus; processes keep running. Also runs on its own after window resizes, pane moves and merges |
 | CMD+SHIFT+← / → | Reorder tabs |
-| CMD+E | Toggle the Yazi file sidebar (local tabs only) |
+| CMD+E | Toggle the Yazi file sidebar (local tabs only); a full-height column on the left, also in tabs that already have splits |
 | CMD+click a path | Open it in a Yazi peek tab next to the current one (file hovered, preview maximized; q closes it and returns to your tab, so TUIs like Claude Code are never resized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links. Paths a TUI hard-wrapped onto the next line (Claude Code's indented continuation) are rejoined from the pane text, whichever half you click |
 | CMD+OPT+click a path | Reveal it in Finder (`open -R`; directories open) so you can drag it into a browser upload, Slack, etc. In an ssh pane the file is first copied to `~/Downloads/<host>/` over the existing ControlMaster |
 | CMD+click a path in an ssh pane | Open it in remote Yazi on that host (peek tab via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Relative paths resolve against the remote cwd if the remote shell reports it (OSC 7), else the remote home |

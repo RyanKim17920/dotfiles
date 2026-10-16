@@ -139,6 +139,21 @@ end
 -- Rebuilds a tab from a geometry list (defined with merge_tab below)
 local rebuild_tab
 
+-- Multi-pane tab: lay out `geometry` (the panes, extent cols x rows) shifted
+-- right of a full-height sidebar column `sidebar_id`, `width` cells wide
+local function with_sidebar(geometry, cols, rows, sidebar_id, width)
+  local rest = math.max(1, cols - width - 1)
+  local function x(v) return width + 1 + math.floor(v * rest / cols) end
+  local out = { { id = sidebar_id, left = 0, top = 0, width = width, height = rows } }
+  for _, p in ipairs(geometry) do
+    local left = x(p.left)
+    table.insert(out, {
+      id = p.id, left = left, top = p.top, width = x(p.left + p.width) - left, height = p.height,
+    })
+  end
+  return out
+end
+
 local function toggle_sidebar(window, pane)
   local tab = pane:tab()
   local key = SIDEBAR_KEY .. tab:tab_id()
@@ -161,9 +176,8 @@ local function toggle_sidebar(window, pane)
   end
 
   local cwd = pane_cwd(pane)
-  local sidebar = pane:split {
+  local spec = {
     direction = 'Left',
-    top_level = true,
     size = SIDEBAR_CELLS,
     cwd = cwd,
     -- Pass the dir explicitly: yazi trusts an inherited $PWD over the real cwd
@@ -174,7 +188,34 @@ local function toggle_sidebar(window, pane)
       PATH = YAZI_PATH,
     },
   }
-  wezterm.GLOBAL[key] = sidebar:pane_id()
+  tab:set_zoomed(false) -- a zoomed tab refuses splits and hides geometry
+  local geometry, cols, rows = tab_geometry(tab)
+  if #geometry == 1 then
+    -- One pane: a plain left split already spans the whole tab
+    wezterm.GLOBAL[key] = pane:split(spec):pane_id()
+    return
+  end
+
+  -- Several panes: WezTerm 20240203's `top_level` split leaves the tab's
+  -- recorded size short of its panes (mux/src/tab.rs split_and_insert), so
+  -- they later spill past the window edge. Instead spawn yazi as an ordinary
+  -- split of the widest pane that fits, then rebuild the tab with it as a
+  -- full-height column on the left.
+  local size, host = tab:get_size(), nil
+  for _, p in ipairs(geometry) do
+    if p.left + p.width <= size.cols and p.width >= 3 and (not host or p.width > host.width) then
+      host = p
+    end
+  end
+  if not host then
+    toast(window, 'Sidebar: no room for a split in this tab')
+    return
+  end
+  spec.size = math.min(SIDEBAR_CELLS, host.width - 2)
+  local sidebar = host.pane:split(spec):pane_id()
+  local width = math.min(SIDEBAR_CELLS, math.max(1, cols - 2))
+  local new_tab = rebuild_tab(window, tab, with_sidebar(geometry, cols, rows, sidebar, width), sidebar)
+  wezterm.GLOBAL[SIDEBAR_KEY .. (new_tab or tab):tab_id()] = sidebar
 end
 
 -- ssh helpers shared by smart splits, image paste, clickable paths and port
