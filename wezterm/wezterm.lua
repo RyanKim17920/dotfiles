@@ -570,11 +570,12 @@ local function parse_ssh_text(text)
   return ssh, forwards
 end
 
--- Tunnel commands ({ ssh, forwards }, oldest first) and the last
--- `cat <path with "token">` in the pane's recent scrollback. Logical lines,
--- so commands soft-wrapped by the terminal stay whole.
+-- Tunnel commands ({ ssh, forwards }, oldest first), the last `cat <path
+-- with "token">` and loopback URLs (parsed, oldest first) in the pane's
+-- recent scrollback. Logical lines, so text soft-wrapped by the terminal
+-- stays whole.
 local function scrollback_hints(pane)
-  local tunnels, token_path = {}, nil
+  local tunnels, token_path, urls = {}, nil, {}
   local ok, text = pcall(pane.get_logical_lines_as_text, pane, SCROLLBACK_LINES)
   for line in (ok and text or ''):gmatch '[^\n]+' do
     local cmd = line:match '%f[%w]ssh%s.*'
@@ -585,8 +586,12 @@ local function scrollback_hints(pane)
     for path in line:gmatch '%f[%w]cat%s+([^%s`\'"]+)' do
       if path:lower():find('token', 1, true) then token_path = (path:gsub('[.,;:)]+$', '')) end
     end
+    for u in line:gmatch 'https?://[^%s`\'"]+' do
+      local url = parse_loopback_url((u:gsub('[.,;:)]+$', '')))
+      if url then table.insert(urls, url) end
+    end
   end
-  return tunnels, token_path
+  return tunnels, token_path, urls
 end
 
 -- Most recent tunnel forwarding local `port`: its args and forward
@@ -809,27 +814,6 @@ local function no_master_msg(ssh)
     .. ' (ControlMaster); open an ssh pane to it first'
 end
 
--- CMD+click on an `ssh ... -L ...` command: add its forwards
-local function forward_command(window, pane, text)
-  local ssh, forwards = parse_ssh_text(text)
-  if not ssh then
-    toast(window, 'Forward: no -L forward in that ssh command')
-    return
-  end
-  local master, pid = find_master(ssh)
-  if not master then
-    toast(window, no_master_msg(ssh), 5000)
-    return
-  end
-  local seen = all_forwards((scrollback_hints(pane)))
-  local done = {}
-  for _, f in ipairs(forwards) do
-    local lport, how, note = ssh_forward(master, pid, f.host, f.rport, f.lport, seen)
-    table.insert(done, lport and describe_forward(master, lport, f.host, f.rport, how, note) or how)
-  end
-  toast(window, 'Forward: ' .. table.concat(done, ' · '), 5000)
-end
-
 -- Query value that is a placeholder: <token>, %3Ctoken%3E, {token}, TOKEN,
 -- YOUR_TOKEN (a link rule may have cut a trailing >)
 local function is_placeholder(v)
@@ -866,6 +850,67 @@ local function read_remote_token(ssh, path)
   return ok and out:match '^%s*(%S+)%s*$' or nil
 end
 
+-- Open loopback `url` in the browser on local port `lport`, its token
+-- placeholder (if any) filled from `token_path` read over master `ssh`;
+-- `notify` gets a note about the token. Returns "host:port" opened.
+local function open_local(ssh, url, lport, token_path, notify)
+  local rest, has_placeholder = fill_placeholder(url.rest, nil)
+  if has_placeholder then
+    local token = token_path and read_remote_token(ssh, token_path)
+    if token then
+      rest = fill_placeholder(url.rest, url_encode(token))
+      notify 'token filled in'
+    else
+      notify 'token not found, opened without it'
+    end
+  end
+  local host = LOOPBACK[url.host]
+  wezterm.open_with(url.scheme .. '://' .. host .. ':' .. lport .. rest)
+  return host .. ':' .. lport
+end
+
+-- Most recent scrollback URL for local `port`, or nil
+local function latest_url(urls, port)
+  for i = #urls, 1, -1 do
+    if urls[i].rport == port then return urls[i] end
+  end
+  return nil
+end
+
+-- CMD+click on an `ssh ... -L ...` command: add its forwards
+local function forward_command(window, pane, text)
+  local ssh, forwards = parse_ssh_text(text)
+  if not ssh then
+    toast(window, 'Forward: no -L forward in that ssh command')
+    return
+  end
+  local master, pid = find_master(ssh)
+  if not master then
+    toast(window, no_master_msg(ssh), 5000)
+    return
+  end
+  local tunnels, token_path, urls = scrollback_hints(pane)
+  local seen = all_forwards(tunnels)
+  local done, open_url, open_port = {}, nil, nil
+  for _, f in ipairs(forwards) do
+    local lport, how, note = ssh_forward(master, pid, f.host, f.rport, f.lport, seen)
+    table.insert(done, lport and describe_forward(master, lport, f.host, f.rport, how, note) or how)
+    -- Open one: the first forward with a URL in the scrollback, else the first
+    local url = lport and latest_url(urls, f.lport)
+    if lport and (not open_port or (url and not open_url)) then
+      open_url, open_port = url, lport
+    end
+  end
+  local msg = 'Forward: ' .. table.concat(done, ' · ')
+  if open_port then
+    local url = open_url or parse_loopback_url('http://localhost:' .. open_port .. '/')
+    local token_note
+    local opened = open_local(master, url, open_port, token_path, function(n) token_note = n end)
+    msg = msg .. ' → opened ' .. opened .. (token_note and ('; ' .. token_note) or '')
+  end
+  toast(window, msg, 5000)
+end
+
 -- Forward for a loopback URL clicked in `pane` and open it; false when
 -- neither a tunnel hint nor an ssh pane says where it lives
 local function open_forwarded(window, pane, url)
@@ -888,18 +933,8 @@ local function open_forwarded(window, pane, url)
     return true
   end
   local msg = 'Forward: ' .. describe_forward(master, lport, target, rport, how, note)
-  local rest, has_placeholder = fill_placeholder(url.rest, nil)
-  if has_placeholder then
-    local token = token_path and read_remote_token(master, token_path)
-    if token then
-      rest = fill_placeholder(url.rest, url_encode(token))
-      msg = msg .. '; token filled in'
-    else
-      msg = msg .. '; token not found, opened without it'
-    end
-  end
+  open_local(master, url, lport, token_path, function(n) msg = msg .. '; ' .. n end)
   toast(window, msg, 5000)
-  wezterm.open_with(url.scheme .. '://' .. LOOPBACK[url.host] .. ':' .. lport .. rest)
   return true
 end
 
