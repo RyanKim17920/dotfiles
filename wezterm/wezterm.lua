@@ -19,6 +19,47 @@ config.front_end = 'WebGpu'
 
 local RESIZE_STEP = 5 -- cells per keypress
 
+-- UI palette for the tab bar, prompts and pickers: Catppuccin Mocha, the
+-- same flavor as Yazi (~/.config/yazi/theme.toml)
+local C = {
+  crust = '#11111b', mantle = '#181825', surface0 = '#313244', overlay0 = '#6c7086',
+  text = '#cdd6f4', mauve = '#cba6f7', blue = '#89b4fa', peach = '#fab387', red = '#f38ba8',
+}
+
+-- Nerd Font glyphs; WezTerm bundles Symbols Nerd Font Mono as a fallback
+local ICON = {
+  rename = utf8.char(0xF03EB), window = utf8.char(0xF0614), close = utf8.char(0xF0156),
+  cancel = utf8.char(0xF073A), server = utf8.char(0xF048B), folder = utf8.char(0xF024B),
+  forward = utf8.char(0xF0318), zoom = utf8.char(0xF0293), console = utf8.char(0xF018D),
+}
+
+-- macOS notification. Messages read "<Area>: <what happened>".
+local function toast(window, msg, ms)
+  window:toast_notification('WezTerm', msg, nil, ms or 3000)
+end
+
+-- Heading for PromptInputLine: accent icon, bold title, dim hint below
+local function prompt_text(icon, title, hint)
+  return wezterm.format {
+    { Foreground = { Color = C.mauve } }, { Text = ' ' .. icon .. '  ' },
+    { Attribute = { Intensity = 'Bold' } }, { Foreground = { Color = C.text } }, { Text = title },
+    { Attribute = { Intensity = 'Normal' } }, { Foreground = { Color = C.overlay0 } },
+    { Text = '\r\n    ' .. hint .. '\r\n' },
+  }
+end
+
+-- Pickers in the same palette: PaneSelect labels as mauve tiles, command
+-- palette and character selector on the darker mantle
+config.pane_select_font_size = 40
+config.pane_select_fg_color = C.crust
+config.pane_select_bg_color = C.mauve
+config.command_palette_fg_color = C.text
+config.command_palette_bg_color = C.mantle
+config.command_palette_font_size = 15
+config.char_select_fg_color = C.text
+config.char_select_bg_color = C.mantle
+config.char_select_font_size = 15
+
 -- File sidebar (VS Code style): CMD+E toggles a narrow Yazi pane on the left
 -- of the tab. It uses ~/.config/yazi-sidebar (single column; text files open in
 -- micro in a new pane to its right via ~/.local/bin/yazi-open).
@@ -59,7 +100,7 @@ local function toggle_sidebar(window, pane)
 
   -- Yazi only exists on this Mac; don't try to run it inside ssh/mux domains
   if pane:get_domain_name() ~= 'local' then
-    window:toast_notification('wezterm', 'File sidebar only works in local tabs', nil, 3000)
+    toast(window, 'Sidebar: only works in local tabs')
     return
   end
 
@@ -191,10 +232,6 @@ end
 -- --hyperlink, Claude Code) are handled the same way; web URLs are untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
 local PEEK_SIZE = 0.45
-
-local function toast(window, msg, ms)
-  window:toast_notification('wezterm', msg, nil, ms or 3000)
-end
 
 local function is_dir(path)
   local ok = pcall(wezterm.read_dir, path)
@@ -339,7 +376,7 @@ exit 1]]
 -- and a message
 local function resolve_remote(ssh, text, rcwd)
   if not ssh_master_pid(ssh) then
-    return nil, 'No live ssh connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
+    return nil, 'ssh: no live connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
   end
   local words = {}
   for _, v in ipairs(path_variants(text)) do table.insert(words, remote_word(v, rcwd)) end
@@ -348,7 +385,7 @@ local function resolve_remote(ssh, text, rcwd)
   local ok, out = wezterm.run_child_process(cmd)
   local kind, path
   if ok then kind, path = out:match '^([fd]) (/[^\n]*)' end
-  if not kind then return nil, 'Not found on ' .. ssh_host(ssh) .. ': ' .. text end
+  if not kind then return nil, 'Path: not found on ' .. ssh_host(ssh) .. ': ' .. text end
   return kind, path
 end
 
@@ -390,7 +427,7 @@ osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title 
 local function reveal_remote(window, ssh, kind, path)
   local host = ssh_host(ssh)
   if kind == 'd' then
-    toast(window, 'Remote directory, not copied: ' .. host .. ':' .. path)
+    toast(window, 'Finder: ' .. host .. ':' .. path .. ' is a remote directory; not copied')
     return
   end
   local sub = host:gsub('[^%w.-]', '_')
@@ -399,7 +436,7 @@ local function reveal_remote(window, ssh, kind, path)
   for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
   table.insert(cmd, 'cat -- ' .. sh_quote(path))
   wezterm.background_child_process(cmd)
-  toast(window, 'Copying ' .. host .. ':' .. path .. ' to ~/Downloads/' .. sub .. '/')
+  toast(window, 'Finder: copying ' .. host .. ':' .. path .. ' to ~/Downloads/' .. sub .. '/')
 end
 
 -- Localhost links from ssh panes: http://localhost:8888/?token=... printed
@@ -442,7 +479,7 @@ end
 local function ssh_forward(ssh, target, rport)
   local pid = ssh_master_pid(ssh)
   if not pid then
-    return nil, 'No live ssh connection to ' .. ssh_host(ssh) .. ' (ControlMaster); not forwarding'
+    return nil, 'Forward: no live ssh connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
   end
   local key = FORWARD_KEY .. table.concat(ssh, ' ', 2) .. '|' .. target .. ':' .. rport
   local known = wezterm.GLOBAL[key]
@@ -456,7 +493,7 @@ local function ssh_forward(ssh, target, rport)
       return lport, false
     end
   end
-  return nil, 'No free local port in ' .. first .. '-' .. math.min(first + 20, 65535)
+  return nil, 'Forward: no free local port in ' .. first .. '-' .. math.min(first + 20, 65535)
 end
 
 local function open_forwarded(window, ssh, url)
@@ -466,23 +503,24 @@ local function open_forwarded(window, ssh, url)
     toast(window, reused, 4000)
     return
   end
-  toast(window, (reused and 'Using forward ' or 'Forwarded ') .. ssh_host(ssh) .. ':' .. url.rport
+  toast(window, 'Forward: ' .. (reused and 'reusing ' or '') .. ssh_host(ssh) .. ':' .. url.rport
     .. ' → localhost:' .. lport)
   wezterm.open_with(url.scheme .. '://' .. target .. ':' .. lport .. url.rest)
 end
 
 -- CMD+SHIFT+L: forward a port (or a pasted localhost URL) without a click
 local forward_prompt = act.PromptInputLine {
-  description = 'Forward remote port (or paste a localhost URL):',
+  description = prompt_text(ICON.forward, 'Forward a remote port to this Mac',
+    'Port number (8888) or a localhost URL · Enter forwards and opens it · Esc cancels'),
   action = wezterm.action_callback(function(window, pane, line)
     line = (line or ''):match '^%s*(.-)%s*$'
     if line == '' then return end
     local ssh = pane_ssh_args(pane)
     local url = parse_loopback_url(line:match '^%d+$' and ('http://localhost:' .. line .. '/') or line)
     if not ssh then
-      toast(window, 'Not an ssh pane')
+      toast(window, 'Forward: not an ssh pane')
     elseif not url then
-      toast(window, 'Expected a port number or a localhost URL')
+      toast(window, 'Forward: expected a port number or a localhost URL')
     else
       open_forwarded(window, ssh, url)
     end
@@ -522,7 +560,7 @@ wezterm.on('open-uri', function(window, pane, uri)
   local path = pane:get_domain_name() == 'local' and resolve_path(text, pane_cwd(pane))
   if not path then
     if custom then
-      toast(window, 'Not found: ' .. text, 2000)
+      toast(window, 'Path: not found: ' .. text, 2000)
       return false
     end
     return -- file:// we can't resolve: let the default opener try
@@ -808,11 +846,11 @@ local merge_windows = wezterm.action_callback(function(window, pane)
     total, moved = total + #panes, moved + n
     if not exact and #panes > 1 then lost = lost + 1 end
   end
-  local msg = string.format('Merged %d tab%s (%d pane%s)', #tabs, #tabs == 1 and '' or 's',
+  local msg = string.format('Merge: %d tab%s (%d pane%s)', #tabs, #tabs == 1 and '' or 's',
     moved, moved == 1 and '' or 's')
   if lost > 0 then msg = msg .. '; layout lost in ' .. lost .. ' (split into tabs)' end
   if moved < total then msg = msg .. '; ' .. (total - moved) .. ' failed' end
-  window:toast_notification('wezterm', msg, nil, 4000)
+  toast(window, msg, 4000)
 end)
 
 -- Move this pane into tab N of this window (1-based, tab bar order) as a
@@ -824,18 +862,18 @@ local function move_to_tab(n, flag)
     local tabs = window:mux_window():tabs()
     local target = tabs[n]
     if not target then
-      window:toast_notification('wezterm', 'No tab ' .. n, nil, 2000)
+      toast(window, 'Move: no tab ' .. n, 2000)
       return
     end
     if target:tab_id() == pane:tab():tab_id() then
-      window:toast_notification('wezterm', 'Already in tab ' .. n, nil, 2000)
+      toast(window, 'Move: already in tab ' .. n, 2000)
       return
     end
     local id = tostring(pane:pane_id())
     local ok, err = cli('split-pane', '--pane-id', tostring(target:active_pane():pane_id()),
       flag, '--percent', '50', '--move-pane-id', id)
     if not ok then
-      window:toast_notification('wezterm', 'Move failed: ' .. (err or '?'), nil, 4000)
+      toast(window, 'Move: failed: ' .. (err or '?'), 4000)
       return
     end
     -- Activate the tab object, not index N-1: indices shift if the source tab closed
@@ -900,7 +938,8 @@ end)
 -- default tab bar; window titles need the format-window-title handler below.
 local function rename_prompt(what)
   return act.PromptInputLine {
-    description = 'Rename ' .. what .. ' (empty = automatic title):',
+    description = prompt_text(what == 'tab' and ICON.rename or ICON.window, 'Rename ' .. what,
+      'Enter applies · empty restores the automatic title · Esc cancels'),
     action = wezterm.action_callback(function(window, _, line)
       if line == nil then return end -- Esc
       if what == 'tab' then
@@ -920,6 +959,9 @@ wezterm.on('format-window-title', function(tab, _, tabs)
   local index = #tabs > 1 and string.format('[%d/%d] ', tab.tab_index + 1, #tabs) or ''
   return zoomed .. index .. tab.active_pane.title
 end)
+
+-- Home-row labels for PaneSelect (swap / jump)
+local PANE_ALPHABET = 'asdfghjkl'
 
 config.keys = {
   -- Unified copy/paste (see smart_copy / smart_paste above)
@@ -942,8 +984,17 @@ config.keys = {
   -- Close the focused pane instead of the whole tab (Ghostty: cmd+w)
   -- Confirm with a picker so Enter (or y) closes and n/Esc cancels
   { key = 'w', mods = 'CMD', action = act.InputSelector {
-    title = 'Close this pane?  (Enter/y = close, n/Esc = cancel)',
-    choices = { { id = 'yes', label = 'Yes, close it' }, { id = 'no', label = 'No' } },
+    title = 'Close pane',
+    description = 'Close this pane?   Enter / y = close    n / Esc = cancel',
+    choices = {
+      { id = 'yes', label = wezterm.format {
+        { Foreground = { Color = C.red } }, { Attribute = { Intensity = 'Bold' } },
+        { Text = ICON.close .. '  Close pane' },
+      } },
+      { id = 'no', label = wezterm.format {
+        { Foreground = { Color = C.overlay0 } }, { Text = ICON.cancel .. '  Cancel' },
+      } },
+    },
     alphabet = 'yn',
     action = wezterm.action_callback(function(window, pane, id)
       if id == 'yes' then
@@ -972,7 +1023,7 @@ config.keys = {
   { key = 'Enter', mods = 'CMD|SHIFT', action = act.TogglePaneZoomState },
 
   -- Reshape: swap the focused pane with one you pick (shows letter labels)
-  { key = 's', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'SwapWithActive' } },
+  { key = 's', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'SwapWithActive', alphabet = PANE_ALPHABET } },
   -- Reshape: rotate pane positions within the tab
   { key = 'r', mods = 'CMD|OPT', action = act.RotatePanes 'Clockwise' },
   { key = 'r', mods = 'CMD|SHIFT|OPT', action = act.RotatePanes 'CounterClockwise' },
@@ -980,7 +1031,7 @@ config.keys = {
   { key = 'r', mods = 'CMD|SHIFT', action = rename_prompt 'tab' },
   { key = 'r', mods = 'CMD|CTRL', action = rename_prompt 'window' },
   -- Jump to any pane by label
-  { key = 'p', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'Activate' } },
+  { key = 'p', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'Activate', alphabet = PANE_ALPHABET } },
 
   -- Reorder tabs: move the current tab one slot left/right
   { key = 'LeftArrow', mods = 'CMD|SHIFT', action = act.MoveTabRelative(-1) },
