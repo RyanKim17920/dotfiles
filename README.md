@@ -45,7 +45,9 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+OPT+click a path | Reveal it in Finder (`open -R`; directories open) so you can drag it into a browser upload, Slack, etc. In an ssh pane the file is first copied to `~/Downloads/<host>/` over the existing ControlMaster |
 | CMD+click a path in an ssh pane | Open it in remote Yazi on that host (split via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Relative paths resolve against the remote cwd if the remote shell reports it (OSC 7), else the remote home |
 | CMD+click a localhost link in an ssh pane | `http://localhost:PORT` / `127.0.0.1` / `0.0.0.0` from Jupyter, TensorBoard, vite... on the remote: adds `ssh -O forward -L` on the existing ControlMaster (never a new login) and opens it locally, `?token=` kept. A busy local port moves to the next free one; forwards are reused |
-| CMD+SHIFT+L | Same without a click: prompt for a remote port (or paste a localhost URL) in an ssh pane |
+| CMD+click an `ssh ... -L LPORT:HOST:RPORT ... host` command | Add those forwards to the existing ControlMaster for that host instead of running it (never a new login; config aliases are matched, so `me@login.example.org` finds the master opened as `myserver`) |
+| CMD+click `http://localhost:LPORT/...` after such a hint | Uses the most recent `ssh -L LPORT:...` in the scrollback (works from local panes too), so a server on a compute node behind a login host opens directly. A stale forward of ours on LPORT is replaced; an old hand-started tunnel is left running and named by pid. `?token=<token>` is filled from the last `cat .../token` shown, read over the master and never logged |
+| CMD+SHIFT+L | Same without a click: a port, a localhost URL or a whole `ssh -L` command |
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | CMD+W | Close pane, confirm with Enter or y (n/Esc cancels) |
 | CMD+[ / CMD+] | Previous / next pane |
