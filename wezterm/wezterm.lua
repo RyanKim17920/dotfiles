@@ -159,6 +159,14 @@ local function sh_quote(s)
   return "'" .. s:gsub("'", [['\'']]) .. "'"
 end
 
+local WEZTERM_CLI = '/opt/homebrew/bin/wezterm'
+
+-- Run `wezterm cli <args...>`; returns success, stderr
+local function cli(...)
+  local ok, _, err = wezterm.run_child_process { WEZTERM_CLI, 'cli', ... }
+  return ok, err
+end
+
 -- ssh options that take a value (from `man ssh`)
 local SSH_OPTS_WITH_VALUE = {}
 for c in ('bcDEeFIiJLlmOopQRSWw'):gmatch '.' do SSH_OPTS_WITH_VALUE[c] = true end
@@ -253,13 +261,15 @@ end
 
 -- Clickable file paths: CMD+click on a path such as ~/.ssh/config,
 -- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
--- temporary Yazi pane on the right of the tab with the file hovered and the
--- preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua), or the directory
--- opened. q quits Yazi and closes the pane. OSC 8 file:// links (ls
--- --hyperlink, Claude Code) are handled the same way; web URLs are untouched.
+-- temporary Yazi "peek" tab right after the current one, with the file
+-- hovered and the preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua),
+-- or the directory opened. q quits Yazi, closes the tab and returns to the
+-- tab the click came from. A tab rather than a split, so a TUI like Claude
+-- Code is never resized under it. OSC 8 file:// links (ls --hyperlink) are
+-- handled the same way; web URLs are untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
 local SSH_FORWARD_SCHEME = 'ssh-forward:' -- see forward_command
-local PEEK_SIZE = 0.45
+local PEEK_KEY = 'peek_pane' -- pane id of the open peek tab
 
 local function is_dir(path)
   local ok = pcall(wezterm.read_dir, path)
@@ -336,21 +346,36 @@ local function resolve_path(text, cwd)
   return nil
 end
 
--- Split the peek pane off `pane` from `spec` (cwd, args, env). One peek
--- pane per tab: the previous one is closed if it's still open.
-local function replace_peek(window, pane, spec)
-  local tab = pane:tab()
-  local key = 'peek_pane_for_tab_' .. tab:tab_id()
-  for _, p in ipairs(tab:panes()) do
-    if p:pane_id() == wezterm.GLOBAL[key] and p:pane_id() ~= pane:pane_id() then
-      p:activate()
-      window:perform_action(act.CloseCurrentPane { confirm = false }, p)
-      pane:activate()
-      break
-    end
+-- Runs a peek command, then (unless the tab was closed some other way)
+-- switches back to the tab it was opened from: argv cli tab_id cmd...
+local PEEK_WRAPPER = [[
+cli=$1 tab=$2; shift 2
+trap 'exit 129' HUP
+"$@"; s=$?
+"$cli" cli activate-tab --tab-id "$tab" >/dev/null 2>&1
+exit $s]]
+
+-- Open the peek tab for `path` from `spec` (cwd, args, env), right after the
+-- tab of `pane`. One peek tab at a time: the previous one is closed first.
+local function replace_peek(window, pane, spec, path)
+  local old = wezterm.GLOBAL[PEEK_KEY]
+  if old and old ~= pane:pane_id() and wezterm.mux.get_pane(old) then
+    cli('kill-pane', '--pane-id', tostring(old))
   end
-  spec.direction, spec.top_level, spec.size = 'Right', true, PEEK_SIZE
-  wezterm.GLOBAL[key] = pane:split(spec):pane_id()
+  local origin = pane:tab():tab_id()
+  local mux_window = window:mux_window()
+  local index = 0
+  for _, info in ipairs(mux_window:tabs_with_info()) do
+    if info.tab:tab_id() == origin then index = info.index end
+  end
+  local args = { '/bin/sh', '-c', PEEK_WRAPPER, 'sh', WEZTERM_CLI, tostring(origin) }
+  for _, a in ipairs(spec.args) do table.insert(args, a) end
+  spec.args = args
+  local tab, peek = mux_window:spawn_tab(spec)
+  tab:set_title('Peek: ' .. (path:match '([^/]+)/?$' or path))
+  tab:activate()
+  window:perform_action(act.MoveTab(index + 1), peek)
+  wezterm.GLOBAL[PEEK_KEY] = peek:pane_id()
 end
 
 local function open_peek(window, pane, path)
@@ -361,7 +386,7 @@ local function open_peek(window, pane, path)
     cwd = dir and path or (path:match '^(.+)/' or '/'),
     args = { YAZI, path },
     set_environment_variables = env,
-  })
+  }, path)
 end
 
 -- Paths clicked in a local pane running ssh live on the remote host. They
@@ -433,7 +458,7 @@ local function open_remote_peek(window, pane, ssh, kind, path)
     cwd = wezterm.home_dir,
     args = args,
     set_environment_variables = { PATH = SPAWN_PATH },
-  })
+  }, path)
 end
 
 -- CMD+OPT+click reveals the path in Finder instead (drag it from there into
@@ -1160,13 +1185,6 @@ end
 -- the second group's top-left pane at a proportional --percent.
 -- Pane records: { id, left, top, width, height } in cells (the shape of
 -- tab:panes_with_info() and `wezterm cli list --format json` geometry).
-local WEZTERM_CLI = '/opt/homebrew/bin/wezterm'
-
--- Run `wezterm cli <args...>`; returns success, stderr
-local function cli(...)
-  local ok, _, err = wezterm.run_child_process { WEZTERM_CLI, 'cli', ... }
-  return ok, err
-end
 
 -- Top-left pane of a group
 local function anchor_of(group)
