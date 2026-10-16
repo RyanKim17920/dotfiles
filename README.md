@@ -49,7 +49,8 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+CTRL+arrows | Resize pane |
 | CMD+SHIFT+Enter | Zoom / unzoom pane |
 | CMD+SHIFT+S | Swap the focused pane with a picked one |
-| CMD+SHIFT+R / CMD+OPT+SHIFT+R | Rotate panes clockwise / counter-clockwise |
+| CMD+OPT+R / CMD+OPT+SHIFT+R | Rotate panes clockwise / counter-clockwise |
+| CMD+SHIFT+R / CMD+CTRL+R | Rename the tab / window (empty input restores the automatic title) |
 | CMD+SHIFT+P | Jump to a pane by label |
 
 The ssh-aware actions reuse the original pane's `-l -p -F -J -i` options and

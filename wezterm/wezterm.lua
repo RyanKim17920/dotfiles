@@ -595,6 +595,32 @@ wezterm.on('user-var-changed', function(_, pane, name, value)
   end
 end)
 
+-- Tab / window renaming: a prompt sets an explicit title; empty input goes
+-- back to the automatic one. Tab titles already win over pane titles in the
+-- default tab bar; window titles need the format-window-title handler below.
+local function rename_prompt(what)
+  return act.PromptInputLine {
+    description = 'Rename ' .. what .. ' (empty = automatic title):',
+    action = wezterm.action_callback(function(window, _, line)
+      if line == nil then return end -- Esc
+      if what == 'tab' then
+        window:active_tab():set_title(line)
+      else
+        window:mux_window():set_title(line)
+      end
+    end),
+  }
+end
+
+-- WezTerm's default window title ([Z] zoomed, [i/N] tab index, pane title)
+-- unless the window was renamed
+wezterm.on('format-window-title', function(tab, _, tabs)
+  if (tab.window_title or '') ~= '' then return tab.window_title end
+  local zoomed = tab.active_pane.is_zoomed and '[Z] ' or ''
+  local index = #tabs > 1 and string.format('[%d/%d] ', tab.tab_index + 1, #tabs) or ''
+  return zoomed .. index .. tab.active_pane.title
+end)
+
 config.keys = {
   -- Unified copy/paste (see smart_copy / smart_paste above)
   { key = 'c', mods = 'CMD', action = smart_copy(false) },
@@ -648,8 +674,11 @@ config.keys = {
   -- Reshape: swap the focused pane with one you pick (shows letter labels)
   { key = 's', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'SwapWithActive' } },
   -- Reshape: rotate pane positions within the tab
-  { key = 'r', mods = 'CMD|SHIFT', action = act.RotatePanes 'Clockwise' },
+  { key = 'r', mods = 'CMD|OPT', action = act.RotatePanes 'Clockwise' },
   { key = 'r', mods = 'CMD|SHIFT|OPT', action = act.RotatePanes 'CounterClockwise' },
+  -- Rename the tab / window (see rename_prompt)
+  { key = 'r', mods = 'CMD|SHIFT', action = rename_prompt 'tab' },
+  { key = 'r', mods = 'CMD|CTRL', action = rename_prompt 'window' },
   -- Jump to any pane by label
   { key = 'p', mods = 'CMD|SHIFT', action = act.PaneSelect { mode = 'Activate' } },
 
