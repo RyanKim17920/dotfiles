@@ -369,10 +369,14 @@ end
 -- through ssh-pane. Relative paths resolve against the remote shell's cwd
 -- when it reports one with OSC 7, else against the remote home.
 
--- The remote shell's cwd from OSC 7 (file://<remote host>/dir), or nil
+-- The remote shell's cwd from OSC 7 (file://<remote host>/dir), or nil.
+-- The local shell's last report is still there while ssh runs, and its
+-- host is whatever name DHCP gave this Mac at the time (it changes between
+-- networks), so a dir that exists here is taken as that stale local one.
 local function remote_cwd(pane)
   local url = pane:get_current_working_dir()
-  if type(url) == 'userdata' and url.host and not is_local_host(url.host) then
+  if type(url) == 'userdata' and url.host and not is_local_host(url.host)
+      and not exists(url.file_path) then
     return url.file_path
   end
   return nil
@@ -585,8 +589,8 @@ wezterm.on('open-uri', function(window, pane, uri)
     end
     return false
   end
-  if host then return end -- file://otherhost outside ssh: default opener
-
+  -- Outside ssh a file:// host is this Mac under some name (OSC 7 / ls
+  -- --hyperlink use the DHCP name, which changes): use the path if it exists
   local path = pane:get_domain_name() == 'local' and resolve_path(text, pane_cwd(pane))
   if not path then
     if custom then
