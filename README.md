@@ -39,6 +39,7 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+OPT+1..9 | Send the focused pane to tab N, split to the right |
 | CMD+OPT+SHIFT+1..9 | Send the focused pane to tab N, split below |
 | CMD+SHIFT+M | Merge all other windows into this one, keeping split layouts |
+| CMD+SHIFT+= | Fix layout: if the tab's panes spill past the window edge (a WezTerm 20240203 bug no resize undoes), rebuild the tab with the same proportions, position, title and focus; processes keep running. Also runs on its own after window resizes, pane moves and merges |
 | CMD+SHIFT+← / → | Reorder tabs |
 | CMD+E | Toggle the Yazi file sidebar (local tabs only) |
 | CMD+click a path | Open it in a Yazi peek tab next to the current one (file hovered, preview maximized; q closes it and returns to your tab, so TUIs like Claude Code are never resized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links. Paths a TUI hard-wrapped onto the next line (Claude Code's indented continuation) are rejoined from the pane text, whichever half you click |
