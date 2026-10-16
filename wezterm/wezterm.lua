@@ -80,6 +80,82 @@ local function toggle_sidebar(window, pane)
   wezterm.GLOBAL[key] = sidebar:pane_id()
 end
 
+-- ssh helpers shared by smart splits, image paste, clickable paths and port
+-- forwarding.
+
+-- PATH for spawned ssh/ssh-pane (GUI-launched WezTerm has a minimal PATH),
+-- so they run the same ssh as an interactive shell
+local SPAWN_PATH = '/opt/homebrew/bin:' .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin')
+
+local function sh_quote(s)
+  return "'" .. s:gsub("'", [['\'']]) .. "'"
+end
+
+-- ssh options that take a value (from `man ssh`)
+local SSH_OPTS_WITH_VALUE = {}
+for c in ('bcDEeFIiJLlmOopQRSWw'):gmatch '.' do SSH_OPTS_WITH_VALUE[c] = true end
+-- Of those, the ones carried over so the new connection matches
+local SSH_OPTS_KEPT = { l = true, p = true, F = true, J = true, i = true }
+
+-- ssh wrapper that offers Enter-to-reconnect when the connection drops
+local SSH_PANE = wezterm.home_dir .. '/.local/bin/ssh-pane'
+
+-- argv of an ssh process -> args for a fresh ssh-pane to the same destination
+-- (remote command dropped), or nil if no destination is found.
+local function ssh_split_args(argv, first)
+  local kept, i = {}, (first or 1) + 1
+  while i <= #argv do
+    local a = argv[i]
+    if a == '--' then
+      i = i + 1
+      break
+    elseif a:sub(1, 1) ~= '-' or a == '-' then
+      break
+    end
+    -- Walk bundled flags like -tt or -4p2222
+    for j = 2, #a do
+      local c = a:sub(j, j)
+      if SSH_OPTS_WITH_VALUE[c] then
+        local value = a:sub(j + 1)
+        if value == '' then
+          i = i + 1
+          value = argv[i]
+        end
+        if value and SSH_OPTS_KEPT[c] then
+          table.insert(kept, '-' .. c)
+          table.insert(kept, value)
+        end
+        break
+      end
+    end
+    i = i + 1
+  end
+  local dest = argv[i]
+  if not dest then return nil end
+  local args = { SSH_PANE }
+  for _, v in ipairs(kept) do table.insert(args, v) end
+  table.insert(args, dest)
+  return args
+end
+
+-- { SSH_PANE, <kept opts...>, dest } when the pane is a local pane whose
+-- foreground process is ssh or ssh-pane, else nil. Shared by smart splits,
+-- image paste, clickable paths and port forwarding. ssh-pane is a #!/bin/sh
+-- script, so its argv is { '/bin/sh', '.../ssh-pane', <ssh args...> }: parse
+-- from the ssh-pane entry.
+local function pane_ssh_args(pane)
+  local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
+  if not info then return nil end
+  local argv = info.argv or {}
+  local function base(k) return (argv[k] or ''):match '[^/]*$' end
+  if (info.executable or ''):match '[^/]*$' == 'ssh' or base(1) == 'ssh' or base(1) == 'ssh-pane' then
+    return ssh_split_args(argv, 1)
+  elseif base(2) == 'ssh-pane' then
+    return ssh_split_args(argv, 2)
+  end
+  return nil
+end
+
 -- Clickable file paths: CMD+click on a path such as ~/.ssh/config,
 -- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
 -- temporary Yazi pane on the right of the tab with the file hovered and the
@@ -263,71 +339,6 @@ table.insert(config.hyperlink_rules, {
 -- ControlMaster in ~/.ssh/config, so the new connection is instant. The new
 -- pane runs ssh through ssh-pane: it closes when that session exits normally,
 -- but a dropped connection leaves it open with Enter to reconnect.
-
--- ssh options that take a value (from `man ssh`)
-local SSH_OPTS_WITH_VALUE = {}
-for c in ('bcDEeFIiJLlmOopQRSWw'):gmatch '.' do SSH_OPTS_WITH_VALUE[c] = true end
--- Of those, the ones carried over so the new connection matches
-local SSH_OPTS_KEPT = { l = true, p = true, F = true, J = true, i = true }
-
--- ssh wrapper that offers Enter-to-reconnect when the connection drops
-local SSH_PANE = wezterm.home_dir .. '/.local/bin/ssh-pane'
-
--- argv of an ssh process -> args for a fresh ssh-pane to the same destination
--- (remote command dropped), or nil if no destination is found.
-local function ssh_split_args(argv, first)
-  local kept, i = {}, (first or 1) + 1
-  while i <= #argv do
-    local a = argv[i]
-    if a == '--' then
-      i = i + 1
-      break
-    elseif a:sub(1, 1) ~= '-' or a == '-' then
-      break
-    end
-    -- Walk bundled flags like -tt or -4p2222
-    for j = 2, #a do
-      local c = a:sub(j, j)
-      if SSH_OPTS_WITH_VALUE[c] then
-        local value = a:sub(j + 1)
-        if value == '' then
-          i = i + 1
-          value = argv[i]
-        end
-        if value and SSH_OPTS_KEPT[c] then
-          table.insert(kept, '-' .. c)
-          table.insert(kept, value)
-        end
-        break
-      end
-    end
-    i = i + 1
-  end
-  local dest = argv[i]
-  if not dest then return nil end
-  local args = { SSH_PANE }
-  for _, v in ipairs(kept) do table.insert(args, v) end
-  table.insert(args, dest)
-  return args
-end
-
--- { SSH_PANE, <kept opts...>, dest } when the pane is a local pane whose
--- foreground process is ssh or ssh-pane, else nil. Shared by smart splits and
--- image paste. ssh-pane is a #!/bin/sh script, so its argv is
--- { '/bin/sh', '.../ssh-pane', <ssh args...> }: parse from the ssh-pane entry.
-local function pane_ssh_args(pane)
-  local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
-  if not info then return nil end
-  local argv = info.argv or {}
-  local function base(k) return (argv[k] or ''):match '[^/]*$' end
-  if (info.executable or ''):match '[^/]*$' == 'ssh' or base(1) == 'ssh' or base(1) == 'ssh-pane' then
-    return ssh_split_args(argv, 1)
-  elseif base(2) == 'ssh-pane' then
-    return ssh_split_args(argv, 2)
-  end
-  return nil
-end
-
 local function smart_split(direction)
   return wezterm.action_callback(function(window, pane)
     local args = pane_ssh_args(pane)
@@ -336,9 +347,7 @@ local function smart_split(direction)
         direction = direction,
         args = args,
         cwd = pane_cwd(pane),
-        set_environment_variables = {
-          PATH = '/opt/homebrew/bin:' .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin'),
-        },
+        set_environment_variables = { PATH = SPAWN_PATH },
       }
     elseif direction == 'Right' then
       window:perform_action(act.SplitHorizontal { domain = 'CurrentPaneDomain' }, pane)
@@ -398,9 +407,7 @@ local function smart_spawn(new_window)
       local spec = {
         args = args,
         cwd = pane_cwd(pane),
-        set_environment_variables = {
-          PATH = '/opt/homebrew/bin:' .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin'),
-        },
+        set_environment_variables = { PATH = SPAWN_PATH },
       }
       window:perform_action(new_window and act.SpawnCommandInNewWindow(spec)
         or act.SpawnCommandInNewTab(spec), pane)
@@ -601,10 +608,6 @@ end
 --    bracketed paste.
 -- Local panes not running ssh ignore mdedit_*: local mdedit handles itself.
 local MD_PREVIEW_KEY = 'md_preview_for_pane_' -- .. editor pane id -> "NONCE|PREVIEW_ID"
-
-local function sh_quote(s)
-  return "'" .. s:gsub("'", [['\'']]) .. "'"
-end
 
 -- Kill the preview recorded for editor pane `editor_id` (only if its nonce
 -- matches `nonce`, when given) and forget it.
