@@ -80,14 +80,18 @@ local function toggle_sidebar(window, pane)
   wezterm.GLOBAL[key] = sidebar:pane_id()
 end
 
--- Clickable file paths: a single left click (no drag) on a path such as
--- ~/.ssh/config, /Users/me/x.md, ./foo.py or ~/.wezterm.lua:42 opens a
+-- Clickable file paths: CMD+click on a path such as ~/.ssh/config,
+-- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
 -- temporary Yazi pane on the right of the tab with the file hovered and the
 -- preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua), or the directory
 -- opened. q quits Yazi and closes the pane. OSC 8 file:// links (ls
 -- --hyperlink, Claude Code) are handled the same way; web URLs are untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
 local PEEK_SIZE = 0.45
+
+local function toast(window, msg, ms)
+  window:toast_notification('wezterm', msg, nil, ms or 3000)
+end
 
 local function is_dir(path)
   local ok = pcall(wezterm.read_dir, path)
@@ -134,13 +138,23 @@ local function uri_to_path(uri)
   return percent_decode((path:gsub('[?#].*$', '')))
 end
 
--- Existing absolute path for `text`, resolving ~ and relative paths against
--- `cwd` and dropping a trailing :line or :line:col; nil if nothing exists.
+-- Spellings of a clicked path to try in order: as is, without a trailing
+-- :line, :line:col or :first-last, then each %-decoded (My%20File.md)
+local function path_variants(text)
+  local out = { text }
+  local stripped = text:match '^(.-):%d+[:-]%d+$' or text:match '^(.-):%d+$'
+  if stripped and stripped ~= '' then table.insert(out, stripped) end
+  for i = 1, #out do
+    local decoded = percent_decode(out[i])
+    if decoded ~= out[i] then table.insert(out, decoded) end
+  end
+  return out
+end
+
+-- Existing absolute path for `text` (see path_variants), resolving ~ and
+-- relative paths against `cwd`; nil if nothing exists.
 local function resolve_path(text, cwd)
-  local candidates = { text }
-  local stripped = text:match '^(.-):%d+:%d+$' or text:match '^(.-):%d+$'
-  if stripped and stripped ~= '' then table.insert(candidates, stripped) end
-  for _, c in ipairs(candidates) do
+  for _, c in ipairs(path_variants(text)) do
     if c == '~' or c:sub(1, 2) == '~/' then
       c = wezterm.home_dir .. c:sub(2)
     elseif c:sub(1, 1) ~= '/' then
@@ -188,7 +202,7 @@ wezterm.on('open-uri', function(window, pane, uri)
   local path = pane:get_domain_name() == 'local' and resolve_path(text, pane_cwd(pane))
   if not path then
     if custom then
-      window:toast_notification('wezterm', 'Not found locally: ' .. text, nil, 3000)
+      toast(window, 'Not found: ' .. text, 2000)
       return false
     end
     return -- file:// we can't resolve: let the default opener try
@@ -197,14 +211,49 @@ wezterm.on('open-uri', function(window, pane, uri)
   return false
 end)
 
--- Paths start with ~/, ./, ../ or / at the start of a line or after
--- whitespace/quote/backtick/bracket/= (so 1/2, and/or and the /a/b inside
--- URLs never match). They stop at whitespace, quotes, backticks and brackets
--- and never end in . , : ; ! ? so prose punctuation stays out. Group 1 is the
--- path (with any :line[:col]).
+-- Paths are recognized at the start of a line or after whitespace, a quote,
+-- backtick, bracket, = or * (markdown **bold**), so the /a/b inside URLs
+-- never matches. Group 1 is the path (with any :line[:col] or :first-last).
+-- WezTerm compiles these with fancy-regex, so lookarounds work.
 config.hyperlink_rules = wezterm.default_hyperlink_rules()
+
+-- Anchored paths: ~/, ./, ../ or /. They stop at whitespace, quotes,
+-- backticks, brackets and * and never end in . , : ; ! ? so prose
+-- punctuation stays out.
 table.insert(config.hyperlink_rules, {
-  regex = [=[(?:^|[\s"'`(\[{<=])((?:~|\.\.?)?/[^\s"'`()\[\]{}<>]*[^\s"'`()\[\]{}<>.,:;!?])]=],
+  regex = [=[(?:^|[\s"'`(\[{<=*])((?:~|\.\.?)?/[^\s"'`()\[\]{}<>*]*[^\s"'`()\[\]{}<>*.,:;!?])]=],
+  format = PEEK_SCHEME .. '$1',
+  highlight = 1,
+})
+
+-- Bare relative paths as Claude Code prints them (tasks/todo.md,
+-- src/app.py:42, README.md). To keep prose like and/or, 1/2, 10/16/2026,
+-- e.g., 1.2.3 and example.com out, one must be
+--  * dir/.../file.ext (extension starts with a letter),
+--  * three or more segments starting with a letter (bin/tools/ssh-pane),
+--  * dir/ followed by whitespace or punctuation,
+--  * name.ext with a known source/doc extension, a common dotfile, or a
+--    Makefile/Dockerfile/Justfile.
+-- Segments never end in a dot, so a sentence's final period is left out.
+-- Unknown paths only toast when clicked.
+local REL_START = [=[(?<![^\s"'`(\[{<=*])]=] -- like the boundary above, not consumed
+local REL_FIRST = [=[\.?[\w@+](?:[\w.@+~-]*[\w@+~-])?]=]
+local REL_FIRST_ALPHA = [=[\.?[A-Za-z_](?:[\w.@+~-]*[\w@+~-])?]=]
+local REL_SEG = [=[\.?[\w@+~-](?:[\w.@+~-]*[\w@+~-])?]=]
+local REL_EXTS = 'md|markdown|txt|rst|py|pyi|ipynb|js|mjs|cjs|jsx|ts|tsx|vue|svelte|lua|sh|bash'
+  .. '|zsh|fish|json|jsonl|toml|ya?ml|ini|cfg|conf|env|lock|rs|go|c|h|cc|cpp|hpp|cu|java|kt'
+  .. '|swift|rb|php|sql|css|scss|html?|xml|csv|tsv|log|tex|bib|pdf|png|jpe?g|gif|svg|webp'
+  .. '|mp4|mov|zip|gz|tgz|tar|patch|diff|proto|tf|nix|vim'
+local REL_DOTFILES = [=[[\w-]*rc|env|gitignore|gitconfig|gitattributes|profile|zprofile|editorconfig|dockerignore]=]
+table.insert(config.hyperlink_rules, {
+  regex = REL_START .. '((?:'
+    .. REL_FIRST_ALPHA .. '(?:/' .. REL_SEG .. '){2,}/?'
+    .. '|' .. REL_FIRST .. '(?:/' .. REL_SEG .. [=[)*/[\w@+~.-]*\.[A-Za-z]\w*]=]
+    .. '|' .. REL_FIRST .. '(?:/' .. REL_SEG .. [=[)*/(?=$|[\s"'`)\]}>*,;:!?])]=]
+    .. '|' .. REL_FIRST .. [=[\.(?i:]=] .. REL_EXTS .. [=[)\b]=]
+    .. [=[|\.(?:]=] .. REL_DOTFILES .. [=[)\b(?:\.[\w-]+)*]=]
+    .. [=[|(?:Makefile|Dockerfile|Justfile)\b]=]
+    .. [=[)(?::\d+(?:[:-]\d+)?)?)]=],
   format = PEEK_SCHEME .. '$1',
   highlight = 1,
 })

@@ -41,7 +41,7 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+SHIFT+M | Merge all other windows into this one, keeping split layouts |
 | CMD+SHIFT+← / → | Reorder tabs |
 | CMD+E | Toggle the Yazi file sidebar (local tabs only) |
-| CMD+click a path | Open it in a Yazi peek pane (file hovered, preview maximized). Works on `~/x`, `./x`, `/x`, `x:12` and `file://` links |
+| CMD+click a path | Open it in a Yazi peek pane (file hovered, preview maximized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links |
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | CMD+W | Close pane, confirm with Enter or y (n/Esc cancels) |
 | CMD+[ / CMD+] | Previous / next pane |
