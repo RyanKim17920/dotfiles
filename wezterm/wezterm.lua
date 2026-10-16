@@ -367,7 +367,45 @@ local function open_remote_peek(window, pane, ssh, kind, path)
   })
 end
 
+-- CMD+OPT+click reveals the path in Finder instead (drag it from there into
+-- a browser upload, Slack, ...): `open -R` for files, `open` for directories.
+-- A remote file is first copied to ~/Downloads/<host>/ over the existing
+-- ControlMaster. The mouse binding sets this flag right before opening the
+-- link; it is consumed by the next open-uri and ignored once stale.
+local REVEAL_KEY = 'reveal_next_link'
+
+local function reveal_local(path)
+  wezterm.background_child_process(is_dir(path) and { '/usr/bin/open', path }
+    or { '/usr/bin/open', '-R', path })
+end
+
+-- sh -c script: dir name cmd... ; runs cmd (cat of the remote file) into
+-- dir/name via a .part file, then reveals it, or notifies on failure
+local FETCH_SCRIPT = [[
+dir=$1 name=$2; shift 2
+mkdir -p "$dir" && "$@" > "$dir/$name.part" && mv -f "$dir/$name.part" "$dir/$name" && exec open -R "$dir/$name"
+rm -f "$dir/$name.part"
+osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "wezterm"' -e 'end run' "Copy failed: $name"]]
+
+local function reveal_remote(window, ssh, kind, path)
+  local host = ssh_host(ssh)
+  if kind == 'd' then
+    toast(window, 'Remote directory, not copied: ' .. host .. ':' .. path)
+    return
+  end
+  local sub = host:gsub('[^%w.-]', '_')
+  local cmd = { '/bin/sh', '-c', FETCH_SCRIPT, 'sh', wezterm.home_dir .. '/Downloads/' .. sub,
+    path:match '[^/]+$' }
+  for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
+  table.insert(cmd, 'cat -- ' .. sh_quote(path))
+  wezterm.background_child_process(cmd)
+  toast(window, 'Copying ' .. host .. ':' .. path .. ' to ~/Downloads/' .. sub .. '/')
+end
+
 wezterm.on('open-uri', function(window, pane, uri)
+  local clicked = wezterm.GLOBAL[REVEAL_KEY]
+  wezterm.GLOBAL[REVEAL_KEY] = nil
+  local reveal = clicked ~= nil and os.time() - clicked <= 2
   local text, host = uri_to_path(uri)
   if not text then return end -- web URL etc.: default opener
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
@@ -379,7 +417,11 @@ wezterm.on('open-uri', function(window, pane, uri)
       toast(window, path)
       return false
     end
-    open_remote_peek(window, pane, ssh, kind, path)
+    if reveal then
+      reveal_remote(window, ssh, kind, path)
+    else
+      open_remote_peek(window, pane, ssh, kind, path)
+    end
     return false
   end
   if host then return end -- file://otherhost outside ssh: default opener
@@ -392,7 +434,11 @@ wezterm.on('open-uri', function(window, pane, uri)
     end
     return -- file:// we can't resolve: let the default opener try
   end
-  open_peek(window, pane, path)
+  if reveal then
+    reveal_local(path)
+  else
+    open_peek(window, pane, path)
+  end
   return false
 end)
 
@@ -873,23 +919,33 @@ for n = 1, 9 do
 end
 
 -- CMD+click opens links/paths even inside apps that capture the mouse
--- (Claude Code, less, micro). mouse_reporting=true covers those apps; the
--- plain entries cover normal shells. The Down events are swallowed so the
--- click isn't also sent to the app or start a selection.
+-- (Claude Code, less, micro); CMD+OPT+click reveals a path in Finder (see
+-- REVEAL_KEY). mouse_reporting=true covers those apps; the plain entries
+-- cover normal shells. The Down events are swallowed so the click isn't also
+-- sent to the app or start a selection.
+local function open_link(reveal)
+  return wezterm.action_callback(function(window, pane)
+    wezterm.GLOBAL[REVEAL_KEY] = reveal and os.time() or nil
+    window:perform_action(act.OpenLinkAtMouseCursor, pane)
+  end)
+end
+
 config.mouse_bindings = {}
 for _, reporting in ipairs { false, true } do
-  table.insert(config.mouse_bindings, {
-    event = { Down = { streak = 1, button = 'Left' } },
-    mods = 'CMD',
-    mouse_reporting = reporting,
-    action = act.Nop,
-  })
-  table.insert(config.mouse_bindings, {
-    event = { Up = { streak = 1, button = 'Left' } },
-    mods = 'CMD',
-    mouse_reporting = reporting,
-    action = act.OpenLinkAtMouseCursor,
-  })
+  for mods, reveal in pairs { CMD = false, ['CMD|OPT'] = true } do
+    table.insert(config.mouse_bindings, {
+      event = { Down = { streak = 1, button = 'Left' } },
+      mods = mods,
+      mouse_reporting = reporting,
+      action = act.Nop,
+    })
+    table.insert(config.mouse_bindings, {
+      event = { Up = { streak = 1, button = 'Left' } },
+      mods = mods,
+      mouse_reporting = reporting,
+      action = open_link(reveal),
+    })
+  end
 end
 
 return config

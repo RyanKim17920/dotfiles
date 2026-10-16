@@ -42,6 +42,7 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+SHIFT+← / → | Reorder tabs |
 | CMD+E | Toggle the Yazi file sidebar (local tabs only) |
 | CMD+click a path | Open it in a Yazi peek pane (file hovered, preview maximized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links |
+| CMD+OPT+click a path | Reveal it in Finder (`open -R`; directories open) so you can drag it into a browser upload, Slack, etc. In an ssh pane the file is first copied to `~/Downloads/<host>/` over the existing ControlMaster |
 | CMD+click a path in an ssh pane | Open it in remote Yazi on that host (split via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Relative paths resolve against the remote cwd if the remote shell reports it (OSC 7), else the remote home |
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | CMD+W | Close pane, confirm with Enter or y (n/Esc cancels) |
@@ -71,6 +72,7 @@ Host *
 | T | Maximize / restore the preview pane |
 | R | `mdview`: read the hovered Markdown file full screen (glow, paged with `less -R`; q returns) |
 | Enter on `.md` | `mdedit`: micro on the left, live glow preview on the right |
+| g r | Reveal the hovered file in Finder (macOS only; a no-op on remote hosts) |
 
 Side-by-side Markdown also works over SSH in WezTerm: on the remote host,
 `mdedit` sets a WezTerm user var and `~/.wezterm.lua` opens the preview

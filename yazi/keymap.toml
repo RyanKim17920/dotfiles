@@ -7,3 +7,8 @@ desc = "Maximize or restore the preview pane"
 on   = "R"
 run  = 'shell --block -- "$HOME/.local/bin/mdview" %s'
 desc = "Read markdown rendered, full screen (q to return)"
+
+[[mgr.prepend_keymap]]
+on   = [ "g", "r" ]
+run  = 'shell -- [ "$(uname)" = Darwin ] && open -R %h'
+desc = "Reveal the hovered file in Finder (macOS only)"
