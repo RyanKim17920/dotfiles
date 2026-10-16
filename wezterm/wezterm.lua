@@ -33,9 +33,24 @@ local ICON = {
   forward = utf8.char(0xF0318), zoom = utf8.char(0xF0293), console = utf8.char(0xF018D),
 }
 
--- macOS notification. Messages read "<Area>: <what happened>".
+-- Feedback for clicks, prompts and moves; messages read "<Area>: <what
+-- happened>". WezTerm's macOS toasts use the deprecated NSUserNotification
+-- API, which current macOS no longer displays (WezTerm never even shows up in
+-- System Settings > Notifications), so the message also flashes in the tab
+-- bar's right status for `ms` and goes to the GUI log.
 local function toast(window, msg, ms)
-  window:toast_notification('WezTerm', msg, nil, ms or 3000)
+  ms = ms or 3000
+  window:toast_notification('WezTerm', msg, nil, ms)
+  wezterm.log_info('notice: ' .. msg)
+  local seq = (wezterm.GLOBAL.notice_seq or 0) + 1
+  wezterm.GLOBAL.notice_seq = seq
+  window:set_right_status(wezterm.format {
+    { Background = { Color = C.surface0 } }, { Foreground = { Color = C.peach } },
+    { Text = ' ' .. msg .. ' ' },
+  })
+  wezterm.time.call_after(ms / 1000, function()
+    if wezterm.GLOBAL.notice_seq == seq then window:set_right_status('') end
+  end)
 end
 
 -- Heading for PromptInputLine: accent icon, bold title, dim hint below
@@ -540,6 +555,9 @@ local forward_prompt = act.PromptInputLine {
 }
 
 wezterm.on('open-uri', function(window, pane, uri)
+  -- One GUI log line per click (~/.local/share/wezterm/wezterm-gui-log-*.txt);
+  -- web URLs only up to host:port so tokens stay out of the log
+  wezterm.log_info('open-uri: ' .. (uri:match '^%a[%w+.-]*://[^/?#]*' or uri))
   local clicked = wezterm.GLOBAL[REVEAL_KEY]
   wezterm.GLOBAL[REVEAL_KEY] = nil
   local reveal = clicked ~= nil and os.time() - clicked <= 2
