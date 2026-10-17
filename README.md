@@ -42,9 +42,9 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+SHIFT+= | Fix layout: if the tab's panes spill past the window edge (a WezTerm 20240203 bug no resize undoes), rebuild the tab with the same proportions, position, title and focus; processes keep running. Also runs on its own after window resizes, pane moves and merges |
 | CMD+SHIFT+← / → | Reorder tabs |
 | CMD+E | Toggle the Yazi file sidebar (local tabs only); a full-height column on the left, also in tabs that already have splits |
-| CMD+click a path | Open it in a Yazi peek tab next to the current one (file hovered, preview maximized; q closes it and returns to your tab, so TUIs like Claude Code are never resized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links. Paths a TUI hard-wrapped onto the next line (Claude Code's indented continuation) are rejoined from the pane text, whichever half you click |
+| CMD+click a path | Images and PDFs open in Quick Look. Other files and directories open in a Yazi peek tab next to the current one (file hovered, preview maximized; q closes it and returns to your tab, so TUIs like Claude Code are never resized). Works on `~/x`, `./x`, `/x`, bare relative paths like `src/app.py` or `README.md`, `x:12` / `x:12:3` / `x:12-40` and `file://` links. Paths a TUI hard-wrapped onto the next line (Claude Code's indented continuation) are rejoined from the pane text, whichever half you click |
 | CMD+OPT+click a path | Reveal it in Finder (`open -R`; directories open) so you can drag it into a browser upload, Slack, etc. In an ssh pane the file is first copied to `~/Downloads/<host>/` over the existing ControlMaster |
-| CMD+click a path in an ssh pane | Open it in remote Yazi on that host (peek tab via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Relative paths resolve against the remote cwd if the remote shell reports it (OSC 7), else the remote home |
+| CMD+click a path in an ssh pane | Open it in remote Yazi on that host (peek tab via `ssh-pane`, instant over the ControlMaster; never prompts, toasts if there is no live master). Images and PDFs are copied to `~/Library/Caches/wezterm/peek/<host>/` over the master and open in Quick Look. Relative paths resolve against the remote shell's cwd (OSC 7, sent by the `ssh-setup` bashrc block), else against the cwds of your processes on the host (e.g. Claude Code inside tmux; newest match wins) and the remote home, all in one round trip |
 | CMD+click a localhost link in an ssh pane | `http://localhost:PORT` / `127.0.0.1` / `0.0.0.0` from Jupyter, TensorBoard, vite... on the remote: adds `ssh -O forward -L` on the existing ControlMaster (never a new login) and opens it locally, `?token=` kept. A busy local port moves to the next free one; forwards are reused |
 | CMD+click an `ssh ... -L LPORT:HOST:RPORT ... host` command | Add those forwards to the existing ControlMaster for that host instead of running it, then open the latest localhost URL for that port from the scrollback (token filled in) or `http://localhost:LPORT/` (never a new login; config aliases are matched, so `me@login.example.org` finds the master opened as `myserver`) |
 | CMD+click `http://localhost:LPORT/...` after such a hint | Uses the most recent `ssh -L LPORT:...` in the scrollback (works from local panes too), so a server on a compute node behind a login host opens directly. A stale forward of ours on LPORT is replaced; an old hand-started tunnel is left running and named by pid. `?token=<token>` is filled from the last `cat .../token` shown in this pane, else in the window's other panes, else the token file that last worked for that host and remote port (path remembered in `~/.local/state/wezterm/token-paths`, mode 600; never the token), read over the master and never logged |
@@ -141,15 +141,25 @@ Make sure `~/.local/bin` is on your `PATH`. For the status line, point
 ## ssh-setup
 
 ```sh
-ssh-setup <host>
+ssh-setup <host>   # set up or update one host
+ssh-setup --all    # update every host set up before
 ```
 
 Installs yazi, ya, micro, glow and resvg (static release binaries matching your local
 versions, checksum-verified), your yazi/micro configs and the status line into
 your home directory on a remote Linux host (x86_64 or aarch64). No sudo. It
-adds one marked block to the remote `~/.bashrc` (PATH, `EDITOR=micro`, `y`),
+adds one marked block to the remote `~/.bashrc` (PATH, `EDITOR=micro`, `y`,
+and an OSC 7 prompt hook so WezTerm knows the remote cwd; inside tmux it uses
+passthrough when `allow-passthrough` is on), replaced in place on updates,
 backs up anything it replaces to `*.bak-ssh-setup`, and prints undo commands.
 Re-running is a fast no-op when nothing changed.
+
+Each host set up successfully is listed in `~/.local/state/ssh-setup/hosts`.
+`ssh-setup --all` re-syncs those hosts in parallel and prints one line per
+host. It only touches hosts with a live ControlMaster (`ssh -O check`) and
+rides that connection only (a dead master makes the run fail instead of
+logging in), so a host behind 2FA is skipped with `not connected (open an ssh
+pane to it first)` rather than prompted.
 
 Caveats:
 
