@@ -335,7 +335,8 @@ end
 -- hovered and the preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua),
 -- or the directory opened. q quits Yazi, closes the tab and returns to the
 -- tab the click came from. A tab rather than a split, so a TUI like Claude
--- Code is never resized under it. OSC 8 file:// links (ls --hyperlink) are
+-- Code is never resized under it. Images and PDFs open in Quick Look
+-- instead (see is_quicklook). OSC 8 file:// links (ls --hyperlink) are
 -- handled the same way; web URLs are untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
 local SSH_FORWARD_SCHEME = 'ssh-forward:' -- see forward_command
@@ -676,13 +677,71 @@ local function reveal_local(path)
     or { '/usr/bin/open', '-R', path })
 end
 
--- sh -c script: dir name cmd... ; runs cmd (cat of the remote file) into
--- dir/name via a .part file, then reveals it, or notifies on failure
-local FETCH_SCRIPT = [[
+-- Images (and PDFs, which Yazi previews as an image too) open in macOS Quick
+-- Look instead of the peek tab: Yazi draws them through a terminal image
+-- protocol sized from the pane's reported pixel size, the fragile part of a
+-- TUI preview; Quick Look is a real viewer. Remote ones are copied to
+-- ~/Library/Caches/wezterm/peek/<host>/ first over the existing ControlMaster.
+local QUICKLOOK_EXTS = {}
+for e in ('png jpg jpeg gif webp bmp tif tiff heic heif svg pdf'):gmatch '%S+' do
+  QUICKLOOK_EXTS[e] = true
+end
+local QUICKLOOK_PID = wezterm.home_dir .. '/.local/state/wezterm/quicklook.pid'
+local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
+
+local function is_quicklook(path)
+  local ext = path:match '%.(%w+)$'
+  return ext ~= nil and QUICKLOOK_EXTS[ext:lower()] == true
+end
+
+-- sh -c script: pidfile mode args...
+--   look <file>        Quick Look it; one panel at a time (the qlmanage
+--                      started last time is closed first)
+--   reveal-copy|look-copy <dir> <name> <cmd...>
+--                      run cmd (cat of a remote file) into dir/name via a
+--                      .part file, then reveal it in Finder or Quick Look
+--                      it; notify on failure
+local FILE_SCRIPT = [[
+pf=$1 mode=$2; shift 2
+look() {
+  old=$(cat "$pf" 2>/dev/null)
+  case $(ps -o comm= -p "${old:-0}" 2>/dev/null) in *qlmanage) kill "$old" ;; esac
+  mkdir -p "$(dirname "$pf")"
+  qlmanage -p "$1" >/dev/null 2>&1 &
+  echo $! > "$pf"
+  wait
+}
+if [ "$mode" = look ]; then look "$1"; exit; fi
 dir=$1 name=$2; shift 2
-mkdir -p "$dir" && "$@" > "$dir/$name.part" && mv -f "$dir/$name.part" "$dir/$name" && exec open -R "$dir/$name"
+if mkdir -p "$dir" && "$@" > "$dir/$name.part" && mv -f "$dir/$name.part" "$dir/$name"; then
+  if [ "$mode" = look-copy ]; then look "$dir/$name"; else exec open -R "$dir/$name"; fi
+  exit
+fi
 rm -f "$dir/$name.part"
 osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "wezterm"' -e 'end run' "Copy failed: $name"]]
+
+local function file_cmd(mode, ...)
+  return { '/bin/sh', '-c', FILE_SCRIPT, 'sh', QUICKLOOK_PID, mode, ... }
+end
+
+local function quicklook_local(window, path)
+  wezterm.background_child_process(file_cmd('look', path))
+  toast(window, 'Quick Look: ' .. (path:match '[^/]+$' or path), 2000)
+end
+
+-- Copy remote file `path` into local `dir` over the master, then reveal or
+-- Quick Look it (mode 'reveal-copy' / 'look-copy')
+local function fetch_remote(ssh, path, mode, dir)
+  local cmd = file_cmd(mode, dir, path:match '[^/]+$')
+  for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
+  table.insert(cmd, 'cat -- ' .. sh_quote(path))
+  wezterm.background_child_process(cmd)
+end
+
+-- Host as a safe local directory name
+local function host_dir(ssh)
+  return (ssh_host(ssh):gsub('[^%w.-]', '_'))
+end
 
 local function reveal_remote(window, ssh, kind, path)
   local host = ssh_host(ssh)
@@ -690,13 +749,14 @@ local function reveal_remote(window, ssh, kind, path)
     toast(window, 'Finder: ' .. host .. ':' .. path .. ' is a remote directory; not copied')
     return
   end
-  local sub = host:gsub('[^%w.-]', '_')
-  local cmd = { '/bin/sh', '-c', FETCH_SCRIPT, 'sh', wezterm.home_dir .. '/Downloads/' .. sub,
-    path:match '[^/]+$' }
-  for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
-  table.insert(cmd, 'cat -- ' .. sh_quote(path))
-  wezterm.background_child_process(cmd)
+  local sub = host_dir(ssh)
+  fetch_remote(ssh, path, 'reveal-copy', wezterm.home_dir .. '/Downloads/' .. sub)
   toast(window, 'Finder: copying ' .. host .. ':' .. path .. ' to ~/Downloads/' .. sub .. '/')
+end
+
+local function quicklook_remote(window, ssh, path)
+  fetch_remote(ssh, path, 'look-copy', PEEK_CACHE .. host_dir(ssh))
+  toast(window, 'Quick Look: copying ' .. ssh_host(ssh) .. ':' .. path, 2000)
 end
 
 -- Localhost links and ssh -L tunnel commands. A server on a remote host
@@ -1317,6 +1377,8 @@ wezterm.on('open-uri', function(window, pane, uri)
     end
     if reveal then
       reveal_remote(window, ssh, kind, path)
+    elseif kind == 'f' and is_quicklook(path) then
+      quicklook_remote(window, ssh, path)
     else
       open_remote_peek(window, pane, ssh, kind, path)
     end
@@ -1350,6 +1412,8 @@ wezterm.on('open-uri', function(window, pane, uri)
   end
   if reveal then
     reveal_local(path)
+  elseif not is_dir(path) and is_quicklook(path) then
+    quicklook_local(window, path)
   else
     open_peek(window, pane, path)
   end
