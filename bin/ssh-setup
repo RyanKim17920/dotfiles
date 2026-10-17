@@ -20,7 +20,9 @@
 #   ~/.claude/settings.json    (only the "statusLine" key is set; others untouched)
 #   ~/.local/bin/jq            (only if the remote has no usable system jq)
 #   ~/.local/share/ssh-setup/stamp      (version/config hash for idempotency)
-#   ~/.bashrc                  (one block between the ssh-setup markers)
+#   ~/.bashrc                  (one block between the ssh-setup markers: PATH,
+#                              EDITOR, y(), and an OSC 7 prompt hook so WezTerm
+#                              here knows the remote cwd; replaced on update)
 # Pre-existing ~/.config/{yazi,micro}, binaries, ~/.claude/statusline.sh and
 # ~/.claude/settings.json are backed up once to *.bak-ssh-setup before the
 # first install that touches them.
@@ -28,7 +30,7 @@
 # ~/.local/state/ssh-setup/hosts (what --all re-syncs).
 set -euo pipefail
 
-FORMAT=1   # bump when the remote layout or bashrc block changes
+FORMAT=2   # bump when the remote layout or bashrc block changes
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ssh-setup"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # --all: ride the live ControlMaster only. If the master is gone, the direct
@@ -243,17 +245,58 @@ if local_sl="$(jq -ce '.statusLine | select(type == "object")' "$HOME/.claude/se
 fi
 printf '%s\n' "$STATUSLINE_JSON" >"$STAGE/.local/share/ssh-setup/statusline.json"
 
-BASHRC_BLOCK="$MARK_BEGIN (added by ssh-setup; delete this block to undo)
-case \":\$PATH:\" in *\":\$HOME/.local/bin:\"*) ;; *) export PATH=\"\$HOME/.local/bin:\$PATH\" ;; esac
+# The ~/.bashrc block. The OSC 7 hook reports the cwd at every prompt as
+# file://<remote host>/<dir>, which WezTerm on this Mac reads as the pane's
+# cwd (relative-path Cmd+click). Inside tmux it goes through tmux's
+# passthrough when allow-passthrough is on; otherwise tmux keeps it.
+# (read, not $(cat <<EOF): bash 3.2 misparses case patterns in $( ) heredocs)
+IFS= read -r -d '' BASHRC_BODY <<'EOF' || true
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 export EDITOR=micro
 y() {
 	local tmp cwd
-	tmp=\"\$(mktemp -t yazi-cwd.XXXXXX)\"
-	command yazi \"\$@\" --cwd-file=\"\$tmp\"
-	IFS= read -r -d '' cwd < \"\$tmp\"
-	[ -n \"\$cwd\" ] && [ \"\$cwd\" != \"\$PWD\" ] && builtin cd -- \"\$cwd\"
-	rm -f -- \"\$tmp\"
+	tmp="$(mktemp -t yazi-cwd.XXXXXX)"
+	command yazi "$@" --cwd-file="$tmp"
+	IFS= read -r -d '' cwd < "$tmp"
+	[ -n "$cwd" ] && [ "$cwd" != "$PWD" ] && builtin cd -- "$cwd"
+	rm -f -- "$tmp"
 }
+if [ -n "${BASH_VERSION:-}" ] && [[ $- == *i* ]]; then
+	__ssh_setup_tmux_pt=
+	if [ -n "${TMUX:-}" ]; then
+		case "$(tmux display-message -p -t "${TMUX_PANE:-}" '#{allow-passthrough}' 2>/dev/null)" in
+			on|all) __ssh_setup_tmux_pt=1 ;;
+		esac
+	fi
+	__ssh_setup_osc7() {
+		local s=$? p=$PWD
+		p=${p//%/%25}; p=${p// /%20}; p=${p//#/%23}; p=${p//\?/%3F}
+		if [ -n "$__ssh_setup_tmux_pt" ]; then
+			printf '\033Ptmux;\033\033]7;file://%s%s\007\033\\' "${HOSTNAME:-}" "$p"
+		else
+			printf '\033]7;file://%s%s\007' "${HOSTNAME:-}" "$p"
+		fi
+		return $s
+	}
+	# append to PROMPT_COMMAND (string or bash 5.1+ array), once
+	case " ${PROMPT_COMMAND[*]:-} " in
+		*__ssh_setup_osc7*) ;;
+		*)
+			if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+				PROMPT_COMMAND+=(__ssh_setup_osc7)
+			else
+				__ssh_setup_pc=${PROMPT_COMMAND:-}
+				while [[ $__ssh_setup_pc == *[\;[:space:]] ]]; do __ssh_setup_pc=${__ssh_setup_pc%?}; done
+				PROMPT_COMMAND="${__ssh_setup_pc:+$__ssh_setup_pc; }__ssh_setup_osc7"
+				unset __ssh_setup_pc
+			fi
+			;;
+	esac
+fi
+EOF
+BASHRC_BODY="${BASHRC_BODY%$'\n'}"
+BASHRC_BLOCK="$MARK_BEGIN (added by ssh-setup; delete this block to undo)
+$BASHRC_BODY
 $MARK_END"
 
 STAMP="$(
@@ -271,7 +314,7 @@ summary_tail() {
   undo on $HOST:
     rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview,resvg} ~/.config/micro/settings.json
     rm -rf ~/.config/yazi ~/.local/share/ssh-setup
-    sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc
+    sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc; rm -f ~/.bashrc.bak-ssh-setup-prev
     rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
     $([ "$SHIP_JQ" = yes ] && echo '~/.local/bin/jq' || echo jq) 'del(.statusLine)' ~/.claude/settings.json > ~/.claude/s.tmp && mv ~/.claude/s.tmp ~/.claude/settings.json
     # or restore ~/.claude/{settings.json,statusline.sh}.bak-ssh-setup if present
@@ -368,7 +411,7 @@ fi
 printf '%s\n' "$STAMP" >"$STAGE/.local/share/ssh-setup/stamp"
 printf '%s\n' "$BASHRC_BLOCK" >"$STAGE/.local/share/ssh-setup/bashrc-block"
 
-# --- 4. one tar stream; remote backs up, extracts, appends bashrc block -----
+# --- 4. one tar stream; remote backs up, extracts, writes the bashrc block --
 REMOTE_SCRIPT='set -e
 cd "$HOME"
 if [ ! -f .local/share/ssh-setup/stamp ]; then
@@ -430,15 +473,29 @@ else
 fi
 touch .local/share/ssh-setup/statusline-installed
 touch .bashrc
-if ! grep -qF "'"$MARK_BEGIN"'" .bashrc; then
-	{ [ -s .bashrc ] && [ -n "$(tail -c1 .bashrc)" ] && echo; echo; cat .local/share/ssh-setup/bashrc-block; } >> .bashrc
+B=.local/share/ssh-setup/bashrc-block
+if ! grep -qF "$MARK_BEGIN" .bashrc; then
+	{ [ -s .bashrc ] && [ -n "$(tail -c1 .bashrc)" ] && echo; echo; cat "$B"; } >> .bashrc
 	echo "bashrc: block appended"
+elif [ "$(grep -cF "$MARK_BEGIN" .bashrc)" != 1 ] || [ "$(grep -cxF "$MARK_END" .bashrc)" != 1 ] \
+	|| [ "$(grep -nF "$MARK_BEGIN" .bashrc | cut -d: -f1)" -gt "$(grep -nxF "$MARK_END" .bashrc | cut -d: -f1)" ]; then
+	echo "WARNING: ~/.bashrc ssh-setup markers are damaged; block left unchanged"
 else
-	echo "bashrc: block already present"
+	# replace the block in place (cat > keeps a symlinked .bashrc and its mode)
+	awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v f="$B" '\''
+		index($0, b) == 1 { while ((getline l < f) > 0) print l; skip = 1; next }
+		skip && $0 == e { skip = 0; next }
+		!skip'\'' .bashrc > .bashrc.tmp-ssh-setup
+	if cmp -s .bashrc.tmp-ssh-setup .bashrc; then
+		echo "bashrc: block already current"
+	else
+		cp -p .bashrc .bashrc.bak-ssh-setup-prev && cat .bashrc.tmp-ssh-setup > .bashrc && echo "bashrc: block updated (previous ~/.bashrc in ~/.bashrc.bak-ssh-setup-prev)"
+	fi
+	rm -f .bashrc.tmp-ssh-setup
 fi
 echo "installed: yazi $(.local/bin/yazi --version 2>&1 | awk "/Version:/{print \$2; exit}"), micro $(.local/bin/micro --version 2>&1 | awk "/Version:/{print \$2; exit}"), glow $(.local/bin/glow --version 2>&1 | awk "{print \$3; exit}"), resvg $(.local/bin/resvg --version 2>/dev/null || echo none), statusline (jq: $(${JQ:-false} --version 2>/dev/null || echo none))"'
 
-REMOTE_SCRIPT="JQ_SYS=$(sq "$jq_sys") SHIP_JQ=$SHIP_JQ
+REMOTE_SCRIPT="JQ_SYS=$(sq "$jq_sys") SHIP_JQ=$SHIP_JQ MARK_BEGIN=$(sq "$MARK_BEGIN") MARK_END=$(sq "$MARK_END")
 $REMOTE_SCRIPT"
 
 echo "ssh-setup: pushing to $HOST"
