@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # ssh-setup <host>
+# ssh-setup --all      (re-sync every host set up before; see run_all)
 #
 # Install yazi (+ ya), micro, glow and resvg plus this Mac's yazi/micro configs and
 # Claude Code status line into YOUR OWN home directory on a remote Linux host. No sudo, nothing system-wide.
@@ -23,11 +24,20 @@
 # Pre-existing ~/.config/{yazi,micro}, binaries, ~/.claude/statusline.sh and
 # ~/.claude/settings.json are backed up once to *.bak-ssh-setup before the
 # first install that touches them.
+# Local state: hosts set up successfully are listed one per line in
+# ~/.local/state/ssh-setup/hosts (what --all re-syncs).
 set -euo pipefail
 
 FORMAT=1   # bump when the remote layout or bashrc block changes
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ssh-setup"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
+# --all: ride the live ControlMaster only. If the master is gone, the direct
+# connection fallback runs ProxyCommand=false and fails at once, so no login
+# (and no 2FA push) is ever attempted from automation.
+if [ -n "${SSH_SETUP_MUX_ONLY:-}" ]; then
+	SSH_OPTS+=(-o ControlMaster=no -o ProxyCommand=false)
+fi
+HOSTS_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/ssh-setup/hosts"
 MARK_BEGIN='# >>> ssh-setup >>>'
 MARK_END='# <<< ssh-setup <<<'
 # Space-separated hosts to refuse (e.g. a forced-command bastion that cannot
@@ -40,25 +50,91 @@ warn() { printf 'ssh-setup: warning: %s\n' "$*" >&2; }
 
 usage() {
 	cat <<EOF
-usage: ssh-setup <host>
+usage: ssh-setup <host>   set up or update one host
+       ssh-setup --all    update every host set up before, in parallel; hosts
+                          without a live ssh connection (ControlMaster) are
+                          skipped, never logged in to
 Installs yazi, ya, micro, glow, your yazi/micro configs and your Claude Code
 status line (~/.claude/statusline.sh + the settings.json statusLine key) into ~ on <host>.
 EOF
 }
 
-[ $# -eq 1 ] || { usage >&2; exit 2; }
-case "$1" in -h|--help) usage; exit 0 ;; esac
-HOST="$1"
-
 # --- 1. refuse skipped hosts (by alias and by resolved hostname) ----------
 resolved() { ssh -G "$1" 2>/dev/null | awk '$1 == "hostname" { print $2; exit }'; }
-for b in $BLOCKED_HOSTS; do
-	[ "$HOST" = "$b" ] && die "refusing to target $b (listed in SSH_SETUP_SKIP_HOSTS)"
-	bh="$(resolved "$b")"
-	if [ -n "$bh" ] && [ "$(resolved "$HOST")" = "$bh" ]; then
-		die "refusing: $HOST resolves to the same host as $b"
-	fi
-done
+# prints why <host> is refused, if it is
+blocked_reason() {
+	local b bh
+	for b in $BLOCKED_HOSTS; do
+		[ "$1" = "$b" ] && { echo "listed in SSH_SETUP_SKIP_HOSTS"; return; }
+		bh="$(resolved "$b")"
+		if [ -n "$bh" ] && [ "$(resolved "$1")" = "$bh" ]; then
+			echo "resolves to the same host as $b"; return
+		fi
+	done
+}
+
+# Remember a host that was set up successfully (for --all)
+record_host() {
+	mkdir -p "$(dirname "$HOSTS_FILE")"
+	touch "$HOSTS_FILE"
+	grep -qxF -- "$1" "$HOSTS_FILE" || printf '%s\n' "$1" >>"$HOSTS_FILE"
+}
+
+# --all: re-run this script for every recorded host whose ControlMaster is
+# live (ssh -O check only asks the local master socket; it never connects),
+# in parallel, then print one summary line per host.
+run_all() {
+	[ -s "$HOSTS_FILE" ] || die "no hosts recorded yet in $HOSTS_FILE; run 'ssh-setup <host>' once per host"
+	local tmp h i=0 n reason rc log t pids=() hosts=() failed=0
+	tmp="$(mktemp -d "${TMPDIR:-/tmp}/ssh-setup-all.XXXXXX")"
+	while IFS= read -r h || [ -n "$h" ]; do
+		h="${h%%#*}"; h="${h//[[:space:]]/}"
+		[ -n "$h" ] && hosts+=("$h")
+	done <"$HOSTS_FILE"
+	[ ${#hosts[@]} -gt 0 ] || die "no hosts recorded in $HOSTS_FILE"
+	echo "ssh-setup --all: ${hosts[*]}"
+	for h in "${hosts[@]}"; do
+		reason="$(blocked_reason "$h")"
+		if [ -n "$reason" ]; then
+			echo "skipped $h: $reason" >"$tmp/$i.sum"; pids+=("")
+		elif ! ssh -O check "$h" >/dev/null 2>&1; then
+			echo "skipped $h: not connected (open an ssh pane to it first)" >"$tmp/$i.sum"; pids+=("")
+		else
+			SSH_SETUP_MUX_ONLY=1 "$0" "$h" >"$tmp/$i.log" 2>&1 &
+			pids+=("$!")
+		fi
+		i=$((i + 1))
+	done
+	n=$i
+	for ((i = 0; i < n; i++)); do
+		h="${hosts[$i]}"
+		if [ -z "${pids[$i]}" ]; then cat "$tmp/$i.sum"; continue; fi
+		rc=0; wait "${pids[$i]}" || rc=$?
+		log="$tmp/$i.log"
+		t="$(grep -o '\[[0-9]*s\]' "$log" | tail -1 || true)"
+		if [ $rc -ne 0 ]; then
+			failed=1
+			echo "FAILED  $h (exit $rc): $(grep '^ssh-setup:' "$log" | tail -1 | sed 's/^ssh-setup: //')"
+			echo "        log: $log"
+		elif grep -q 'already up to date' "$log"; then
+			echo "ok      $h: already up to date $t"
+		else
+			echo "ok      $h: updated $t$(grep -q 'bashrc: block updated' "$log" && echo ' (bashrc block updated)')"
+		fi
+	done
+	[ $failed -eq 0 ] && rm -rf "$tmp"
+	return $failed
+}
+
+case "${1:-}" in
+	-h|--help) usage; exit 0 ;;
+	--all) [ $# -eq 1 ] || { usage >&2; exit 2; }; run_all; exit ;;
+	''|-*) usage >&2; exit 2 ;;
+esac
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+HOST="$1"
+reason="$(blocked_reason "$HOST")"
+[ -z "$reason" ] || die "refusing to target $HOST ($reason)"
 
 for c in curl jq shasum unzip bsdtar ssh awk; do
 	command -v "$c" >/dev/null || die "missing local dependency: $c"
@@ -204,6 +280,7 @@ EOF
 }
 
 if [ "$remote_stamp" = "$STAMP" ] && [ -z "$remote_missing" ]; then
+	record_host "$HOST"
 	echo "ssh-setup: $HOST ($ARCH) already up to date (yazi $yazi_v, micro $micro_v, glow $glow_v$([ "$SHIP_RESVG" = yes ] && echo ", resvg $resvg_v")) [$((SECONDS - START))s]"
 	summary_tail
 	exit 0
@@ -369,5 +446,6 @@ COPYFILE_DISABLE=1 bsdtar -c -f - --format=ustar --uid 0 --gid 0 --uname root --
 	-C "$STAGE" .local .config .claude/statusline.sh \
 	| rsh "$REMOTE_SCRIPT" | sed 's/^/  /' || die "remote install on $HOST failed"
 
+record_host "$HOST"
 echo "ssh-setup: done [$((SECONDS - START))s]"
 summary_tail
