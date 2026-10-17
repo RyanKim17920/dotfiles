@@ -463,7 +463,9 @@ end
 -- are resolved there over the existing ControlMaster and opened in remote
 -- Yazi (installed by ssh-setup, whose synced init.lua handles YAZI_PEEK)
 -- through ssh-pane. Relative paths resolve against the remote shell's cwd
--- when it reports one with OSC 7, else against the remote home.
+-- when it reports one with OSC 7 (ssh-setup's ~/.bashrc block does), else
+-- against the cwds of the user's processes there (Claude Code inside tmux
+-- reports nothing) and the remote home; see REMOTE_RESOLVE.
 
 -- The remote shell's cwd from OSC 7 (file://<remote host>/dir), or nil.
 -- The local shell's last report is still there while ssh runs, and its
@@ -478,26 +480,82 @@ local function remote_cwd(pane)
   return nil
 end
 
--- Shell word for path text on the remote: ~ becomes "$HOME"
-local function remote_word(text, rcwd)
+-- Shell word for path text on the remote: ~ becomes "$HOME", relative
+-- paths are under it
+local function remote_word(text)
   if text == '~' then return '"$HOME"' end
   if text:sub(1, 2) == '~/' then return '"$HOME"' .. sh_quote(text:sub(2)) end
   if text:sub(1, 1) == '/' then return sh_quote(text) end
-  if rcwd then return sh_quote(rcwd .. '/' .. text) end
   return '"$HOME"/' .. sh_quote(text)
 end
 
--- Prints "d <dir>" or "f <file>" (absolute, ./.. collapsed) for the first
--- candidate that exists; exit 1 if none does
+-- Remote side of a path click, one round trip. Prints "d <dir>" or "f
+-- <file>" (absolute, ./.. collapsed) for the first argument that exists, exit
+-- 1 if none does. Arguments are A:<absolute path> or R:<relative path>. A
+-- relative path is tried against $RCWD (the shell's OSC 7 cwd) first, then
+-- against the cwds of the user's own processes (Linux /proc; those on a tty
+-- named claude/node/python/bash first, other tty ones next, the rest last)
+-- and $HOME; of several matches the newest (mtime) wins, the earlier one in
+-- that order on a tie. `/` is never a base.
 local REMOTE_RESOLVE = [[
-for p in %s; do
-  if [ -d "$p" ]; then
-    cd -- "$p" && printf 'd %%s\n' "$(pwd)" && exit 0
-  elif [ -e "$p" ]; then
-    d=$(cd -- "$(dirname -- "$p")" && pwd) && printf 'f %%s\n' "${d%%/}/$(basename -- "$p")" && exit 0
+emit() {
+  if [ -d "$1" ]; then
+    cd -- "$1" && printf 'd %s\n' "$(pwd)" && exit 0
+  else
+    d=$(cd -- "$(dirname -- "$1")" && pwd) && printf 'f %s\n' "${d%/}/$(basename -- "$1")" && exit 0
   fi
+}
+mtime() { stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null || echo 0; }
+bases() {
+  ps -u "$(id -u)" -o pid=,tty=,comm= 2>/dev/null | while read -r pid tty comm; do
+    c=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    case $c in ''|/) continue ;; esac
+    r=2
+    case $tty in
+      '?'|'') ;;
+      *) r=1; case $comm in claude|node|python*|bash) r=0 ;; esac ;;
+    esac
+    printf '%s %s\n' "$r" "$c"
+  done | sort -n -k1,1 | awk '!seen[substr($0, 3)]++ { print substr($0, 3) }'
+  printf '%s\n' "$HOME"
+}
+B=
+for w in "$@"; do
+  case $w in
+    A:*) p=${w#A:}; [ -e "$p" ] && emit "$p" ;;
+    R:*)
+      r=${w#R:}
+      [ -n "$RCWD" ] && [ -e "$RCWD/$r" ] && emit "$RCWD/$r"
+      [ -n "$B" ] || B=$(bases)
+      best= bt=-1
+      while IFS= read -r b; do
+        [ -n "$b" ] && [ -e "$b/$r" ] || continue
+        t=$(mtime "$b/$r")
+        [ "$t" -gt "$bt" ] 2>/dev/null && best=$b/$r bt=$t
+      done <<EOF
+$B
+EOF
+      [ -n "$best" ] && emit "$best" ;;
+  esac
 done
 exit 1]]
+
+-- REMOTE_RESOLVE argument(s) for clicked path text (see path_variants)
+local function resolve_words(text)
+  local words = {}
+  for _, v in ipairs(path_variants(text)) do
+    if v == '~' then
+      table.insert(words, '"A:$HOME"')
+    elseif v:sub(1, 2) == '~/' then
+      table.insert(words, '"A:$HOME"' .. sh_quote(v:sub(2)))
+    elseif v:sub(1, 1) == '/' then
+      table.insert(words, sh_quote('A:' .. v))
+    else
+      table.insert(words, sh_quote('R:' .. v))
+    end
+  end
+  return words
+end
 
 -- kind ('f' or 'd') and absolute path on the pane's host of the first of
 -- `texts` that exists there, or nil and a message
@@ -507,10 +565,12 @@ local function resolve_remote(ssh, texts, rcwd)
   end
   local words = {}
   for _, text in ipairs(texts) do
-    for _, v in ipairs(path_variants(text)) do table.insert(words, remote_word(v, rcwd)) end
+    for _, w in ipairs(resolve_words(text)) do table.insert(words, w) end
   end
+  local script = 'RCWD=' .. sh_quote(rcwd or '') .. '\nset -- ' .. table.concat(words, ' ')
+    .. '\n' .. REMOTE_RESOLVE
   local cmd = ssh_batch_cmd(ssh)
-  table.insert(cmd, 'sh -c ' .. sh_quote(string.format(REMOTE_RESOLVE, table.concat(words, ' '))))
+  table.insert(cmd, 'sh -c ' .. sh_quote(script))
   local ok, out = wezterm.run_child_process(cmd)
   local kind, path
   if ok then kind, path = out:match '^([fd]) (/[^\n]*)' end
@@ -1016,7 +1076,7 @@ end
 -- One whitespace-free token from a remote file (first 4 KiB), or nil
 local function read_remote_token(ssh, path)
   local cmd = ssh_batch_cmd(ssh)
-  table.insert(cmd, 'head -c 4096 -- ' .. remote_word(path, nil))
+  table.insert(cmd, 'head -c 4096 -- ' .. remote_word(path))
   local ok, out = wezterm.run_child_process(cmd)
   return ok and out:match '^%s*(%S+)%s*$' or nil
 end
