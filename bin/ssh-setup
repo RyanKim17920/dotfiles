@@ -30,7 +30,7 @@
 # ~/.local/state/ssh-setup/hosts (what --all re-syncs).
 set -euo pipefail
 
-FORMAT=2   # bump when the remote layout or bashrc block changes
+FORMAT=3   # bump when the remote layout or bashrc block changes
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ssh-setup"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # --all: ride the live ControlMaster only. If the master is gone, the direct
@@ -252,7 +252,7 @@ printf '%s\n' "$STATUSLINE_JSON" >"$STAGE/.local/share/ssh-setup/statusline.json
 # (read, not $(cat <<EOF): bash 3.2 misparses case patterns in $( ) heredocs)
 IFS= read -r -d '' BASHRC_BODY <<'EOF' || true
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
-export EDITOR=micro
+[ -x "$HOME/.local/bin/micro" ] && export EDITOR=micro VISUAL=micro
 y() {
 	local tmp cwd
 	tmp="$(mktemp -t yazi-cwd.XXXXXX)"
