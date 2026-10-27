@@ -19,8 +19,24 @@ run = 'piper -- "$HOME/.local/bin/glow-cached" "$w" "$1"'
 mime = "image/{png,jpeg,gif,webp,bmp,x-ms-bmp}"
 run  = "upscale"
 
-# Enter on Markdown: micro + live glow preview split (WezTerm), see ~/.local/bin/mdedit
+# Text files: micro, never yazi's built-in ${EDITOR:-vi}. Fallback is $EDITOR
+# (unless vi/vim) then nano. A WezTerm peek of path:line:col sets YAZI_PEEK_LINE.
 [opener]
+edit = [
+	{ run = '''
+		ed=$(command -v micro)
+		if [ -z "$ed" ]; then
+			case "${EDITOR##*/}" in ""|vi|vim|nvim|view) ;; *) ed=$(command -v "$EDITOR") ;; esac
+		fi
+		[ -n "$ed" ] || ed=$(command -v nano)
+		set -- %s
+		case "$ed" in
+			*/micro) [ -n "$YAZI_PEEK_LINE" ] && [ "$1" = "$YAZI_PEEK" ] && set -- "+$YAZI_PEEK_LINE" "$@" ;;
+		esac
+		exec "$ed" "$@"
+	''', desc = "micro", block = true, for = "unix" },
+]
+# Enter on Markdown: micro + live glow preview split (WezTerm), see ~/.local/bin/mdedit
 mdedit = [
 	{ run = '"$HOME/.local/bin/mdedit" %s', desc = "micro + live preview", block = true, for = "unix" },
 ]
