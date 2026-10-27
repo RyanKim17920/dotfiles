@@ -126,6 +126,15 @@ local YAZI = '/opt/homebrew/bin/yazi'
 local YAZI_PATH = '/opt/homebrew/bin:' .. wezterm.home_dir .. '/.local/bin:'
   .. (os.getenv 'PATH' or '/usr/bin:/bin:/usr/sbin:/sbin')
 
+-- A Dock-launched GUI has no EDITOR, and Yazi's built-in text opener runs
+-- ${EDITOR:-vi}: give every pane (and each peek) micro instead of vim
+local EDITOR_ENV = { EDITOR = 'micro', VISUAL = 'micro' }
+local function with_editor(env)
+  for k, v in pairs(EDITOR_ENV) do env[k] = v end
+  return env
+end
+config.set_environment_variables = with_editor {}
+
 -- Directory of a pane: Url object on 20240203+, string on older builds,
 -- falling back to the foreground process's cwd.
 local function pane_cwd(pane)
@@ -509,10 +518,20 @@ config.status_update_interval = 200
 -- (the default list, minus tmux: closing it kills the sessions inside)
 config.skip_close_confirmation_for_processes_named = { 'bash', 'sh', 'zsh', 'fish', 'nu' }
 
-local function open_peek(window, pane, path)
+-- "29:15", "29" or nil: the :line[:col] (or :first-last) a clicked path
+-- carried, unless `path` really ends with it (a file named a:5)
+local function click_line(text, path)
+  local spec = text:match ':(%d+:%d+)$' or text:match ':(%d+)[:-]%d+$' or text:match ':(%d+)$'
+  if spec and path:sub(-#spec - 1) ~= ':' .. spec then return spec end
+end
+
+local function open_peek(window, pane, path, line)
   local dir = is_dir(path)
-  local env = { PATH = YAZI_PATH }
-  if not dir then env.YAZI_PEEK = path end
+  local env = with_editor { PATH = YAZI_PATH }
+  if not dir then
+    env.YAZI_PEEK = path
+    env.YAZI_PEEK_LINE = line
+  end
   replace_peek(window, pane, {
     cwd = dir and path or (path:match '^(.+)/' or '/'),
     args = { YAZI, path },
@@ -710,10 +729,12 @@ local function wrapped_candidates(pane, text)
   return {}, false
 end
 
-local function open_remote_peek(window, pane, ssh, kind, path)
-  -- $HOME/.local/bin first: ssh-setup's yazi and its previewers, else any yazi
-  local script = 'export PATH="$HOME/.local/bin:$PATH"; '
+local function open_remote_peek(window, pane, ssh, kind, path, line)
+  -- $HOME/.local/bin first: ssh-setup's yazi and its previewers, else any yazi.
+  -- This sh is non-interactive (no ~/.bashrc), so set the editor here too
+  local script = 'export PATH="$HOME/.local/bin:$PATH" EDITOR=micro VISUAL=micro; '
     .. (kind == 'f' and ('export YAZI_PEEK=' .. sh_quote(path) .. '; ') or '')
+    .. (kind == 'f' and line and ('export YAZI_PEEK_LINE=' .. sh_quote(line) .. '; ') or '')
     .. 'exec yazi ' .. sh_quote(path)
   local args = { SSH_PANE, '-t' }
   for k = 2, #ssh do table.insert(args, ssh[k]) end
@@ -1431,7 +1452,7 @@ wezterm.on('open-uri', function(window, pane, uri)
     elseif kind == 'f' and look then
       quicklook_remote(window, ssh, path)
     else
-      open_remote_peek(window, pane, ssh, kind, path)
+      open_remote_peek(window, pane, ssh, kind, path, click_line(text, path))
     end
     return false
   end
@@ -1466,7 +1487,7 @@ wezterm.on('open-uri', function(window, pane, uri)
   elseif look and not is_dir(path) then
     quicklook_local(window, path)
   else
-    open_peek(window, pane, path)
+    open_peek(window, pane, path, click_line(text, path))
   end
   return false
 end)
