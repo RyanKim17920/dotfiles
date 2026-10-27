@@ -28,8 +28,8 @@ local C = {
 
 -- Nerd Font glyphs; WezTerm bundles Symbols Nerd Font Mono as a fallback
 local ICON = {
-  rename = utf8.char(0xF03EB), window = utf8.char(0xF0614), close = utf8.char(0xF0156),
-  cancel = utf8.char(0xF073A), server = utf8.char(0xF048B), folder = utf8.char(0xF024B),
+  rename = utf8.char(0xF03EB), window = utf8.char(0xF0614),
+  server = utf8.char(0xF048B), folder = utf8.char(0xF024B),
   forward = utf8.char(0xF0318), zoom = utf8.char(0xF0293), console = utf8.char(0xF018D),
 }
 
@@ -504,6 +504,10 @@ end
 
 wezterm.on('update-status', function(window) restore_peeks(window:mux_window()) end)
 config.status_update_interval = 200
+
+-- Closing a pane that only runs an idle shell needs no confirmation
+-- (the default list, minus tmux: closing it kills the sessions inside)
+config.skip_close_confirmation_for_processes_named = { 'bash', 'sh', 'zsh', 'fish', 'nu' }
 
 local function open_peek(window, pane, path)
   local dir = is_dir(path)
@@ -2055,27 +2059,11 @@ config.keys = {
   { key = 'd', mods = 'CMD', action = smart_split 'Right' },
   { key = 'd', mods = 'CMD|SHIFT', action = smart_split 'Bottom' },
 
-  -- Close the focused pane instead of the whole tab (Ghostty: cmd+w)
-  -- Confirm with a picker so Enter (or y) closes and n/Esc cancels
-  { key = 'w', mods = 'CMD', action = act.InputSelector {
-    title = 'Close pane',
-    description = 'Close this pane?   Enter / y = close    n / Esc = cancel',
-    choices = {
-      { id = 'yes', label = wezterm.format {
-        { Foreground = { Color = C.red } }, { Attribute = { Intensity = 'Bold' } },
-        { Text = ICON.close .. '  Close pane' },
-      } },
-      { id = 'no', label = wezterm.format {
-        { Foreground = { Color = C.overlay0 } }, { Text = ICON.cancel .. '  Cancel' },
-      } },
-    },
-    alphabet = 'yn',
-    action = wezterm.action_callback(function(window, pane, id)
-      if id == 'yes' then
-        window:perform_action(act.CloseCurrentPane { confirm = false }, pane)
-      end
-    end),
-  } },
+  -- Close the focused pane instead of the whole tab (Ghostty: cmd+w). The
+  -- built-in confirm is a pane-scoped overlay (y = close, n / Esc = cancel)
+  -- and is skipped for an idle shell (skip_close_confirmation_for_processes_named)
+  { key = 'w', mods = 'CMD', action = act.CloseCurrentPane { confirm = true } },
+  { key = 'w', mods = 'CTRL|SHIFT', action = act.CloseCurrentPane { confirm = true } },
 
   -- Cycle panes (Ghostty: cmd+[ / cmd+])
   { key = '[', mods = 'CMD', action = act.ActivatePaneDirection 'Prev' },
