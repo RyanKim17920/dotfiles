@@ -60,6 +60,29 @@ local function mux_pane(id)
   return ok and pane or nil
 end
 
+-- Peek state per tab (see replace_peek): 'origin|peek|zoomed' = the pane
+-- that was clicked, the Yazi pane covering the tab, and whether the tab was
+-- zoomed on the origin before. wezterm.GLOBAL survives config reloads.
+local PEEK_KEY = 'peek_for_tab_' -- .. tab id
+
+local function peek_record(tab)
+  local origin, peek, zoomed = (wezterm.GLOBAL[PEEK_KEY .. tab:tab_id()] or ''):match '^(%d+)|(%d+)|([01])$'
+  if not peek then return nil end
+  return { origin = tonumber(origin), peek = tonumber(peek), zoomed = zoomed == '1' }
+end
+
+local function set_peek_record(tab, rec) -- nil forgets the peek
+  wezterm.GLOBAL[PEEK_KEY .. tab:tab_id()] = rec
+    and string.format('%d|%d|%d', rec.origin, rec.peek, rec.zoomed and 1 or 0) or nil
+end
+
+-- True while a live peek pane covers `tab`: layout surgery (unzoom, rebuild,
+-- pane moves) would uncover or destroy it
+local function peek_open(tab)
+  local rec = peek_record(tab)
+  return rec ~= nil and mux_pane(rec.peek) ~= nil
+end
+
 -- Heading for PromptInputLine: accent icon, bold title, dim hint below
 local function prompt_text(icon, title, hint)
   return wezterm.format {
@@ -156,6 +179,10 @@ end
 
 local function toggle_sidebar(window, pane)
   local tab = pane:tab()
+  if peek_open(tab) then
+    toast(window, 'Sidebar: close the peek (q) first', 2000)
+    return
+  end
   local key = SIDEBAR_KEY .. tab:tab_id()
   local sidebar_id = wezterm.GLOBAL[key]
 
@@ -331,16 +358,15 @@ end
 
 -- Clickable file paths: CMD+click on a path such as ~/.ssh/config,
 -- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
--- temporary Yazi "peek" tab right after the current one, with the file
--- hovered and the preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua),
--- or the directory opened. q quits Yazi, closes the tab and returns to the
--- tab the click came from. A tab rather than a split, so a TUI like Claude
--- Code is never resized under it. Images and PDFs open in Quick Look
--- instead (see is_quicklook). OSC 8 file:// links (ls --hyperlink) are
--- handled the same way; web URLs are untouched.
+-- Yazi "peek" inside the current tab, covering it, with the file hovered and
+-- the preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua), or the
+-- directory opened. Images and PDFs too (Yazi previews them). q quits Yazi
+-- and you are back in the pane you clicked, layout untouched (see
+-- replace_peek). CMD+OPT+SHIFT+click Quick Looks a file instead. OSC 8
+-- file:// links (ls --hyperlink) are handled the same way; web URLs are
+-- untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
 local SSH_FORWARD_SCHEME = 'ssh-forward:' -- see forward_command
-local PEEK_KEY = 'peek_pane' -- pane id of the open peek tab
 
 local function is_dir(path)
   local ok = pcall(wezterm.read_dir, path)
@@ -417,37 +443,67 @@ local function resolve_path(text, cwd)
   return nil
 end
 
--- Runs a peek command, then (unless the tab was closed some other way)
--- switches back to the tab it was opened from: argv cli tab_id cmd...
-local PEEK_WRAPPER = [[
-cli=$1 tab=$2; shift 2
-trap 'exit 129' HUP
-"$@"; s=$?
-"$cli" cli activate-tab --tab-id "$tab" >/dev/null 2>&1
-exit $s]]
+-- Cells the peek pane takes from the clicked pane before it is zoomed
+local PEEK_CELLS = 2
 
--- Open the peek tab for `path` from `spec` (cwd, args, env), right after the
--- tab of `pane`. One peek tab at a time: the previous one is closed first.
-local function replace_peek(window, pane, spec, path)
-  local old = wezterm.GLOBAL[PEEK_KEY]
-  if old and old ~= pane:pane_id() and mux_pane(old) then
-    cli('kill-pane', '--pane-id', tostring(old))
-  end
-  local origin = pane:tab():tab_id()
-  local mux_window = window:mux_window()
-  local index = 0
-  for _, info in ipairs(mux_window:tabs_with_info()) do
-    if info.tab:tab_id() == origin then index = info.index end
-  end
-  local args = { '/bin/sh', '-c', PEEK_WRAPPER, 'sh', WEZTERM_CLI, tostring(origin) }
-  for _, a in ipairs(spec.args) do table.insert(args, a) end
-  spec.args = args
-  local tab, peek = mux_window:spawn_tab(spec)
-  tab:set_title('Peek: ' .. (path:match '([^/]+)/?$' or path))
-  tab:activate()
-  window:perform_action(act.MoveTab(index + 1), peek)
-  wezterm.GLOBAL[PEEK_KEY] = peek:pane_id()
+-- Back to the pane the peek was opened from, tab zoomed as it was
+local function show_origin(tab, origin, zoomed)
+  origin:activate()
+  tab:set_zoomed(zoomed)
 end
+
+-- Open a peek (`spec`: cwd, args, env) for the clicked `pane`: a tiny split
+-- of that pane (never top_level, see repair_layout), zoomed over the whole
+-- tab. When Yazi quits the pane closes, WezTerm unzooms and gives the cells
+-- back, and restore_peeks re-activates `pane`. One peek per tab: a click
+-- while one is open replaces it.
+local function replace_peek(window, pane, spec)
+  local tab = pane:tab()
+  local origin, zoomed = pane, select(4, tab_geometry(tab))
+  local rec = peek_record(tab)
+  if rec then
+    zoomed = rec.zoomed
+    local old = mux_pane(rec.peek)
+    if old and old:pane_id() == pane:pane_id() then origin = mux_pane(rec.origin) end
+    if old then cli('kill-pane', '--pane-id', tostring(rec.peek)) end
+    set_peek_record(tab, nil)
+    origin = origin or tab:active_pane()
+  end
+  tab:set_zoomed(false) -- a zoomed tab refuses splits
+  spec.domain = 'DefaultDomain' -- local Yazi, even when the clicked pane is in a mux domain
+  spec.size = PEEK_CELLS
+  local ok, peek
+  for _, direction in ipairs { 'Bottom', 'Right' } do
+    spec.direction = direction
+    ok, peek = pcall(origin.split, origin, spec)
+    if ok then break end
+  end
+  if not ok then
+    show_origin(tab, origin, zoomed)
+    toast(window, 'Peek: no room to split this pane')
+    return
+  end
+  peek:activate()
+  tab:set_zoomed(true)
+  set_peek_record(tab, { origin = origin:pane_id(), peek = peek:pane_id(), zoomed = zoomed })
+end
+
+-- A peek pane has closed (Yazi quit): activate the pane it came from again
+-- and re-zoom it if the tab was zoomed there. WezTerm has no pane-exit
+-- event, so update-status (every status_update_interval) notices.
+local function restore_peeks(mux_window)
+  for _, tab in ipairs(mux_window:tabs()) do
+    local rec = peek_record(tab)
+    if rec and not mux_pane(rec.peek) then
+      set_peek_record(tab, nil)
+      local origin = mux_pane(rec.origin)
+      if origin then show_origin(tab, origin, rec.zoomed) end
+    end
+  end
+end
+
+wezterm.on('update-status', function(window) restore_peeks(window:mux_window()) end)
+config.status_update_interval = 200
 
 local function open_peek(window, pane, path)
   local dir = is_dir(path)
@@ -457,7 +513,7 @@ local function open_peek(window, pane, path)
     cwd = dir and path or (path:match '^(.+)/' or '/'),
     args = { YAZI, path },
     set_environment_variables = env,
-  }, path)
+  })
 end
 
 -- Paths clicked in a local pane running ssh live on the remote host. They
@@ -662,37 +718,27 @@ local function open_remote_peek(window, pane, ssh, kind, path)
     cwd = wezterm.home_dir,
     args = args,
     set_environment_variables = { PATH = SPAWN_PATH },
-  }, path)
+  })
 end
 
 -- CMD+OPT+click reveals the path in Finder instead (drag it from there into
 -- a browser upload, Slack, ...): `open -R` for files, `open` for directories.
 -- A remote file is first copied to ~/Downloads/<host>/ over the existing
--- ControlMaster. The mouse binding sets this flag right before opening the
--- link; it is consumed by the next open-uri and ignored once stale.
-local REVEAL_KEY = 'reveal_next_link'
+-- ControlMaster. CMD+OPT+SHIFT+click opens a file in macOS Quick Look
+-- instead (a remote one is copied to ~/Library/Caches/wezterm/peek/<host>/
+-- first). The mouse binding sets 'reveal <time>' or 'look <time>' right
+-- before opening the link; it is consumed by the next open-uri and ignored
+-- once stale.
+local LINK_MODE_KEY = 'link_mode_next_link'
 
 local function reveal_local(path)
   wezterm.background_child_process(is_dir(path) and { '/usr/bin/open', path }
     or { '/usr/bin/open', '-R', path })
 end
 
--- Images (and PDFs, which Yazi previews as an image too) open in macOS Quick
--- Look instead of the peek tab: Yazi draws them through a terminal image
--- protocol sized from the pane's reported pixel size, the fragile part of a
--- TUI preview; Quick Look is a real viewer. Remote ones are copied to
--- ~/Library/Caches/wezterm/peek/<host>/ first over the existing ControlMaster.
-local QUICKLOOK_EXTS = {}
-for e in ('png jpg jpeg gif webp bmp tif tiff heic heif svg pdf'):gmatch '%S+' do
-  QUICKLOOK_EXTS[e] = true
-end
+-- Quick Look (CMD+OPT+SHIFT+click), see LINK_MODE_KEY
 local QUICKLOOK_PID = wezterm.home_dir .. '/.local/state/wezterm/quicklook.pid'
 local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
-
-local function is_quicklook(path)
-  local ext = path:match '%.(%w+)$'
-  return ext ~= nil and QUICKLOOK_EXTS[ext:lower()] == true
-end
 
 -- sh -c script: pidfile mode args...
 --   look <file>        Quick Look it; one panel at a time (the qlmanage
@@ -1342,9 +1388,10 @@ wezterm.on('open-uri', function(window, pane, uri)
   -- One GUI log line per click (~/.local/share/wezterm/wezterm-gui-log-*.txt);
   -- web URLs only up to host:port so tokens stay out of the log
   wezterm.log_info('open-uri: ' .. (uri:match '^%a[%w+.-]*://[^/?#]*' or uri))
-  local clicked = wezterm.GLOBAL[REVEAL_KEY]
-  wezterm.GLOBAL[REVEAL_KEY] = nil
-  local reveal = clicked ~= nil and os.time() - clicked <= 2
+  local mode, clicked = (wezterm.GLOBAL[LINK_MODE_KEY] or ''):match '^(%a+) (%d+)$'
+  wezterm.GLOBAL[LINK_MODE_KEY] = nil
+  if not clicked or os.time() - tonumber(clicked) > 2 then mode = nil end
+  local reveal, look = mode == 'reveal', mode == 'look'
   if uri:sub(1, #SSH_FORWARD_SCHEME) == SSH_FORWARD_SCHEME then
     forward_command(window, pane, uri:sub(#SSH_FORWARD_SCHEME + 1))
     return false
@@ -1377,7 +1424,7 @@ wezterm.on('open-uri', function(window, pane, uri)
     end
     if reveal then
       reveal_remote(window, ssh, kind, path)
-    elseif kind == 'f' and is_quicklook(path) then
+    elseif kind == 'f' and look then
       quicklook_remote(window, ssh, path)
     else
       open_remote_peek(window, pane, ssh, kind, path)
@@ -1412,7 +1459,7 @@ wezterm.on('open-uri', function(window, pane, uri)
   end
   if reveal then
     reveal_local(path)
-  elseif not is_dir(path) and is_quicklook(path) then
+  elseif look and not is_dir(path) then
     quicklook_local(window, path)
   else
     open_peek(window, pane, path)
@@ -1764,6 +1811,10 @@ end
 -- notice. Returns the tab now holding those panes.
 local function repair_layout(window, tab, quiet)
   if not tab or wezterm.GLOBAL.layout_repairing then return tab end
+  if peek_open(tab) then
+    if not quiet then toast(window, 'Layout: close the peek (q) first', 2000) end
+    return tab
+  end
   if not layout_overflows(tab) then
     if not quiet then toast(window, 'Layout: panes already fit the window', 2000) end
     return tab
@@ -1834,6 +1885,10 @@ local function move_to_tab(n, flag)
     end
     if target:tab_id() == pane:tab():tab_id() then
       toast(window, 'Move: already in tab ' .. n, 2000)
+      return
+    end
+    if peek_open(target) then
+      toast(window, 'Move: close the peek in tab ' .. n .. ' first', 2000)
       return
     end
     -- An overflowing or zoomed target refuses the split, and a refused
@@ -2088,20 +2143,20 @@ for n = 1, 9 do
 end
 
 -- CMD+click opens links/paths even inside apps that capture the mouse
--- (Claude Code, less, micro); CMD+OPT+click reveals a path in Finder (see
--- REVEAL_KEY). mouse_reporting=true covers those apps; the plain entries
--- cover normal shells. The Down events are swallowed so the click isn't also
--- sent to the app or start a selection.
-local function open_link(reveal)
+-- (Claude Code, less, micro); CMD+OPT+click reveals a path in Finder and
+-- CMD+OPT+SHIFT+click Quick Looks it (see LINK_MODE_KEY). mouse_reporting=true
+-- covers those apps; the plain entries cover normal shells. The Down events
+-- are swallowed so the click isn't also sent to the app or start a selection.
+local function open_link(mode)
   return wezterm.action_callback(function(window, pane)
-    wezterm.GLOBAL[REVEAL_KEY] = reveal and os.time() or nil
+    wezterm.GLOBAL[LINK_MODE_KEY] = mode and (mode .. ' ' .. os.time()) or nil
     window:perform_action(act.OpenLinkAtMouseCursor, pane)
   end)
 end
 
 config.mouse_bindings = {}
 for _, reporting in ipairs { false, true } do
-  for mods, reveal in pairs { CMD = false, ['CMD|OPT'] = true } do
+  for mods, mode in pairs { CMD = false, ['CMD|OPT'] = 'reveal', ['CMD|OPT|SHIFT'] = 'look' } do
     table.insert(config.mouse_bindings, {
       event = { Down = { streak = 1, button = 'Left' } },
       mods = mods,
@@ -2112,7 +2167,7 @@ for _, reporting in ipairs { false, true } do
       event = { Up = { streak = 1, button = 'Left' } },
       mods = mods,
       mouse_reporting = reporting,
-      action = open_link(reveal),
+      action = open_link(mode),
     })
   end
 end
