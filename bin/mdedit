@@ -42,9 +42,11 @@ preview() {
   # Render $file at width $1 into $doc. glow writes a side temp first; the
   # result is then copied over $doc IN PLACE (not mv): less keeps its fd open,
   # so `R` only sees new content if the same inode is rewritten.
+  style=${XDG_CONFIG_HOME:-$HOME/.config}/glow/catppuccin.json
+  [ -f "$style" ] || style=dark
   render() {
     if [ -e "$file" ]; then
-      CLICOLOR_FORCE=1 glow -s dark -w "$(($1 - 2))" -- "$file" >"$dir/new" 2>&1
+      CLICOLOR_FORCE=1 glow -s "$style" -w "$(($1 - 2))" -- "$file" >"$dir/new" 2>&1
     else
       printf '\n  (%s does not exist yet; save to preview)\n' "${file##*/}" >"$dir/new"
     fi
