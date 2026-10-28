@@ -15,7 +15,8 @@
 #   ~/.local/bin/resvg         (yazi's SVG previewer; x86_64 only, as upstream
 #                              publishes no Linux aarch64 binary)
 #   ~/.config/yazi/            (local config, as is)
-#   ~/.config/micro/settings.json
+#   ~/.config/glow/catppuccin.json (glamour style for the Markdown renderers)
+#   ~/.config/micro/settings.json ~/.config/glow/catppuccin.json
 #   ~/.claude/statusline.sh    (only this from ~/.claude; nothing else is copied)
 #   ~/.claude/settings.json    (only the "statusLine" key is set; others untouched)
 #   ~/.local/bin/jq            (only if the remote has no usable system jq)
@@ -226,6 +227,12 @@ stage_configs() {
 	[ -f "$HOME/.local/bin/glow-cached" ] || die "no local ~/.local/bin/glow-cached"
 	cp "$HOME/.local/bin/glow-cached" "$STAGE/.local/bin/glow-cached"
 	chmod 755 "$STAGE/.local/bin/glow-cached"
+	# glamour style the Markdown renderers pass to glow (scripts fall back to
+	# glow's dark style when it is absent)
+	if [ -f "$HOME/.config/glow/catppuccin.json" ]; then
+		mkdir -p "$STAGE/.config/glow"
+		cp "$HOME/.config/glow/catppuccin.json" "$STAGE/.config/glow/catppuccin.json"
+	fi
 	# mdview: full-screen Markdown reader that keymap.toml's R binding runs;
 	# mdedit: yazi.toml's Enter-on-.md opener; mdpreview: its preview pane
 	for f in mdview mdedit mdpreview; do
@@ -312,7 +319,7 @@ summary_tail() {
 	[ "$SHIP_RESVG" = yes ] || echo "  resvg: not shipped (no Linux $ARCH release upstream; SVG previews unavailable)"
 	cat <<EOF
   undo on $HOST:
-    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview,resvg} ~/.config/micro/settings.json
+    rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview,resvg} ~/.config/micro/settings.json ~/.config/glow/catppuccin.json
     rm -rf ~/.config/yazi ~/.local/share/ssh-setup
     sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc; rm -f ~/.bashrc.bak-ssh-setup-prev
     rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
