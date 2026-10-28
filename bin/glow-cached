@@ -6,7 +6,8 @@
 # Meant for previewers that re-run their command on every scroll step
 # (e.g. Yazi's piper plugin).
 #
-# Cache key: absolute path + mtime + size + width + style + glow binary stamp.
+# Cache key: absolute path + mtime + size + width + style (name, and the style
+# file's contents hash) + glow binary stamp.
 # Cache dir: ${XDG_CACHE_HOME:-$HOME/.cache}/glow-cached
 # Entries older than 7 days are pruned on roughly 1 in 50 runs.
 # Exits non-zero (with glow's error on stderr) if rendering fails.
@@ -16,7 +17,10 @@ set -u
 # Non-interactive shells (ssh, Yazi) may lack ~/.local/bin, where glow often lives.
 PATH="$HOME/.local/bin:$PATH"
 
-STYLE=dark
+# Catppuccin style shipped with the dotfiles; falls back to glow's built-in
+# dark style if the file is missing.
+STYLE=${XDG_CONFIG_HOME:-$HOME/.config}/glow/catppuccin.json
+[ -f "$STYLE" ] || STYLE=dark
 
 usage() {
 	echo "usage: glow-cached <width> <file>" >&2
@@ -93,7 +97,14 @@ meta=$(file_stat "$abs" "$glow_bin") || {
 	exit 1
 }
 
-key=$(printf '%s\n' "$abs" "$meta" "$width" "$STYLE" "$glow_bin" | hash)
+# Editing the style file must invalidate old renders.
+if [ -f "$STYLE" ]; then
+	style_id=$(hash <"$STYLE")
+else
+	style_id=$STYLE
+fi
+
+key=$(printf '%s\n' "$abs" "$meta" "$width" "$STYLE" "$style_id" "$glow_bin" | hash)
 key=${key%% *}
 
 dir=${XDG_CACHE_HOME:-$HOME/.cache}/glow-cached
