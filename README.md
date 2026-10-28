@@ -91,7 +91,7 @@ Side-by-side Markdown also works over SSH in WezTerm: on the remote host,
 exits. Inside tmux this needs `set -g allow-passthrough on`; in other
 terminals it is plain micro.
 
-Markdown previews in Yazi are rendered with glow (piper plugin).
+Markdown previews in Yazi are rendered with glow (piper plugin) using the Catppuccin style in `glow/catppuccin.json` (headings differ by colour and bar, no `#` prefixes).
 
 Small raster images (icons, small screenshots) are enlarged to about 80% of the
 preview pane (at most 8x) by the `upscale` previewer instead of being drawn at

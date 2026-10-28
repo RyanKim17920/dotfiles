@@ -38,6 +38,7 @@ for f in keymap.toml theme.toml package.toml plugins flavors; do
 done
 
 link "$REPO/micro/settings.json" "$HOME/.config/micro/settings.json"
+link "$REPO/glow/catppuccin.json" "$HOME/.config/glow/catppuccin.json"
 
 for f in mdedit yazi-open clipimg-push ssh-setup glow-cached mdview mdpreview ssh-pane; do
 	link "$REPO/bin/$f" "$HOME/.local/bin/$f"
