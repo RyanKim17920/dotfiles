@@ -756,6 +756,17 @@ end
 -- once stale.
 local LINK_MODE_KEY = 'link_mode_next_link'
 
+-- Video and audio can't play in a terminal: a plain click reveals them too
+local MEDIA_EXT = {}
+for e in ([[mp4 mov m4v mkv webm avi wmv flv mpg mpeg 3gp mp3 wav m4a flac aac ogg opus aiff]]):gmatch '%S+' do
+  MEDIA_EXT[e] = true
+end
+
+local function is_media(path)
+  local ext = path:match '%.([^./]+)$'
+  return ext ~= nil and MEDIA_EXT[ext:lower()] == true
+end
+
 local function reveal_local(path)
   wezterm.background_child_process(is_dir(path) and { '/usr/bin/open', path }
     or { '/usr/bin/open', '-R', path })
@@ -1447,7 +1458,7 @@ wezterm.on('open-uri', function(window, pane, uri)
       toast(window, path)
       return false
     end
-    if reveal then
+    if reveal or (kind == 'f' and is_media(path)) then
       reveal_remote(window, ssh, kind, path)
     elseif kind == 'f' and look then
       quicklook_remote(window, ssh, path)
@@ -1482,8 +1493,9 @@ wezterm.on('open-uri', function(window, pane, uri)
     end
     return -- file:// we can't resolve: let the default opener try
   end
-  if reveal then
+  if reveal or (not look and not is_dir(path) and is_media(path)) then
     reveal_local(path)
+    if not reveal then toast(window, 'Finder: ' .. (path:match '[^/]+$' or path), 2000) end
   elseif look and not is_dir(path) then
     quicklook_local(window, path)
   else
