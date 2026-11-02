@@ -1,0 +1,58 @@
+#!/bin/sh
+# wez-claude-session: Claude Code SessionStart hook. Records the session id
+# for the WezTerm pane it runs in, so a restored WezTerm session can resume the
+# exact conversation (`claude --resume <id>`, see wezterm.lua).
+#
+#   ~/.claude/settings.json: hooks.SessionStart -> this script (no matcher:
+#   startup, resume, clear, compact and fork all write the current id)
+#
+# Reads the hook JSON on stdin; writes <state>/claude/$WEZTERM_PANE with the
+# id on line 1 and the cwd on line 2. Silent and always exits 0, so it can
+# never disturb a session. Non-interactive runs (claude -p) are skipped: they
+# inherit the pane's environment but are not the conversation in that pane.
+
+state=${WEZTERM_STATE_DIR:-$HOME/.local/state/wezterm}
+input=$(cat 2>/dev/null)
+
+case $WEZTERM_PANE in '' | *[!0-9]*) exit 0 ;; esac
+
+# Is the nearest claude ancestor running with -p / --print?
+set -f
+pid=$PPID
+n=0
+while [ "$n" -lt 4 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+	line=$(ps -o ppid=,args= -p "$pid" 2>/dev/null) || break
+	set -- $line
+	next=$1
+	shift
+	prog=${1##*/}
+	[ "$prog" = node ] && prog=${2##*/}
+	case $prog in
+	claude*)
+		for a in "$@"; do
+			case $a in -p | --print | --print=*) exit 0 ;; esac
+		done
+		break
+		;;
+	esac
+	pid=$next
+	n=$((n + 1))
+done
+set +f
+
+# Pull a top-level string field out of the one-line JSON
+field() {
+	printf '%s' "$input" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+id=$(field session_id)
+case $id in '' | *[!A-Za-z0-9_-]*) exit 0 ;; esac
+cwd=$(field cwd)
+[ -n "$cwd" ] || cwd=$PWD
+
+dir=$state/claude
+mkdir -p "$dir" 2>/dev/null || exit 0
+tmp=$dir/.$WEZTERM_PANE.$$
+printf '%s\n%s\n' "$id" "$cwd" >"$tmp" 2>/dev/null && mv -f "$tmp" "$dir/$WEZTERM_PANE" 2>/dev/null
+rm -f "$tmp" 2>/dev/null
+exit 0

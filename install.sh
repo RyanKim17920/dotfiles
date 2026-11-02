@@ -45,6 +45,7 @@ for f in mdedit yazi-open clipimg-push ssh-setup glow-cached mdview mdpreview ss
 done
 
 link "$REPO/claude/statusline.sh" "$HOME/.claude/statusline.sh"
+link "$REPO/bin/wez-claude-session" "$HOME/.local/bin/wez-claude-session"
 
 # Yazi plugins and flavor listed in package.toml
 if command -v ya >/dev/null 2>&1; then
