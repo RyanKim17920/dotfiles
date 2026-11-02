@@ -15,7 +15,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 | `yazi/` | `~/.config/yazi/` |
 | `yazi-sidebar/yazi.toml` | `~/.config/yazi-sidebar/yazi.toml` |
 | `micro/settings.json` | `~/.config/micro/settings.json` |
-| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`, `ssh-pane`) |
+| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`, `ssh-pane`, `wez-claude-session`) |
 | `claude/statusline.sh` | `~/.claude/statusline.sh` (Claude Code status line) |
 | `zsh/snippets.zsh` | source it from `~/.zshrc` |
 
@@ -61,6 +61,8 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+OPT+R / CMD+OPT+SHIFT+R | Rotate panes clockwise / counter-clockwise |
 | CMD+SHIFT+R / CMD+CTRL+R | Rename the tab / window (empty input restores the automatic title) |
 | CMD+SHIFT+P | Jump to a pane by label |
+| CMD+SHIFT+O | Reopen the session from before this launch (`session.prev.json`) on demand |
+| CMD+OPT+SHIFT+O | Toggle restoring the last session at launch (`no-restore` flag file) |
 
 The tab bar, prompts and pickers use the Catppuccin Mocha palette (same as
 the Yazi flavor). Each tab shows its number, an icon and its title: the name
@@ -75,6 +77,47 @@ Host *
   ControlMaster auto
   ControlPath ~/.ssh/cm-%r@%h:%p
   ControlPersist 10m
+```
+
+## Session restore
+
+Like a browser, quitting WezTerm (or a reboot or crash) and reopening it brings
+back the windows (size, workspace), tabs in order with their custom titles,
+split layouts with proportions, the active tab and pane, zoom and the Yazi
+sidebar. No process is kept alive; panes are re-created and what ran in them
+is run again, through the login shell so the pane stays a shell afterwards:
+
+* **Claude Code** panes: `claude --resume <session id>`, the exact
+  conversation. The id comes from a `SessionStart` hook (below). Without a
+  recorded id the original command is only typed at the prompt.
+* **ssh / ssh-pane** panes: reconnect through `ssh-pane`. Hosts are staggered,
+  and further panes to a host wait for its ControlMaster, so you log in once.
+  Hosts listed in `~/.local/state/wezterm/restore-skip-hosts` (one per line,
+  `#` comments; or `WEZTERM_RESTORE_SKIP_HOSTS=a,b`) are never reconnected.
+* **Any other command**: re-run with its exact arguments in its cwd. Commands
+  that could do damage or duplicate work are only typed at the prompt, not run
+  (`rm mv cp dd sudo kill shutdown ssh-setup scp rsync tee ...`, `git push
+  commit reset rebase merge ...`, package-manager install/remove/update, docker
+  `rm/prune/stop`, `kubectl delete/apply`, `terraform apply/destroy`, and `sh
+  -c` strings with those words or a `>` redirect). See `DENY_*` in
+  `wezterm.lua`.
+* An idle shell comes back as a shell in its cwd.
+
+State is saved to `~/.local/state/wezterm/session.json` (atomic write, only
+when it changed and has settled for a poll; WezTerm 20240203 has no quit
+event, so the last settled state is restored). At launch the previous file is
+kept as `session.prev.json`. Window positions cannot be read by this WezTerm
+version, so only sizes are restored. Disable with `WEZTERM_NO_RESTORE=1` or
+CMD+OPT+SHIFT+O (creates/removes `~/.local/state/wezterm/no-restore`).
+
+Add the hook to `~/.claude/settings.json` (it records the id per pane in
+`~/.local/state/wezterm/claude/<WEZTERM_PANE>`; silent, never fails, skips
+`claude -p` runs):
+
+```json
+"hooks": { "SessionStart": [ { "hooks": [
+  { "type": "command", "command": "\"$HOME/.local/bin/wez-claude-session\"", "timeout": 5 }
+] } ] }
 ```
 
 ## Yazi keys added
