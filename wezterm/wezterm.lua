@@ -186,6 +186,21 @@ local function with_sidebar(geometry, cols, rows, sidebar_id, width)
   return out
 end
 
+-- Spawn spec (cwd, args, env) of the sidebar's Yazi; toggle_sidebar and the
+-- session restore add direction and size
+local function sidebar_spec(cwd)
+  return {
+    cwd = cwd,
+    -- Pass the dir explicitly: yazi trusts an inherited $PWD over the real cwd
+    args = { YAZI, cwd },
+    set_environment_variables = {
+      YAZI_SIDEBAR = '1',
+      YAZI_CONFIG_HOME = wezterm.home_dir .. '/.config/yazi-sidebar',
+      PATH = YAZI_PATH,
+    },
+  }
+end
+
 local function toggle_sidebar(window, pane)
   local tab = pane:tab()
   if peek_open(tab) then
@@ -211,19 +226,9 @@ local function toggle_sidebar(window, pane)
     return
   end
 
-  local cwd = pane_cwd(pane)
-  local spec = {
-    direction = 'Left',
-    size = SIDEBAR_CELLS,
-    cwd = cwd,
-    -- Pass the dir explicitly: yazi trusts an inherited $PWD over the real cwd
-    args = { YAZI, cwd },
-    set_environment_variables = {
-      YAZI_SIDEBAR = '1',
-      YAZI_CONFIG_HOME = wezterm.home_dir .. '/.config/yazi-sidebar',
-      PATH = YAZI_PATH,
-    },
-  }
+  local spec = sidebar_spec(pane_cwd(pane))
+  spec.direction = 'Left'
+  spec.size = SIDEBAR_CELLS
   tab:set_zoomed(false) -- a zoomed tab refuses splits and hides geometry
   local geometry, cols, rows = tab_geometry(tab)
   if #geometry == 1 then
@@ -281,6 +286,9 @@ local SSH_OPTS_KEPT = { l = true, p = true, F = true, J = true, i = true }
 
 -- ssh wrapper that offers Enter-to-reconnect when the connection drops
 local SSH_PANE = wezterm.home_dir .. '/.local/bin/ssh-pane'
+-- $0 of the sh -c script that waits before running ssh-pane when a session
+-- is restored (see SSH_RESTORE_SCRIPT)
+local RESTORE_TAG = 'wez-restore'
 
 -- argv of an ssh process -> args for a fresh ssh-pane to the same destination
 -- (remote command dropped), or nil if no destination is found.
@@ -325,17 +333,22 @@ end
 -- image paste, clickable paths and port forwarding. ssh-pane is a #!/bin/sh
 -- script, so its argv is { '/bin/sh', '.../ssh-pane', <ssh args...> }: parse
 -- from the ssh-pane entry.
-local function pane_ssh_args(pane)
-  local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
-  if not info then return nil end
+local function info_ssh_args(info)
   local argv = info.argv or {}
   local function base(k) return (argv[k] or ''):match '[^/]*$' end
   if (info.executable or ''):match '[^/]*$' == 'ssh' or base(1) == 'ssh' or base(1) == 'ssh-pane' then
     return ssh_split_args(argv, 1)
   elseif base(2) == 'ssh-pane' then
     return ssh_split_args(argv, 2)
+  elseif base(1) == 'sh' and argv[4] == RESTORE_TAG then
+    return ssh_split_args(argv, 5)
   end
   return nil
+end
+
+local function pane_ssh_args(pane)
+  local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
+  return info and info_ssh_args(info) or nil
 end
 
 -- `ssh <opts...> <kept opts...> dest` for a pane_ssh_args result, run with
@@ -2071,6 +2084,556 @@ wezterm.on('format-window-title', function(tab, _, tabs)
   return zoomed .. index .. tab.active_pane.title
 end)
 
+-- Session restore, browser style: windows, tabs (order, titles), split
+-- layouts with proportions, zoom, the active tab/pane, the sidebar and what
+-- each pane was running come back after quitting WezTerm, a reboot or a
+-- crash. No process is kept alive: panes are re-created and their commands
+-- re-run (see restore_spec). The snapshot is saved to session.json by the
+-- poller below whenever it changed; WezTerm 20240203 has no quit event, so
+-- the last settled state before quitting is what comes back.
+-- (A do-block: the main chunk is at Lua's limit of 200 local variables.)
+local restore_previous, toggle_auto_restore
+do
+local STATE_DIR = wezterm.home_dir .. '/.local/state/wezterm'
+local SESSION_FILE = STATE_DIR .. '/session.json'
+local SESSION_PREV = STATE_DIR .. '/session.prev.json' -- the session before this launch
+local NO_RESTORE_FILE = STATE_DIR .. '/no-restore' -- exists = no auto-restore at launch
+local SKIP_HOSTS_FILE = STATE_DIR .. '/restore-skip-hosts' -- ssh hosts never reconnected
+-- Claude Code session id per pane, written by bin/wez-claude-session (a
+-- SessionStart hook) as <WEZTERM_PANE>: line 1 id, line 2 cwd
+local CLAUDE_DIR = STATE_DIR .. '/claude'
+local SNAPSHOT_VERSION = 1
+local SETTLE_MAX = 10 -- seconds a changing state may delay the save
+
+local function read_file(path)
+  local f = io.open(path, 'r')
+  if not f then return nil end
+  local text = f:read '*a'
+  f:close()
+  return text
+end
+
+-- tmp + rename, so a crash never leaves a half-written file
+local function write_atomic(path, text)
+  wezterm.run_child_process { '/bin/mkdir', '-p', STATE_DIR }
+  local tmp = path .. '.tmp'
+  local f, err = io.open(tmp, 'w')
+  if not f then return false, err end
+  f:write(text)
+  f:close()
+  return os.rename(tmp, path)
+end
+
+-- Compact JSON with sorted keys, so equal states compare equal as strings
+local function canon(v)
+  if type(v) ~= 'table' then return wezterm.json_encode(v) end
+  local out = {}
+  if #v > 0 or next(v) == nil then
+    for i, x in ipairs(v) do out[i] = canon(x) end
+    return '[' .. table.concat(out, ',') .. ']'
+  end
+  local keys = {}
+  for k in pairs(v) do table.insert(keys, k) end
+  table.sort(keys)
+  for _, k in ipairs(keys) do table.insert(out, wezterm.json_encode(k) .. ':' .. canon(v[k])) end
+  return '{' .. table.concat(out, ',') .. '}'
+end
+
+local function base(path) return (path or ''):match '[^/]*$' end
+
+local function set_of(words)
+  local set = {}
+  for w in words:gmatch '%S+' do set[w] = true end
+  return set
+end
+
+-- What a pane was running ---------------------------------------------------
+
+local SHELLS = set_of 'bash sh zsh fish nu dash ksh'
+
+-- A shell waiting at its prompt: no script, no -c command
+local function is_idle_shell(argv)
+  if not SHELLS[(base(argv[1]):gsub('^%-', ''))] then return false end
+  for i = 2, #argv do
+    local a = argv[i]
+    if a:sub(1, 1) ~= '-' or (a:match '^%-%a+$' and a:find 'c') then return false end
+  end
+  return true
+end
+
+local function is_claude(info)
+  local argv = info.argv or {}
+  if base(argv[1]) == 'claude' or base(info.executable) == 'claude' then return true end
+  return base(argv[1]) == 'node' and (argv[2] or ''):find('/claude', 1, true) ~= nil
+end
+
+-- Session id (and its cwd) the SessionStart hook recorded for a pane
+local function claude_session(pane_id)
+  local id, cwd = (read_file(CLAUDE_DIR .. '/' .. pane_id) or ''):match '^([%w_-]+)\n?([^\n]*)'
+  if id then return id, cwd ~= '' and cwd or nil end
+end
+
+-- Commands that are never re-run on their own: re-running could damage or
+-- duplicate work, so they are only typed at the prompt (see type_when_ready)
+local DENY_BARE = set_of [[rm rmdir mv cp dd sudo doas su kill pkill killall shutdown reboot halt
+  ssh-setup mkfs diskutil truncate shred srm unlink tee scp rsync]]
+local DENY_ARGS = {
+  git = set_of [[push commit reset rebase merge clean checkout switch pull cherry-pick revert stash
+    tag am apply rm mv restore add]],
+  docker = set_of 'rm rmi prune kill stop down push system volume',
+  kubectl = set_of 'delete apply patch scale replace drain cordon',
+  terraform = set_of 'apply destroy import',
+  gh = set_of 'merge create delete close edit',
+}
+local PKG_WRITE = set_of [[install i add remove uninstall rm un update upgrade up publish link unlink
+  cleanup autoremove sync init create ci dedupe prune]]
+for _, pm in ipairs { 'npm', 'pnpm', 'yarn', 'bun', 'pip', 'pip3', 'uv', 'brew', 'cargo', 'gem',
+    'conda', 'mamba', 'apt', 'apt-get' } do
+  DENY_ARGS[pm] = PKG_WRITE
+end
+DENY_ARGS.podman = DENY_ARGS.docker
+DENY_ARGS.tofu = DENY_ARGS.terraform
+-- Commands that run other commands: every argument may be the real one
+local WRAPPERS = set_of 'env nice nohup time caffeinate command builtin exec xargs watch timeout'
+
+local function is_denied(argv)
+  local from = 1
+  if SHELLS[base(argv[1])] then
+    if (argv[2] or '-'):sub(1, 1) == '-' then -- sh -c '...': scan the script's words and redirects
+      for i = 2, #argv do
+        if argv[i]:find '>' then return true end
+        for w in argv[i]:gmatch '[%w_-]+' do
+          if DENY_BARE[w] then return true end
+        end
+      end
+      return false
+    end
+    from = 2 -- sh script.sh args: the script is the command
+  end
+  local cmd = base(argv[from])
+  if DENY_BARE[cmd] then return true end
+  local deny = DENY_ARGS[cmd]
+  for i = from + 1, #argv do
+    if (deny and deny[argv[i]]) or (WRAPPERS[cmd] and DENY_BARE[base(argv[i])]) then return true end
+  end
+  return false
+end
+
+-- Pane record: where it sits (cells; set by capture_tab) and what it ran.
+-- kind: shell (idle), run (argv, re-run), typed (argv, only typed at the
+-- prompt), claude (id), ssh (ssh-pane args), sidebar
+local function capture_pane(pane, is_sidebar)
+  local rec = { kind = 'shell' }
+  local cwd = pane_cwd(pane)
+  local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
+  local ssh = info and info_ssh_args(info)
+  local argv = info and info.argv or {}
+  if is_sidebar then
+    rec.kind = 'sidebar'
+  elseif ssh then
+    rec.kind, rec.ssh = 'ssh', { table.unpack(ssh, 2) }
+    cwd = nil -- the local shell's cwd means nothing on the host
+  elseif info and is_claude(info) then
+    local id, id_cwd = claude_session(pane:pane_id())
+    if id then
+      rec.kind, rec.claude = 'claude', id
+      cwd = id_cwd and is_dir(id_cwd) and id_cwd or cwd
+    else
+      rec.kind, rec.argv = 'typed', argv
+    end
+  elseif #argv > 0 and not is_idle_shell(argv)
+      and not (#argv == 1 and argv[1]:find ' ') then -- a program that rewrote its own title
+    rec.kind, rec.argv = is_denied(argv) and 'typed' or 'run', argv
+    cwd = info.cwd and is_dir(info.cwd) and info.cwd or cwd
+  end
+  if cwd and is_dir(cwd) then rec.cwd = cwd end
+  return rec
+end
+
+-- Capture ---------------------------------------------------------------------
+
+-- Pane geometry stays hidden while a tab is zoomed or peeked, so the last
+-- unzoomed layout is remembered per tab (one JSON string in wezterm.GLOBAL,
+-- rebuilt each capture so closed tabs drop out).
+local function capture_tab(tab, geoms_in, geoms_out)
+  local tab_id = tostring(tab:tab_id())
+  local sidebar_id = wezterm.GLOBAL[SIDEBAR_KEY .. tab:tab_id()]
+  local peek = peek_open(tab) and peek_record(tab) or nil
+  local infos, recs, ids, fresh, frozen = tab:panes_with_info(), {}, {}, {}, peek ~= nil
+  local zoomed_rec, active_rec
+  for _, info in ipairs(infos) do
+    local pid = info.pane:pane_id()
+    frozen = frozen or info.is_zoomed
+    if not (peek and pid == peek.peek) then
+      local rec = capture_pane(info.pane, pid == sidebar_id)
+      table.insert(recs, rec)
+      ids[rec] = tostring(pid)
+      fresh[tostring(pid)] = { left = info.left, top = info.top, width = info.width, height = info.height }
+      if info.is_zoomed and not peek then zoomed_rec = rec end
+      if (peek and pid == peek.origin) or (not peek and info.is_active) then active_rec = rec end
+      if peek and pid == peek.origin and peek.zoomed then zoomed_rec = rec end
+    end
+  end
+  local geom = fresh
+  if frozen then
+    geom = geoms_in[tab_id]
+    for _, rec in ipairs(recs) do
+      if not (geom and geom[ids[rec]]) then geom = nil break end
+    end
+    if not geom then -- never saw it unzoomed: lay the panes out side by side
+      geom = {}
+      local size = tab:get_size()
+      local w = math.max(1, math.floor(size.cols / #recs))
+      for i, rec in ipairs(recs) do
+        geom[ids[rec]] = { left = (i - 1) * w, top = 0, width = w, height = size.rows }
+      end
+    end
+  end
+  geoms_out[tab_id] = geom
+  for _, rec in ipairs(recs) do
+    local g = geom[ids[rec]]
+    rec.left, rec.top, rec.width, rec.height = g.left, g.top, g.width, g.height
+  end
+  active_rec = active_rec or recs[1]
+  if active_rec then active_rec.active = true end
+  if zoomed_rec then zoomed_rec.zoomed = true end
+  return { title = tab:get_title(), panes = recs }
+end
+
+-- The whole GUI state as plain data
+local function capture_session()
+  local geoms_in = wezterm.json_parse(wezterm.GLOBAL.tab_geoms or '{}')
+  local geoms_out, windows, focused = {}, {}, {}
+  if wezterm.gui then
+    for _, gw in ipairs(wezterm.gui.gui_windows()) do
+      if gw:is_focused() then focused[gw:window_id()] = true end
+    end
+  end
+  local all = wezterm.mux.all_windows()
+  table.sort(all, function(a, b) return a:window_id() < b:window_id() end)
+  for _, mw in ipairs(all) do
+    local tabs, active = {}, mw:active_tab()
+    local wrec = { title = mw:get_title(), workspace = mw:get_workspace(), focused = focused[mw:window_id()] }
+    for _, tab in ipairs(mw:tabs()) do
+      table.insert(tabs, capture_tab(tab, geoms_in, geoms_out))
+      if active and tab:tab_id() == active:tab_id() then
+        wrec.active_tab = #tabs
+        local size = tab:get_size()
+        wrec.cols, wrec.rows = size.cols, size.rows
+      end
+    end
+    wrec.tabs = tabs
+    -- A pane's own title can end up as the window title; only a title that
+    -- is not one of them was set by the user
+    for _, tab in ipairs(mw:tabs()) do
+      for _, p in ipairs(tab:panes()) do
+        if p:get_title() == wrec.title then wrec.title = '' end
+      end
+    end
+    if #tabs > 0 then table.insert(windows, wrec) end
+  end
+  wezterm.GLOBAL.tab_geoms = wezterm.json_encode(geoms_out)
+  return { version = SNAPSHOT_VERSION, workspace = wezterm.mux.get_active_workspace(), windows = windows }
+end
+
+-- Claude session files of panes that no longer exist
+local function prune_claude_files(live)
+  local ok, files = pcall(wezterm.read_dir, CLAUDE_DIR)
+  for _, path in ipairs(ok and files or {}) do
+    if not live[base(path)] then os.remove(path) end
+  end
+end
+
+-- Save the state once it has stopped changing (so a half-closed set of
+-- windows during quit is never written), or has kept changing for SETTLE_MAX
+-- seconds. Called about once a second.
+local function save_session()
+  local G = wezterm.GLOBAL
+  if G.session_restoring then return end
+  local ok, snap = pcall(capture_session)
+  if not ok then
+    wezterm.log_error('session: capture failed: ' .. tostring(snap))
+    return
+  end
+  if #snap.windows == 0 then return end
+  local text, now = canon(snap), os.time()
+  if text == G.session_saved then
+    G.session_pending, G.session_dirty_since = nil, nil
+    return
+  end
+  G.session_dirty_since = G.session_dirty_since or now
+  local settled = text == G.session_pending
+  G.session_pending = text
+  if not settled and now - G.session_dirty_since < SETTLE_MAX then return end
+  local wrote, err = write_atomic(SESSION_FILE, text .. '\n')
+  if not wrote then
+    wezterm.log_error('session: save failed: ' .. tostring(err))
+    return
+  end
+  G.session_saved, G.session_dirty_since = text, nil
+  local live = {}
+  for _, mw in ipairs(wezterm.mux.all_windows()) do
+    for _, tab in ipairs(mw:tabs()) do
+      for _, p in ipairs(tab:panes()) do live[tostring(p:pane_id())] = true end
+    end
+  end
+  prune_claude_files(live)
+end
+
+wezterm.on('update-status', function()
+  local now = os.time()
+  if wezterm.GLOBAL.session_tick ~= now then
+    wezterm.GLOBAL.session_tick = now
+    save_session()
+  end
+end)
+
+-- Restore ---------------------------------------------------------------------
+
+local RESTORE_SHELL = os.getenv 'SHELL' or '/bin/zsh'
+
+-- Run `cmd` in the login shell (right PATH and env) from `cwd`, and stay in
+-- that shell when it exits. cd here rather than via the spawn's cwd: on
+-- 20240203 a split or new tab with `args` ignores `cwd`.
+local function shell_args(cmd, cwd)
+  local cd = cwd and ('cd ' .. sh_quote(cwd) .. ' && ') or ''
+  return { RESTORE_SHELL, '-lic', cd .. cmd .. '; exec ' .. sh_quote(RESTORE_SHELL) .. ' -l' }
+end
+
+local function join_argv(argv)
+  local words = {}
+  for _, a in ipairs(argv) do table.insert(words, sh_quote(tostring(a))) end
+  return table.concat(words, ' ')
+end
+
+-- Hosts (user@ ignored) never reconnected on restore: WEZTERM_RESTORE_SKIP_HOSTS
+-- (comma or space separated) and one per line in restore-skip-hosts
+local function skip_hosts()
+  local set = {}
+  for h in (os.getenv 'WEZTERM_RESTORE_SKIP_HOSTS' or ''):gmatch '[^,%s]+' do set[h] = true end
+  for line in (read_file(SKIP_HOSTS_FILE) or ''):gmatch '[^\n]+' do
+    local h = line:gsub('#.*', ''):match '^%s*(.-)%s*$'
+    if h ~= '' then set[h] = true end
+  end
+  return set
+end
+
+-- Runs under /bin/sh with the ssh-pane command line as arguments: an
+-- optional pause, then (for further panes of a host) wait until the first
+-- one's ControlMaster is up so they ride it instead of logging in again
+local SSH_RESTORE_SCRIPT = [[
+sleep "${WEZ_RESTORE_DELAY:-0}"
+i=0
+if [ -n "$WEZ_RESTORE_WAIT" ]; then
+  p=$1; shift
+  while [ "$i" -lt 90 ] && ! ssh -O check "$@" >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done
+  set -- "$p" "$@"
+fi
+unset WEZ_RESTORE_DELAY WEZ_RESTORE_WAIT
+exec "$@"]]
+
+-- Spawn spec for a pane record, plus the text to type at its prompt (or nil)
+local function restore_spec(rec, ctx)
+  local spec = {}
+  if rec.cwd and is_dir(rec.cwd) then spec.cwd = rec.cwd end
+  local kind = rec.kind
+  if kind == 'sidebar' then
+    return sidebar_spec(spec.cwd or wezterm.home_dir)
+  elseif kind == 'ssh' and type(rec.ssh) == 'table' and #rec.ssh > 0 then
+    local full = { SSH_PANE, table.unpack(rec.ssh) }
+    local host, dest = ssh_host(full), rec.ssh[#rec.ssh]
+    if ctx.skip[host] or ctx.skip[dest] then
+      spec.args = shell_args('printf "%s\\n" ' .. sh_quote('restore: not reconnecting to ' .. host), spec.cwd)
+      return spec
+    end
+    local first = not ctx.hosts[host]
+    if first then ctx.hosts[host], ctx.nhosts = true, ctx.nhosts + 1 end
+    spec.args = { '/bin/sh', '-c', SSH_RESTORE_SCRIPT, RESTORE_TAG, table.unpack(full) }
+    spec.set_environment_variables = {
+      PATH = SPAWN_PATH,
+      WEZ_RESTORE_DELAY = tostring(first and 2 * (ctx.nhosts - 1) or 1),
+      WEZ_RESTORE_WAIT = first and '' or '1',
+    }
+  elseif kind == 'claude' and type(rec.claude) == 'string' and rec.claude:match '^[%w_-]+$' then
+    spec.args = shell_args('claude --resume ' .. rec.claude, spec.cwd)
+  elseif kind == 'run' and type(rec.argv) == 'table' and #rec.argv > 0 then
+    spec.args = shell_args(join_argv(rec.argv), spec.cwd)
+  elseif kind == 'typed' and type(rec.argv) == 'table' and #rec.argv > 0 then
+    return spec, join_argv(rec.argv)
+  end
+  return spec
+end
+
+-- Put `text` on the pane's command line without running it, once the shell
+-- has drawn its prompt (typed earlier it would echo twice)
+local function type_when_ready(pane, text, tries)
+  wezterm.time.call_after(0.25, function()
+    local ok, shown = pcall(pane.get_lines_as_text, pane)
+    if ok and shown:match '%S' then
+      pcall(pane.send_text, pane, text)
+    elseif tries > 0 then
+      type_when_ready(pane, text, tries - 1)
+    end
+  end)
+end
+
+local function finish_pane(pane, typed)
+  if typed then type_when_ready(pane, typed, 40) end
+end
+
+-- Split `pane` (holding the top-left record of `group`) into the rest of the
+-- group, following the same clean cuts merge_tab uses
+local function build_group(group, pane, ctx, live)
+  if #group <= 1 then return end
+  local first, second, flag, pct = find_cut(group)
+  if not first then -- not a split tree (hand-edited file): stack the rest to the right
+    for i = 2, #group do
+      local spec, typed = restore_spec(group[i], ctx)
+      spec.direction = 'Right'
+      live[group[i]] = pane:split(spec)
+      finish_pane(live[group[i]], typed)
+    end
+    return
+  end
+  local anchor = anchor_of(second)
+  local spec, typed = restore_spec(anchor, ctx)
+  spec.direction = flag == '--right' and 'Right' or 'Bottom'
+  spec.size = pct / 100
+  local created = pane:split(spec)
+  live[anchor] = created
+  finish_pane(created, typed)
+  build_group(first, pane, ctx, live)
+  build_group(second, created, ctx, live)
+end
+
+local function restore_tab(tab, pane, trec, ctx, typed)
+  local anchor = anchor_of(trec.panes)
+  local live = { [anchor] = pane }
+  finish_pane(pane, typed)
+  build_group(trec.panes, pane, ctx, live)
+  if (trec.title or '') ~= '' then tab:set_title(trec.title) end
+  local active, zoomed
+  for _, rec in ipairs(trec.panes) do
+    if rec.kind == 'sidebar' then wezterm.GLOBAL[SIDEBAR_KEY .. tab:tab_id()] = live[rec]:pane_id() end
+    if rec.active then active = live[rec] end
+    if rec.zoomed then zoomed = live[rec] end
+  end
+  if zoomed then
+    zoomed:activate()
+    tab:set_zoomed(true)
+  elseif active then
+    active:activate()
+  end
+end
+
+local function restore_window(wrec, ctx)
+  local mw, tabs = nil, {}
+  for _, trec in ipairs(wrec.tabs) do
+    if type(trec.panes) == 'table' and #trec.panes > 0 then
+      local spec, typed = restore_spec(anchor_of(trec.panes), ctx)
+      local tab, pane
+      if mw then
+        tab, pane = mw:spawn_tab(spec)
+      else
+        if type(wrec.cols) == 'number' and type(wrec.rows) == 'number' then
+          spec.width, spec.height = math.floor(wrec.cols), math.floor(wrec.rows)
+        end
+        spec.workspace = wrec.workspace
+        tab, pane, mw = wezterm.mux.spawn_window(spec)
+      end
+      restore_tab(tab, pane, trec, ctx, typed)
+      tabs[#tabs + 1] = tab
+    end
+  end
+  if tabs[wrec.active_tab] then tabs[wrec.active_tab]:activate() end
+  -- last: programs starting in the tabs above retitle the window
+  if mw and (wrec.title or '') ~= '' then mw:set_title(wrec.title) end
+  return mw ~= nil
+end
+
+-- Re-create the windows of `snap`; the focused window last so it ends on top.
+-- Returns how many windows came back.
+local function restore_session(snap)
+  local ctx = { skip = skip_hosts(), hosts = {}, nhosts = 0 }
+  local order = {}
+  for _, w in ipairs(snap.windows) do
+    if type(w.tabs) == 'table' then table.insert(order, w) end
+  end
+  -- Stable, focused window last (table.sort is not stable)
+  local rank = {}
+  for i, w in ipairs(order) do rank[w] = (w.focused and 1e6 or 0) + i end
+  table.sort(order, function(a, b) return rank[a] < rank[b] end)
+  wezterm.GLOBAL.session_restoring = true
+  local n = 0
+  for _, w in ipairs(order) do
+    local ok, made = pcall(restore_window, w, ctx)
+    if ok and made then
+      n = n + 1
+    else
+      wezterm.log_error('session: window restore failed: ' .. tostring(made))
+    end
+  end
+  if snap.workspace and n > 0 then pcall(wezterm.mux.set_active_workspace, snap.workspace) end
+  wezterm.GLOBAL.session_restoring = nil
+  return n
+end
+
+local function load_snapshot(path)
+  local ok, snap = pcall(function() return wezterm.json_parse(read_file(path) or '') end)
+  if ok and type(snap) == 'table' and snap.version == SNAPSHOT_VERSION and type(snap.windows) == 'table'
+      and #snap.windows > 0 then
+    return snap
+  end
+  return nil
+end
+
+local function restore_disabled()
+  return os.getenv 'WEZTERM_NO_RESTORE' == '1' or exists(NO_RESTORE_FILE)
+end
+
+-- Fresh launch: keep the last session as session.prev.json (unless it is just
+-- one empty-looking window and a better one is already kept), forget stale
+-- Claude ids (pane ids restart from 0), then restore or open the default window
+local function startup(cmd)
+  local current = load_snapshot(SESSION_FILE)
+  if current then
+    local trivial = #current.windows == 1 and #current.windows[1].tabs == 1
+      and #current.windows[1].tabs[1].panes == 1 and current.windows[1].tabs[1].panes[1].kind == 'shell'
+    if not trivial or not load_snapshot(SESSION_PREV) then
+      write_atomic(SESSION_PREV, read_file(SESSION_FILE))
+    end
+  end
+  prune_claude_files {}
+  local n = 0
+  if current and not cmd and not restore_disabled() then
+    local ok, made = pcall(restore_session, current)
+    n = ok and made or 0
+    if not ok then wezterm.log_error('session: restore failed: ' .. tostring(made)) end
+  end
+  if n == 0 and #wezterm.mux.all_windows() == 0 then wezterm.mux.spawn_window(cmd or {}) end
+end
+wezterm.on('gui-startup', startup)
+
+restore_previous = wezterm.action_callback(function(window)
+  local snap = load_snapshot(SESSION_PREV)
+  if not snap then
+    toast(window, 'Session: no previous session saved', 2000)
+    return
+  end
+  local n = restore_session(snap)
+  toast(window, string.format('Session: restored %d window%s', n, n == 1 and '' or 's'), 3000)
+end)
+
+toggle_auto_restore = wezterm.action_callback(function(window)
+  if exists(NO_RESTORE_FILE) then
+    os.remove(NO_RESTORE_FILE)
+    toast(window, 'Session: auto-restore on', 2000)
+  elseif write_atomic(NO_RESTORE_FILE, 'delete this file to restore the last session at launch\n') then
+    toast(window, 'Session: auto-restore off', 2000)
+  end
+end)
+end -- session restore
+
 -- Home-row labels for PaneSelect (swap / jump)
 local PANE_ALPHABET = 'asdfghjkl'
 
@@ -2151,6 +2714,10 @@ config.keys = {
   -- macOS reports Shift+= as either key
   { key = '=', mods = 'CMD|SHIFT', action = act.EmitEvent 'fix-layout' },
   { key = '+', mods = 'CMD|SHIFT', action = act.EmitEvent 'fix-layout' },
+  -- Session restore: reopen the session from before this launch; toggle
+  -- whether launching restores the last session on its own
+  { key = 'o', mods = 'CMD|SHIFT', action = restore_previous },
+  { key = 'o', mods = 'CMD|SHIFT|OPT', action = toggle_auto_restore },
   -- ssh pane: forward a remote port to this Mac and open it (see open_forwarded)
   { key = 'l', mods = 'CMD|SHIFT', action = forward_prompt },
 }
