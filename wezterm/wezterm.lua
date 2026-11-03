@@ -2124,6 +2124,18 @@ local function write_atomic(path, text)
   return os.rename(tmp, path)
 end
 
+-- `path` with glob metacharacters matched literally
+local function glob_quote(path) return (path:gsub('[%[%]%*%?{}]', '[%0]')) end
+
+-- Does the absolute path exist? A stat (wezterm.glob), not a listing: macOS
+-- privacy protection can deny WezTerm reading folders such as ~/Desktop,
+-- where is_dir (read_dir) fails although the shells there work fine
+local function present(path)
+  if type(path) ~= 'string' or path:sub(1, 1) ~= '/' then return false end
+  local ok, found = pcall(wezterm.glob, glob_quote(path))
+  return ok and #found > 0
+end
+
 -- Compact JSON with sorted keys, so equal states compare equal as strings
 local function canon(v)
   if type(v) ~= 'table' then return wezterm.json_encode(v) end
@@ -2237,16 +2249,16 @@ local function capture_pane(pane, is_sidebar)
     local id, id_cwd = claude_session(pane:pane_id())
     if id then
       rec.kind, rec.claude = 'claude', id
-      cwd = id_cwd and is_dir(id_cwd) and id_cwd or cwd
+      cwd = present(id_cwd) and id_cwd or cwd
     else
       rec.kind, rec.argv = 'typed', argv
     end
   elseif #argv > 0 and not is_idle_shell(argv)
       and not (#argv == 1 and argv[1]:find ' ') then -- a program that rewrote its own title
     rec.kind, rec.argv = is_denied(argv) and 'typed' or 'run', argv
-    cwd = info.cwd and is_dir(info.cwd) and info.cwd or cwd
+    cwd = present(info.cwd) and info.cwd or cwd
   end
-  if cwd and is_dir(cwd) then rec.cwd = cwd end
+  if present(cwd) then rec.cwd = cwd end
   return rec
 end
 
@@ -2435,15 +2447,17 @@ exec "$@"]]
 -- Spawn spec for a pane record, plus the text to type at its prompt (or nil)
 local function restore_spec(rec, ctx)
   local spec = {}
-  if rec.cwd and is_dir(rec.cwd) then spec.cwd = rec.cwd end
+  -- The shell cds there itself: WezTerm drops a spawn cwd it cannot list
+  local cwd = present(rec.cwd) and rec.cwd or nil
+  if cwd and is_dir(cwd) then spec.cwd = cwd end
   local kind = rec.kind
   if kind == 'sidebar' then
-    return sidebar_spec(spec.cwd or wezterm.home_dir)
+    return sidebar_spec(cwd or wezterm.home_dir)
   elseif kind == 'ssh' and type(rec.ssh) == 'table' and #rec.ssh > 0 then
     local full = { SSH_PANE, table.unpack(rec.ssh) }
     local host, dest = ssh_host(full), rec.ssh[#rec.ssh]
     if ctx.skip[host] or ctx.skip[dest] then
-      spec.args = shell_args('printf "%s\\n" ' .. sh_quote('restore: not reconnecting to ' .. host), spec.cwd)
+      spec.args = shell_args('printf "%s\\n" ' .. sh_quote('restore: not reconnecting to ' .. host), cwd)
       return spec
     end
     local first = not ctx.hosts[host]
@@ -2455,11 +2469,12 @@ local function restore_spec(rec, ctx)
       WEZ_RESTORE_WAIT = first and '' or '1',
     }
   elseif kind == 'claude' and type(rec.claude) == 'string' and rec.claude:match '^[%w_-]+$' then
-    spec.args = shell_args('claude --resume ' .. rec.claude, spec.cwd)
+    spec.args = shell_args('claude --resume ' .. rec.claude, cwd)
   elseif kind == 'run' and type(rec.argv) == 'table' and #rec.argv > 0 then
-    spec.args = shell_args(join_argv(rec.argv), spec.cwd)
-  elseif kind == 'typed' and type(rec.argv) == 'table' and #rec.argv > 0 then
-    return spec, join_argv(rec.argv)
+    spec.args = shell_args(join_argv(rec.argv), cwd)
+  else
+    if cwd then spec.args = { '/bin/sh', '-c', 'cd "$1" 2>/dev/null; exec "$2" -l', 'sh', cwd, RESTORE_SHELL } end
+    if kind == 'typed' and type(rec.argv) == 'table' and #rec.argv > 0 then return spec, join_argv(rec.argv) end
   end
   return spec
 end
