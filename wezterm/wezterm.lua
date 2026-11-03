@@ -2184,10 +2184,64 @@ local function is_claude(info)
   return base(argv[1]) == 'node' and (argv[2] or ''):find('/claude', 1, true) ~= nil
 end
 
--- Session id (and its cwd) the SessionStart hook recorded for a pane
-local function claude_session(pane_id)
-  local id, cwd = (read_file(CLAUDE_DIR .. '/' .. pane_id) or ''):match '^([%w_-]+)\n?([^\n]*)'
-  if id then return id, cwd ~= '' and cwd or nil end
+local claude_session
+do
+-- Session id on a claude command line: --resume/-r <id>, --session-id <id>
+-- (a uuid; --resume <search words> opens a picker). --fork-session runs
+-- under a new id, so its command line says nothing.
+local UUID = '^%x+%-%x+%-%x+%-%x+%-%x+$'
+local function argv_claude_id(argv)
+  local id
+  for i, a in ipairs(argv) do
+    if a == '--fork-session' then return nil end
+    local flag, value = a:match '^(%-%-[%w-]+)=(.*)$'
+    if not flag then flag, value = a, argv[i + 1] end
+    if (flag == '--resume' or flag == '-r' or flag == '--session-id') and (value or ''):match(UUID) then
+      id = value
+    end
+  end
+  return id
+end
+
+-- Session id (and cwd) a running claude process published: Claude Code keeps
+-- <config dir>/sessions/<pid>.json ({ pid, sessionId, cwd, startedAt }) for
+-- each live interactive process, under ~/.claude or another config dir
+-- named ~/.claude-* (CLAUDE_CONFIG_DIR). Trusted only if written by this
+-- very process, i.e. not before it started (pids get reused).
+local function pid_claude_session(info)
+  if type(info.pid) ~= 'number' then return nil end
+  local ok, files = pcall(wezterm.glob, glob_quote(wezterm.home_dir) .. '/.claude*/sessions/' .. info.pid .. '.json')
+  for _, path in ipairs(ok and files or {}) do
+    local parsed, s = pcall(wezterm.json_parse, read_file(path) or '')
+    if parsed and type(s) == 'table' and s.pid == info.pid and type(s.sessionId) == 'string'
+        and s.sessionId:match '^[%w_-]+$' and type(s.startedAt) == 'number'
+        and (type(info.start_time) ~= 'number' or s.startedAt / 1000 >= info.start_time - 5) then
+      return s.sessionId, type(s.cwd) == 'string' and s.cwd or nil
+    end
+  end
+end
+
+-- Session id (and its cwd) of the claude process in a pane. The pane's file
+-- holds line 1 id, line 2 cwd: written by the SessionStart hook, or here,
+-- with `pid <n>` on line 3, for a process the hook never saw (started before
+-- it was installed): then the id comes from the process's own sessions file
+-- or its command line, and the file keeps it known for that process.
+function claude_session(pane_id, info)
+  local path = CLAUDE_DIR .. '/' .. pane_id
+  local text = read_file(path) or ''
+  local id, cwd, owner = text:match '^([^\n]*)\n?([^\n]*)\n?([^\n]*)'
+  if not id:match '^[%w_-]+$' then id = nil end
+  cwd = cwd ~= '' and cwd or nil
+  if id and owner == '' then return id, cwd end -- the hook's
+  local found, found_cwd = pid_claude_session(info)
+  if not found and id and owner == 'pid ' .. tostring(info.pid) then return id, cwd end
+  found = found or argv_claude_id(info.argv or {})
+  if not found then return nil end
+  found_cwd = found_cwd or info.cwd
+  local record = string.format('%s\n%s\npid %d\n', found, found_cwd or '', info.pid or 0)
+  if type(info.pid) == 'number' and record ~= text then write_atomic(path, record) end
+  return found, found_cwd
+end
 end
 
 -- Commands that are never re-run on their own: re-running could damage or
@@ -2251,7 +2305,7 @@ local function capture_pane(pane, is_sidebar)
     rec.kind, rec.ssh = 'ssh', { table.unpack(ssh, 2) }
     cwd = nil -- the local shell's cwd means nothing on the host
   elseif info and is_claude(info) then
-    local id, id_cwd = claude_session(pane:pane_id())
+    local id, id_cwd = claude_session(pane:pane_id(), info)
     if id then
       rec.kind, rec.claude = 'claude', id
       cwd = present(id_cwd) and id_cwd or cwd
