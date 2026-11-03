@@ -88,8 +88,10 @@ sidebar. No process is kept alive; panes are re-created and what ran in them
 is run again, through the login shell so the pane stays a shell afterwards:
 
 * **Claude Code** panes: `claude --resume <session id>`, the exact
-  conversation. The id comes from a `SessionStart` hook (below). Without a
-  recorded id the original command is only typed at the prompt.
+  conversation. The id comes from a `SessionStart` hook (below); for a
+  process started before the hook, from the `sessions/<pid>.json` Claude Code
+  keeps for it (in `~/.claude*`) or a `--resume <id>` on its command line.
+  Without an id the original command is only typed at the prompt.
 * **ssh / ssh-pane** panes: reconnect through `ssh-pane`. Hosts are staggered,
   and further panes to a host wait for its ControlMaster, so you log in once.
   Hosts listed in `~/.local/state/wezterm/restore-skip-hosts` (one per line,
@@ -100,13 +102,17 @@ is run again, through the login shell so the pane stays a shell afterwards:
   commit reset rebase merge ...`, package-manager install/remove/update, docker
   `rm/prune/stop`, `kubectl delete/apply`, `terraform apply/destroy`, and `sh
   -c` strings with those words or a `>` redirect). See `DENY_*` in
-  `wezterm.lua`.
-* An idle shell comes back as a shell in its cwd.
+  `wezterm.lua`. An interpreter running a script on PATH (`python
+  ~/.local/bin/tool`) comes back as `tool`; Yazi drops its `--cwd-file` and
+  runs through the `y` function; commands on a `$TMPDIR` file are only typed.
+* An idle shell comes back as a shell in its cwd (also in folders such as
+  `~/Desktop` that macOS privacy protection keeps WezTerm from listing).
 
 State is saved to `~/.local/state/wezterm/session.json` (atomic write, only
 when it changed and has settled for a poll; WezTerm 20240203 has no quit
 event, so the last settled state is restored). At launch the previous file is
-kept as `session.prev.json`. Window positions cannot be read by this WezTerm
+kept as `session.prev.json`, as is a session whose windows were all closed
+before a new one opened. Window positions cannot be read by this WezTerm
 version, so only sizes are restored. Disable with `WEZTERM_NO_RESTORE=1` or
 CMD+OPT+SHIFT+O (creates/removes `~/.local/state/wezterm/no-restore`).
 
