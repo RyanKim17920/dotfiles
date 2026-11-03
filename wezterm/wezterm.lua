@@ -2113,14 +2113,19 @@ local function read_file(path)
   return text
 end
 
--- tmp + rename, so a crash never leaves a half-written file
+-- tmp + rename, so a crash never leaves a half-written file; a failed write
+-- (disk full) leaves the old file in place
 local function write_atomic(path, text)
-  wezterm.run_child_process { '/bin/mkdir', '-p', STATE_DIR }
+  wezterm.run_child_process { '/bin/mkdir', '-p', path:match '^(.*)/' }
   local tmp = path .. '.tmp'
   local f, err = io.open(tmp, 'w')
   if not f then return false, err end
-  f:write(text)
-  f:close()
+  local wrote, werr = f:write(text)
+  local closed, cerr = f:close()
+  if not (wrote and closed) then
+    os.remove(tmp)
+    return false, werr or cerr
+  end
   return os.rename(tmp, path)
 end
 
