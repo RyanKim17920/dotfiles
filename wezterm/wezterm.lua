@@ -2492,18 +2492,27 @@ local function save_session()
   local settled = text == G.session_pending
   G.session_pending = text
   if not settled and now - G.session_dirty_since < SETTLE_MAX then return end
+  local live, windows, kept = {}, ',', false
+  for _, mw in ipairs(wezterm.mux.all_windows()) do
+    windows = windows .. mw:window_id() .. ','
+    kept = kept or (G.session_windows or ''):find(',' .. mw:window_id() .. ',', 1, true) ~= nil
+    for _, tab in ipairs(mw:tabs()) do
+      for _, p in ipairs(tab:panes()) do live[tostring(p:pane_id())] = true end
+    end
+  end
+  -- None of the saved windows is left (the last window was closed, not quit,
+  -- and a new one opened; nothing is saved while there are none): keep that
+  -- session as session.prev.json (Cmd+Shift+O) before replacing it
+  if G.session_windows and not kept then
+    local last = read_file(SESSION_FILE)
+    if last then write_atomic(SESSION_PREV, last) end
+  end
   local wrote, err = write_atomic(SESSION_FILE, text .. '\n')
   if not wrote then
     wezterm.log_error('session: save failed: ' .. tostring(err))
     return
   end
-  G.session_saved, G.session_dirty_since = text, nil
-  local live = {}
-  for _, mw in ipairs(wezterm.mux.all_windows()) do
-    for _, tab in ipairs(mw:tabs()) do
-      for _, p in ipairs(tab:panes()) do live[tostring(p:pane_id())] = true end
-    end
-  end
+  G.session_saved, G.session_dirty_since, G.session_windows = text, nil, windows
   prune_claude_files(live)
 end
 
