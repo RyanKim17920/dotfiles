@@ -2290,6 +2290,61 @@ local function is_denied(argv)
   return false
 end
 
+local command_argv, names_temp
+do
+-- The command a user would type for argv:
+-- * an interpreter running a script that is a command on PATH (uv, pipx and
+--   npm install CLIs as `#!/abs/python` or `#!/usr/bin/env node` scripts):
+--   `.../bin/python ~/.local/bin/tool` -> `tool` (so shell functions of that
+--   name apply again)
+-- * yazi without --cwd-file/--chooser-file: temp files of the wrapper that
+--   started it, gone after it exits (restore_spec runs it via `y` again)
+local INTERPRETERS = set_of 'python python3 node ruby perl bun deno'
+local CMD_DIRS = set_of(table.concat({ SPAWN_PATH:gsub(':', ' '), wezterm.home_dir .. '/.local/bin',
+  wezterm.home_dir .. '/bin', wezterm.home_dir .. '/.cargo/bin', wezterm.home_dir .. '/.bun/bin',
+  '/usr/local/bin', '/opt/homebrew/bin' }, ' '))
+local YAZI_TEMP_OPTS = set_of '--cwd-file --chooser-file'
+function command_argv(argv)
+  local script, interp = argv[2] or '', base(argv[1]):gsub('[%d.]+$', '')
+  if INTERPRETERS[interp] and CMD_DIRS[script:match '^(.*)/' or ''] then
+    local f = io.open(script, 'r')
+    local line = f and f:read '*l' or ''
+    if f then f:close() end
+    local direct, via_env = line:match '^#!%s*(%S+)', line:match '^#!%s*%S*/env%s+(%S+)%s*$'
+    if direct == argv[1] or via_env == base(argv[1]) then
+      return { base(script), table.unpack(argv, 3) }
+    end
+  end
+  if base(argv[1]) == 'yazi' then
+    local out, i = { 'yazi' }, 2
+    while i <= #argv do
+      local a = argv[i]
+      if YAZI_TEMP_OPTS[a] then
+        i = i + 1 -- and its value
+      elseif not YAZI_TEMP_OPTS[a:match '^(%-%-[%w-]+)=' or ''] then
+        table.insert(out, a)
+      end
+      i = i + 1
+    end
+    return out
+  end
+  return argv
+end
+
+-- Does a command name a file in the per-user temp dir (mktemp: an editor on
+-- a shell's edit-command-line buffer, ...)? It is gone after a reboot: only
+-- typed, never re-run.
+local TEMP_DIRS = { '/var/folders/', '/private/var/folders/', os.getenv 'TMPDIR' or '' }
+function names_temp(argv)
+  for i = 2, #argv do
+    for _, dir in ipairs(TEMP_DIRS) do
+      if dir ~= '' and argv[i]:find(dir, 1, true) then return true end
+    end
+  end
+  return false
+end
+end
+
 -- Pane record: where it sits (cells; set by capture_tab) and what it ran.
 -- kind: shell (idle), run (argv, re-run), typed (argv, only typed at the
 -- prompt), claude (id), ssh (ssh-pane args), sidebar
@@ -2310,11 +2365,12 @@ local function capture_pane(pane, is_sidebar)
       rec.kind, rec.claude = 'claude', id
       cwd = present(id_cwd) and id_cwd or cwd
     else
-      rec.kind, rec.argv = 'typed', argv
+      rec.kind, rec.argv = 'typed', command_argv(argv)
     end
   elseif #argv > 0 and not is_idle_shell(argv)
       and not (#argv == 1 and argv[1]:find ' ') then -- a program that rewrote its own title
-    rec.kind, rec.argv = is_denied(argv) and 'typed' or 'run', argv
+    argv = command_argv(argv)
+    rec.kind, rec.argv = (is_denied(argv) or names_temp(argv)) and 'typed' or 'run', argv
     cwd = present(info.cwd) and info.cwd or cwd
   end
   if present(cwd) then rec.cwd = cwd end
@@ -2530,7 +2586,12 @@ local function restore_spec(rec, ctx)
   elseif kind == 'claude' and type(rec.claude) == 'string' and rec.claude:match '^[%w_-]+$' then
     spec.args = shell_args('claude --resume ' .. rec.claude, cwd)
   elseif kind == 'run' and type(rec.argv) == 'table' and #rec.argv > 0 then
-    spec.args = shell_args(join_argv(rec.argv), cwd)
+    local cmd = join_argv(rec.argv)
+    if rec.argv[1] == 'yazi' then -- via the shell's `y` wrapper (cd to where yazi was left), if it has one
+      cmd = 'if typeset -f y >/dev/null 2>&1; then y ' .. join_argv { table.unpack(rec.argv, 2) }
+        .. '; else ' .. cmd .. '; fi'
+    end
+    spec.args = shell_args(cmd, cwd)
   else
     if cwd then spec.args = { '/bin/sh', '-c', 'cd "$1" 2>/dev/null; exec "$2" -l', 'sh', cwd, RESTORE_SHELL } end
     if kind == 'typed' and type(rec.argv) == 'table' and #rec.argv > 0 then return spec, join_argv(rec.argv) end
