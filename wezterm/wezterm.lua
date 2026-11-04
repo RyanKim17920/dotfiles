@@ -2886,9 +2886,14 @@ local function open_link(mode)
   end)
 end
 
+-- Bindings are built in a fixed order (ipairs, not pairs): each
+-- action_callback is named by a per-evaluation counter, and the GUI may bind
+-- the names from one config evaluation to the callbacks of another, so a
+-- random pairs order sent plain CMD+click to the Quick Look callback.
 config.mouse_bindings = {}
 for _, reporting in ipairs { false, true } do
-  for mods, mode in pairs { CMD = false, ['CMD|OPT'] = 'reveal', ['CMD|OPT|SHIFT'] = 'look' } do
+  for _, b in ipairs { { 'CMD', false }, { 'CMD|OPT', 'reveal' }, { 'CMD|OPT|SHIFT', 'look' } } do
+    local mods, mode = b[1], b[2]
     table.insert(config.mouse_bindings, {
       event = { Down = { streak = 1, button = 'Left' } },
       mods = mods,
