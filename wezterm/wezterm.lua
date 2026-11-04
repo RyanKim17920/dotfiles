@@ -804,7 +804,12 @@ look() {
   mkdir -p "$(dirname "$pf")"
   qlmanage -p "$1" >/dev/null 2>&1 &
   echo $! > "$pf"
-  wait
+  wait $!
+  # qlmanage aborts on video (AVKit: highlightedTimeRanges unsupported) and
+  # shows nothing; reveal it in Finder instead (Space there previews it).
+  # 143 = SIGTERM from the next Quick Look replacing this panel
+  st=$?
+  if [ "$st" -gt 128 ] && [ "$st" -ne 143 ]; then exec open -R "$1"; fi
 }
 if [ "$mode" = look ]; then look "$1"; exit; fi
 dir=$1 name=$2; shift 2
