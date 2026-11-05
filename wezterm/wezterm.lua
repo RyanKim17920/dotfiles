@@ -780,16 +780,16 @@ local function is_media(path)
   return ext ~= nil and MEDIA_EXT[ext:lower()] == true
 end
 
-local function reveal_local(path)
-  wezterm.background_child_process(is_dir(path) and { '/usr/bin/open', path }
-    or { '/usr/bin/open', '-R', path })
-end
+local reveal_local -- defined below, after file_cmd
 
 -- Quick Look (CMD+OPT+SHIFT+click), see LINK_MODE_KEY
 local QUICKLOOK_PID = wezterm.home_dir .. '/.local/state/wezterm/quicklook.pid'
 local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
 
 -- sh -c script: pidfile mode args...
+--   reveal <file>      select it in Finder (AppleScript, since `open -R` skips
+--                      files under hidden paths like /private/tmp; falls back
+--                      to `open -R` if osascript fails, e.g. Automation denied)
 --   look <file>        Quick Look it; one panel at a time (the qlmanage
 --                      started last time is closed first)
 --   reveal-copy|look-copy <dir> <name> <cmd...>
@@ -798,6 +798,11 @@ local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
 --                      it; notify on failure
 local FILE_SCRIPT = [[
 pf=$1 mode=$2; shift 2
+reveal() {
+  osascript -e 'on run argv' -e 'tell application "Finder"' \
+    -e 'reveal POSIX file (item 1 of argv)' -e 'activate' -e 'end tell' \
+    -e 'end run' "$1" >/dev/null 2>&1 || open -R -- "$1"
+}
 look() {
   old=$(cat "$pf" 2>/dev/null)
   case $(ps -o comm= -p "${old:-0}" 2>/dev/null) in *qlmanage) kill "$old" ;; esac
@@ -809,12 +814,13 @@ look() {
   # shows nothing; reveal it in Finder instead (Space there previews it).
   # 143 = SIGTERM from the next Quick Look replacing this panel
   st=$?
-  if [ "$st" -gt 128 ] && [ "$st" -ne 143 ]; then exec open -R "$1"; fi
+  if [ "$st" -gt 128 ] && [ "$st" -ne 143 ]; then reveal "$1"; fi
 }
 if [ "$mode" = look ]; then look "$1"; exit; fi
+if [ "$mode" = reveal ]; then reveal "$1"; exit; fi
 dir=$1 name=$2; shift 2
 if mkdir -p "$dir" && "$@" > "$dir/$name.part" && mv -f "$dir/$name.part" "$dir/$name"; then
-  if [ "$mode" = look-copy ]; then look "$dir/$name"; else exec open -R "$dir/$name"; fi
+  if [ "$mode" = look-copy ]; then look "$dir/$name"; else reveal "$dir/$name"; fi
   exit
 fi
 rm -f "$dir/$name.part"
@@ -822,6 +828,11 @@ osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title 
 
 local function file_cmd(mode, ...)
   return { '/bin/sh', '-c', FILE_SCRIPT, 'sh', QUICKLOOK_PID, mode, ... }
+end
+
+reveal_local = function(path)
+  wezterm.background_child_process(is_dir(path) and { '/usr/bin/open', path }
+    or file_cmd('reveal', path))
 end
 
 local function quicklook_local(window, path)
