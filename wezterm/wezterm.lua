@@ -384,8 +384,9 @@ end
 -- the preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua), or the
 -- directory opened. Images and PDFs too (Yazi previews them). q quits Yazi
 -- and you are back in the pane you clicked, layout untouched (see
--- replace_peek). CMD+OPT+SHIFT+click Quick Looks a file instead. OSC 8
--- file:// links (ls --hyperlink) are handled the same way; web URLs are
+-- replace_peek). CMD+OPT+SHIFT+click Quick Looks a file instead, and in an
+-- ssh pane right-click downloads the file or folder (see download_remote).
+-- OSC 8 file:// links (ls --hyperlink) are handled the same way; web URLs are
 -- untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
 local SSH_FORWARD_SCHEME = 'ssh-forward:' -- see forward_command
@@ -796,6 +797,14 @@ local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
 --                      run cmd (cat of a remote file) into dir/name via a
 --                      .part file, then reveal it in Finder or Quick Look
 --                      it; notify on failure
+--   download <dir> <status> <cmd...>
+--                      unpack the tar stream of one file or folder that cmd
+--                      writes into dir, under a numbered name if a different
+--                      item already has that name, write the outcome to the
+--                      status file (three lines: kind, path, size or error;
+--                      see DOWNLOAD_NOTES) and reveal it in Finder. Exit 1-2
+--                      are tar's "some files changed or were unreadable";
+--                      higher is ssh or the remote shell failing.
 local FILE_SCRIPT = [[
 pf=$1 mode=$2; shift 2
 reveal() {
@@ -816,8 +825,41 @@ look() {
   st=$?
   if [ "$st" -gt 128 ] && [ "$st" -ne 143 ]; then reveal "$1"; fi
 }
+report() { printf '%s\n' "$1" "$2" "$3" > "$st.tmp" && mv -f "$st.tmp" "$st"; }
+download() {
+  dir=$1 st=$2; shift 2
+  mkdir -p "$dir" "$(dirname "$st")"
+  tmp=$(mktemp -d "$dir/.download.XXXXXX") || { report failed "$dir" 'cannot write there'; return; }
+  mkdir "$tmp/x"
+  { "$@" 2> "$tmp/err"; echo $? > "$tmp/rc"; } | tar -xf - -C "$tmp/x" 2> "$tmp/xerr"
+  xrc=$? rc=$(cat "$tmp/rc")
+  # read-only remote folders could neither be renamed nor deleted here
+  chmod -R u+rwX "$tmp/x"
+  item=$(find "$tmp/x" -mindepth 1 -maxdepth 1 -print -quit)
+  if [ "$xrc" -ne 0 ] || [ "$rc" -gt 2 ] || [ -z "$item" ]; then
+    msg=$(tail -n 1 "$tmp/err")
+    report failed '' "${msg:-$(tail -n 1 "$tmp/xerr")}"
+    rm -rf "$tmp"
+    return
+  fi
+  base=${item##*/} stem=${item##*/} ext=
+  if [ -f "$item" ]; then
+    case $base in ?*.*) stem=${base%.*} ext=.${base##*.} ;; esac
+  fi
+  dest=$dir/$base n=0 kind=done
+  [ "$rc" -eq 0 ] || kind=partial
+  while [ -e "$dest" ] || [ -L "$dest" ]; do
+    if diff -rq "$dest" "$item" > /dev/null 2>&1; then kind=same; break; fi
+    n=$((n + 1)) dest="$dir/$stem ($n)$ext"
+  done
+  [ "$kind" = same ] || mv -n "$item" "$dest"
+  rm -rf "$tmp"
+  report "$kind" "$dest" "$(du -sh "$dest" | awk '{ print $1 }')"
+  reveal "$dest"
+}
 if [ "$mode" = look ]; then look "$1"; exit; fi
 if [ "$mode" = reveal ]; then reveal "$1"; exit; fi
+if [ "$mode" = download ]; then download "$@"; exit; fi
 dir=$1 name=$2; shift 2
 if mkdir -p "$dir" && "$@" > "$dir/$name.part" && mv -f "$dir/$name.part" "$dir/$name"; then
   if [ "$mode" = look-copy ]; then look "$dir/$name"; else reveal "$dir/$name"; fi
@@ -840,6 +882,10 @@ local function quicklook_local(window, path)
   toast(window, 'Quick Look: ' .. (path:match '[^/]+$' or path), 2000)
 end
 
+-- Copies from the pane's host over the master.
+-- (A do-block: the main chunk is near Lua's limit of 200 local variables.)
+local reveal_remote, quicklook_remote, download_remote
+do
 -- Copy remote file `path` into local `dir` over the master, then reveal or
 -- Quick Look it (mode 'reveal-copy' / 'look-copy')
 local function fetch_remote(ssh, path, mode, dir)
@@ -854,7 +900,7 @@ local function host_dir(ssh)
   return (ssh_host(ssh):gsub('[^%w.-]', '_'))
 end
 
-local function reveal_remote(window, ssh, kind, path)
+function reveal_remote(window, ssh, kind, path)
   local host = ssh_host(ssh)
   if kind == 'd' then
     toast(window, 'Finder: ' .. host .. ':' .. path .. ' is a remote directory; not copied')
@@ -865,10 +911,94 @@ local function reveal_remote(window, ssh, kind, path)
   toast(window, 'Finder: copying ' .. host .. ':' .. path .. ' to ~/Downloads/' .. sub .. '/')
 end
 
-local function quicklook_remote(window, ssh, path)
+function quicklook_remote(window, ssh, path)
   fetch_remote(ssh, path, 'look-copy', PEEK_CACHE .. host_dir(ssh))
   toast(window, 'Quick Look: copying ' .. ssh_host(ssh) .. ':' .. path, 2000)
 end
+
+-- Right-click on a path in an ssh pane: download the file or folder to
+-- ~/Downloads/<host>/ in the background. tar works for both, keeps names with
+-- spaces and needs nothing but ssh and tar on the host (rsync may be missing
+-- there, and this Mac's is openrsync). The transfer outlives this config
+-- (reloads, ...), so it is not waited for here: `download` in FILE_SCRIPT
+-- leaves a status file, which update-status picks up. wezterm.time.call_after
+-- would be dropped by a reload.
+local DOWNLOADS_KEY = 'downloads' -- JSON list of { status, window, what }
+local DOWNLOAD_STATUS_DIR = wezterm.home_dir .. '/.local/state/wezterm/downloads/'
+local DOWNLOAD_NOTES = {
+  done = 'Download: %s (%s) in %s',
+  partial = 'Download: %s (%s) in %s, INCOMPLETE: some files changed or were unreadable',
+  same = 'Download: %s (%s) was already in %s',
+}
+
+-- $1: remote path. A symlink gets its target, not a dangling link.
+local REMOTE_TAR = [[
+p=$(readlink -f -- "$1" 2>/dev/null) || p=$1
+[ "$p" != / ] || { echo 'refusing to download /' >&2; exit 3; }
+cd -- "$(dirname -- "$p")" && exec tar -cf - -- "./$(basename -- "$p")"]]
+
+local function set_downloads(list)
+  wezterm.GLOBAL[DOWNLOADS_KEY] = #list > 0 and wezterm.json_encode(list) or nil
+end
+
+local function downloads()
+  return wezterm.json_parse(wezterm.GLOBAL[DOWNLOADS_KEY] or '[]')
+end
+
+function download_remote(window, ssh, path)
+  local sub = host_dir(ssh)
+  local seq = (wezterm.GLOBAL.download_seq or 0) + 1
+  wezterm.GLOBAL.download_seq = seq
+  local status = DOWNLOAD_STATUS_DIR .. os.time() .. '-' .. seq
+  local cmd = file_cmd('download', wezterm.home_dir .. '/Downloads/' .. sub, status)
+  for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
+  table.insert(cmd, 'sh -c ' .. sh_quote(REMOTE_TAR) .. ' sh ' .. sh_quote(path))
+  wezterm.background_child_process(cmd)
+  local what = ssh_host(ssh) .. ':' .. path
+  local list = downloads()
+  table.insert(list, { status = status, window = window:window_id(), what = what })
+  set_downloads(list)
+  toast(window, 'Download: ' .. what .. ' to ~/Downloads/' .. sub .. '/', 4000)
+end
+
+local function download_note(d, kind, dest, info)
+  if not DOWNLOAD_NOTES[kind] then
+    return 'Download failed: ' .. d.what .. ((info or '') ~= '' and (': ' .. info) or '')
+  end
+  local dir, name = dest:match '^(.*)/([^/]*)$'
+  if dir:sub(1, #wezterm.home_dir + 1) == wezterm.home_dir .. '/' then
+    dir = '~' .. dir:sub(#wezterm.home_dir + 1)
+  end
+  return string.format(DOWNLOAD_NOTES[kind], name, info, dir .. '/')
+end
+
+-- Every status file is taken and the list saved before the first toast:
+-- finding the window yields, and other windows poll in the meantime
+local function poll_downloads(window)
+  local left, finished = {}, {}
+  for _, d in ipairs(downloads()) do
+    local f = io.open(d.status)
+    if f then
+      local kind, dest, info = f:read('a'):match '^([^\n]*)\n([^\n]*)\n([^\n]*)'
+      f:close()
+      os.remove(d.status)
+      table.insert(finished, { d = d, note = download_note(d, kind, dest, info) })
+    else
+      table.insert(left, d)
+    end
+  end
+  set_downloads(left)
+  for _, r in ipairs(finished) do
+    -- It raises for a window closed since the click
+    local ok, target = pcall(wezterm.gui.gui_window_for_mux_window, r.d.window)
+    toast(ok and target or window, r.note, 8000)
+  end
+end
+
+wezterm.on('update-status', function(window)
+  if wezterm.GLOBAL[DOWNLOADS_KEY] then poll_downloads(window) end
+end)
+end -- copies from the pane's host
 
 -- Localhost links and ssh -L tunnel commands. A server on a remote host
 -- (Jupyter, TensorBoard, vite, ...) prints http://localhost:PORT/..., often
