@@ -51,7 +51,8 @@ fetches them from `yazi/package.toml`. The one custom plugin,
 | CMD+click an `ssh ... -L LPORT:HOST:RPORT ... host` command | Add those forwards to the existing ControlMaster for that host instead of running it, then open the latest localhost URL for that port from the scrollback (token filled in) or `http://localhost:LPORT/` (never a new login; config aliases are matched, so `me@login.example.org` finds the master opened as `myserver`) |
 | CMD+click `http://localhost:LPORT/...` after such a hint | Uses the most recent `ssh -L LPORT:...` in the scrollback (works from local panes too), so a server on a compute node behind a login host opens directly. A stale forward of ours on LPORT is replaced; an old hand-started tunnel is left running and named by pid. `?token=<token>` is filled from the last `cat .../token` shown in this pane, else in the window's other panes, else the token file that last worked for that host and remote port (path remembered in `~/.local/state/wezterm/token-paths`, mode 600; never the token), read over the master and never logged |
 | CMD+SHIFT+L | Same without a click: a port, a localhost URL or a whole `ssh -L` command |
-| CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
+| CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. CTRL+V pastes only in ssh panes; in local panes the raw key goes through, for Claude Code's image paste. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
+| Right-click a path in an ssh pane | Download the file or folder to `~/Downloads/<host>/` in the background over the ControlMaster (tar, so the remote only needs ssh and tar; never logs in, toasts if there is no live master), then reveal it in Finder. Toasts at start and end, with the size. A different item of the same name is kept and the new one numbered (`name (1).ext`); an identical one is reused. Unbound elsewhere. An app that grabs the mouse still gets the press but not the release |
 | CMD+W / CTRL+SHIFT+W | Close the pane. WezTerm's own confirm, shown over that pane only: y closes, n or Esc cancels (Enter does nothing). Skipped when the pane only runs an idle shell (bash, zsh, sh, fish, nu; tmux still asks) |
 | CMD+[ / CMD+] | Previous / next pane |
 | CMD+OPT+arrows | Focus pane in that direction |
@@ -193,7 +194,8 @@ Make sure `~/.local/bin` is on your `PATH`. For the status line, point
 
 ```sh
 ssh-setup <host>   # set up or update one host
-ssh-setup --all    # update every host set up before
+ssh-setup --all    # update every known host with a live connection
+ssh-setup --all --dry-run   # only print what --all would do
 ```
 
 Installs yazi, ya, micro, glow and resvg (static release binaries matching your local
@@ -201,13 +203,19 @@ versions, checksum-verified), your yazi/micro configs and the status line into
 your home directory on a remote Linux host (x86_64 or aarch64). No sudo. It
 adds one marked block to the remote `~/.bashrc` (PATH, `EDITOR=micro`, `y`,
 and an OSC 7 prompt hook so WezTerm knows the remote cwd; inside tmux it uses
-passthrough when `allow-passthrough` is on), replaced in place on updates,
+passthrough when `allow-passthrough` is on) and one to `~/.tmux.conf`
+(`set-clipboard on`, `allow-passthrough on`, read by new tmux servers only; a
+running one keeps its options until it restarts), replaced in place on updates,
 backs up anything it replaces to `*.bak-ssh-setup`, and prints undo commands.
-Re-running is a fast no-op when nothing changed.
+Re-running is a fast no-op when nothing changed. Remote micro gets
+`"clipboard": "terminal"`, so its copy reaches this Mac over OSC 52 like Yazi's
+(WezTerm honors setting the clipboard, and ignores requests to read it).
 
 Each host set up successfully is listed in `~/.local/state/ssh-setup/hosts`.
-`ssh-setup --all` re-syncs those hosts in parallel and prints one line per
-host. It only touches hosts with a live ControlMaster (`ssh -O check`) and
+`ssh-setup --all` re-syncs those hosts, plus any other host in `~/.ssh/config`
+(and its Includes) that has a live connection, in parallel, and prints one
+line per host (updated, skipped or FAILED) and the totals. It only touches
+hosts with a live ControlMaster (`ssh -O check`) and
 rides that connection only (a dead master makes the run fail instead of
 logging in), so a host behind 2FA is skipped with `not connected (open an ssh
 pane to it first)` rather than prompted.
