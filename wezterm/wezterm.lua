@@ -1586,7 +1586,10 @@ wezterm.on('open-uri', function(window, pane, uri)
   local mode, clicked = (wezterm.GLOBAL[LINK_MODE_KEY] or ''):match '^(%a+) (%d+)$'
   wezterm.GLOBAL[LINK_MODE_KEY] = nil
   if not clicked or os.time() - tonumber(clicked) > 2 then mode = nil end
-  local reveal, look = mode == 'reveal', mode == 'look'
+  local reveal, look, download = mode == 'reveal', mode == 'look', mode == 'download'
+  -- Right-click is for paths in ssh panes only: nothing happens on web links
+  -- and `ssh -L` commands, like before it was bound
+  if download and not (pane_ssh_args(pane) and uri_to_path(uri)) then return false end
   if uri:sub(1, #SSH_FORWARD_SCHEME) == SSH_FORWARD_SCHEME then
     forward_command(window, pane, uri:sub(#SSH_FORWARD_SCHEME + 1))
     return false
@@ -1617,7 +1620,9 @@ wezterm.on('open-uri', function(window, pane, uri)
       toast(window, path)
       return false
     end
-    if reveal or (kind == 'f' and is_media(path)) then
+    if download then
+      download_remote(window, ssh, path)
+    elseif reveal or (kind == 'f' and is_media(path)) then
       reveal_remote(window, ssh, kind, path)
     elseif kind == 'f' and look then
       quicklook_remote(window, ssh, path)
@@ -3057,6 +3062,26 @@ for _, reporting in ipairs { false, true } do
       action = open_link(mode),
     })
   end
+  -- Right-click on a path in an ssh pane downloads it (see download_remote);
+  -- right-click was unbound before, so elsewhere it stays a no-op. Lua can't
+  -- hand a mouse event back to the app, so only Up is bound: an app that
+  -- grabs the mouse (mouse_reporting) still gets the press, in every pane,
+  -- but not the release. A press with no link under it leaves the mode unused:
+  -- drop it, or the next plain click on a link within 2s would download.
+  table.insert(config.mouse_bindings, {
+    event = { Up = { streak = 1, button = 'Right' } },
+    mods = 'NONE',
+    mouse_reporting = reporting,
+    action = wezterm.action_callback(function(window, pane)
+      if not pane_ssh_args(pane) then return end
+      local stamp = 'download ' .. os.time()
+      wezterm.GLOBAL[LINK_MODE_KEY] = stamp
+      window:perform_action(act.OpenLinkAtMouseCursor, pane)
+      wezterm.time.call_after(0.5, function()
+        if wezterm.GLOBAL[LINK_MODE_KEY] == stamp then wezterm.GLOBAL[LINK_MODE_KEY] = nil end
+      end)
+    end),
+  })
 end
 
 return config
