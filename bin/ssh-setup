@@ -16,7 +16,9 @@
 #                              publishes no Linux aarch64 binary)
 #   ~/.config/yazi/            (local config, as is)
 #   ~/.config/glow/catppuccin.json (glamour style for the Markdown renderers)
-#   ~/.config/micro/settings.json ~/.config/glow/catppuccin.json
+#   ~/.config/micro/settings.json (local one, with "clipboard": "terminal" so
+#                              remote copy reaches this Mac via OSC 52)
+#   ~/.config/glow/catppuccin.json
 #   ~/.claude/statusline.sh    (only this from ~/.claude; nothing else is copied)
 #   ~/.claude/settings.json    (only the "statusLine" key is set; others untouched)
 #   ~/.local/bin/jq            (only if the remote has no usable system jq)
@@ -220,7 +222,11 @@ stage_configs() {
 		# -L: custom plugins may be symlinks into a dotfiles checkout
 		[ -d "$src/$f" ] && cp -RL "$src/$f" "$dst/$f"
 	done
-	[ -f "$HOME/.config/micro/settings.json" ] && cp "$HOME/.config/micro/settings.json" "$STAGE/.config/micro/"
+	# OSC 52: remote micro reaches this Mac's clipboard through WezTerm, with no
+	# xclip or X server on the host. Pasting there comes from WezTerm too.
+	if [ -f "$HOME/.config/micro/settings.json" ]; then
+		jq '.clipboard = "terminal"' "$HOME/.config/micro/settings.json" >"$STAGE/.config/micro/settings.json"
+	fi
 	# Claude Code status line: the script only (never anything else from ~/.claude)
 	[ -f "$HOME/.claude/statusline.sh" ] || die "no local ~/.claude/statusline.sh"
 	mkdir -p "$STAGE/.claude"
