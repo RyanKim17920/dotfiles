@@ -24,6 +24,9 @@
 #   ~/.bashrc                  (one block between the ssh-setup markers: PATH,
 #                              EDITOR, y(), and an OSC 7 prompt hook so WezTerm
 #                              here knows the remote cwd; replaced on update)
+#   ~/.tmux.conf               (one block between the same markers: lets programs
+#                              set this Mac's clipboard with OSC 52 and use
+#                              passthrough; read by NEW tmux servers only)
 # Pre-existing ~/.config/{yazi,micro}, binaries, ~/.claude/statusline.sh and
 # ~/.claude/settings.json are backed up once to *.bak-ssh-setup before the
 # first install that touches them.
@@ -31,7 +34,7 @@
 # ~/.local/state/ssh-setup/hosts (what --all re-syncs).
 set -euo pipefail
 
-FORMAT=3   # bump when the remote layout or bashrc block changes
+FORMAT=4   # bump when the remote layout or bashrc block changes
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ssh-setup"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # --all: ride the live ControlMaster only. If the master is gone, the direct
@@ -306,10 +309,19 @@ BASHRC_BLOCK="$MARK_BEGIN (added by ssh-setup; delete this block to undo)
 $BASHRC_BODY
 $MARK_END"
 
+# The ~/.tmux.conf block: programs inside tmux set this Mac's clipboard with
+# OSC 52, and the bashrc hook's OSC 7 and yazi's image previews pass through.
+# -q: tmux older than 3.3 has no allow-passthrough. Only new servers read this;
+# running ones are left alone.
+TMUX_BLOCK="$MARK_BEGIN (added by ssh-setup; delete this block to undo)
+set -g set-clipboard on
+set -gq allow-passthrough on
+$MARK_END"
+
 STAMP="$(
 	{
 		printf 'format=%s arch=%s yazi=%s micro=%s glow=%s ship_jq=%s resvg=%s\n' "$FORMAT" "$ARCH" "$yazi_v" "$micro_v" "$glow_v" "$SHIP_JQ" "$([ "$SHIP_RESVG" = yes ] && echo "${resvg_v:-latest}" || echo none)"
-		printf '%s\n' "$BASHRC_BLOCK" "$STATUSLINE_JSON"
+		printf '%s\n' "$BASHRC_BLOCK" "$TMUX_BLOCK" "$STATUSLINE_JSON"
 		(cd "$STAGE" && find .config .claude .local/bin/glow-cached .local/bin/mdview .local/bin/mdedit .local/bin/mdpreview -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
 	} | shasum -a 256 | awk '{ print $1 }'
 )"
@@ -321,7 +333,7 @@ summary_tail() {
   undo on $HOST:
     rm -f ~/.local/bin/{yazi,ya,micro,glow,glow-cached,mdview,mdedit,mdpreview,resvg} ~/.config/micro/settings.json ~/.config/glow/catppuccin.json
     rm -rf ~/.config/yazi ~/.local/share/ssh-setup
-    sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc; rm -f ~/.bashrc.bak-ssh-setup-prev
+    sed -i '/^$MARK_BEGIN/,/^$MARK_END/d' ~/.bashrc ~/.tmux.conf; rm -f ~/.bashrc.bak-ssh-setup-prev ~/.tmux.conf.bak-ssh-setup-prev
     rm -f ~/.claude/statusline.sh$([ "$SHIP_JQ" = yes ] && echo ' ~/.local/bin/jq')
     $([ "$SHIP_JQ" = yes ] && echo '~/.local/bin/jq' || echo jq) 'del(.statusLine)' ~/.claude/settings.json > ~/.claude/s.tmp && mv ~/.claude/s.tmp ~/.claude/settings.json
     # or restore ~/.claude/{settings.json,statusline.sh}.bak-ssh-setup if present
@@ -417,6 +429,7 @@ if [ "$SHIP_JQ" = yes ]; then
 fi
 printf '%s\n' "$STAMP" >"$STAGE/.local/share/ssh-setup/stamp"
 printf '%s\n' "$BASHRC_BLOCK" >"$STAGE/.local/share/ssh-setup/bashrc-block"
+printf '%s\n' "$TMUX_BLOCK" >"$STAGE/.local/share/ssh-setup/tmux-block"
 
 # --- 4. one tar stream; remote backs up, extracts, writes the bashrc block --
 REMOTE_SCRIPT='set -e
@@ -479,27 +492,31 @@ else
 	echo "WARNING: no jq or python3 on remote; ~/$S statusLine NOT set"
 fi
 touch .local/share/ssh-setup/statusline-installed
-touch .bashrc
-B=.local/share/ssh-setup/bashrc-block
-if ! grep -qF "$MARK_BEGIN" .bashrc; then
-	{ [ -s .bashrc ] && [ -n "$(tail -c1 .bashrc)" ] && echo; echo; cat "$B"; } >> .bashrc
-	echo "bashrc: block appended"
-elif [ "$(grep -cF "$MARK_BEGIN" .bashrc)" != 1 ] || [ "$(grep -cxF "$MARK_END" .bashrc)" != 1 ] \
-	|| [ "$(grep -nF "$MARK_BEGIN" .bashrc | cut -d: -f1)" -gt "$(grep -nxF "$MARK_END" .bashrc | cut -d: -f1)" ]; then
-	echo "WARNING: ~/.bashrc ssh-setup markers are damaged; block left unchanged"
-else
-	# replace the block in place (cat > keeps a symlinked .bashrc and its mode)
-	awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v f="$B" '\''
-		index($0, b) == 1 { while ((getline l < f) > 0) print l; skip = 1; next }
-		skip && $0 == e { skip = 0; next }
-		!skip'\'' .bashrc > .bashrc.tmp-ssh-setup
-	if cmp -s .bashrc.tmp-ssh-setup .bashrc; then
-		echo "bashrc: block already current"
+# put_block <file> <block file> <name>: add the marked block, or replace it
+put_block() {
+	touch "$1"
+	if ! grep -qF "$MARK_BEGIN" "$1"; then
+		{ [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ] && echo; echo; cat "$2"; } >> "$1"
+		echo "$3: block appended"
+	elif [ "$(grep -cF "$MARK_BEGIN" "$1")" != 1 ] || [ "$(grep -cxF "$MARK_END" "$1")" != 1 ] \
+		|| [ "$(grep -nF "$MARK_BEGIN" "$1" | cut -d: -f1)" -gt "$(grep -nxF "$MARK_END" "$1" | cut -d: -f1)" ]; then
+		echo "WARNING: ~/$1 ssh-setup markers are damaged; block left unchanged"
 	else
-		cp -p .bashrc .bashrc.bak-ssh-setup-prev && cat .bashrc.tmp-ssh-setup > .bashrc && echo "bashrc: block updated (previous ~/.bashrc in ~/.bashrc.bak-ssh-setup-prev)"
+		# replace the block in place (cat > keeps a symlinked file and its mode)
+		awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v f="$2" '\''
+			index($0, b) == 1 { while ((getline l < f) > 0) print l; skip = 1; next }
+			skip && $0 == e { skip = 0; next }
+			!skip'\'' "$1" > "$1.tmp-ssh-setup"
+		if cmp -s "$1.tmp-ssh-setup" "$1"; then
+			echo "$3: block already current"
+		else
+			cp -p "$1" "$1.bak-ssh-setup-prev" && cat "$1.tmp-ssh-setup" > "$1" && echo "$3: block updated (previous ~/$1 in ~/$1.bak-ssh-setup-prev)"
+		fi
+		rm -f "$1.tmp-ssh-setup"
 	fi
-	rm -f .bashrc.tmp-ssh-setup
-fi
+}
+put_block .bashrc .local/share/ssh-setup/bashrc-block bashrc
+put_block .tmux.conf .local/share/ssh-setup/tmux-block tmux
 echo "installed: yazi $(.local/bin/yazi --version 2>&1 | awk "/Version:/{print \$2; exit}"), micro $(.local/bin/micro --version 2>&1 | awk "/Version:/{print \$2; exit}"), glow $(.local/bin/glow --version 2>&1 | awk "{print \$3; exit}"), resvg $(.local/bin/resvg --version 2>/dev/null || echo none), statusline (jq: $(${JQ:-false} --version 2>/dev/null || echo none))"'
 
 REMOTE_SCRIPT="JQ_SYS=$(sq "$jq_sys") SHIP_JQ=$SHIP_JQ MARK_BEGIN=$(sq "$MARK_BEGIN") MARK_END=$(sq "$MARK_END")
