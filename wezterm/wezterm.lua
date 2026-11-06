@@ -1615,7 +1615,8 @@ local function smart_split(direction)
 end
 
 -- Unified copy/paste (VS Code terminal style): CMD+C, CMD+SHIFT+C,
--- CTRL+SHIFT+C and CTRL+C all run smart_copy; the V variants run smart_paste.
+-- CTRL+SHIFT+C and CTRL+C all run smart_copy; the V variants run smart_paste,
+-- except that CTRL+V only does in ssh panes (see the key table).
 local CLIPIMG = wezterm.home_dir .. '/.local/bin/clipimg-push'
 
 -- Copy the selection (and clear it) if there is one. Otherwise CTRL+C passes
@@ -2806,7 +2807,10 @@ config.keys = {
   { key = 'v', mods = 'CMD', action = smart_paste },
   { key = 'v', mods = 'CMD|SHIFT', action = smart_paste },
   { key = 'v', mods = 'CTRL|SHIFT', action = smart_paste },
-  { key = 'v', mods = 'CTRL', action = smart_paste },
+  -- Local panes keep the raw key: local Claude Code pastes images on it
+  { key = 'v', mods = 'CTRL', action = wezterm.action_callback(function(window, pane)
+    window:perform_action(pane_ssh_args(pane) and smart_paste or act.SendKey { key = 'v', mods = 'CTRL' }, pane)
+  end) },
 
   -- Toggle the Yazi file sidebar for this tab
   { key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle_sidebar) },
