@@ -143,6 +143,12 @@ esac
 HOST="$1"
 reason="$(blocked_reason "$HOST")"
 [ -z "$reason" ] || die "refusing to target $HOST ($reason)"
+# ProxyCommand=false above changes the %C socket name of a ProxyJump host (%C
+# hashes the jump host), so name the socket the live master listens on
+if [ -n "${SSH_SETUP_MUX_ONLY:-}" ]; then
+	cp="$(ssh -G "$HOST" 2>/dev/null | awk '$1 == "controlpath" { print $2; exit }')"
+	if [ -n "$cp" ] && [ "$cp" != none ]; then SSH_OPTS+=(-S "$cp"); fi
+fi
 
 for c in curl jq shasum unzip bsdtar ssh awk; do
 	command -v "$c" >/dev/null || die "missing local dependency: $c"
