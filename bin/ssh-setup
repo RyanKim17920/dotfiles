@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ssh-setup <host>
-# ssh-setup --all      (re-sync every host set up before; see run_all)
+# ssh-setup --all [--dry-run]
+#                      (re-sync every host set up before and any other host in
+#                      ~/.ssh/config with a live connection; see run_all)
 #
 # Install yazi (+ ya), micro, glow and resvg plus this Mac's yazi/micro configs and
 # Claude Code status line into YOUR OWN home directory on a remote Linux host. No sudo, nothing system-wide.
@@ -33,7 +35,8 @@
 # ~/.claude/settings.json are backed up once to *.bak-ssh-setup before the
 # first install that touches them.
 # Local state: hosts set up successfully are listed one per line in
-# ~/.local/state/ssh-setup/hosts (what --all re-syncs).
+# ~/.local/state/ssh-setup/hosts (what --all re-syncs, along with hosts it finds
+# connected).
 set -euo pipefail
 
 FORMAT=4   # bump when the remote layout or bashrc block changes
@@ -59,9 +62,13 @@ warn() { printf 'ssh-setup: warning: %s\n' "$*" >&2; }
 usage() {
 	cat <<EOF
 usage: ssh-setup <host>   set up or update one host
-       ssh-setup --all    update every host set up before, in parallel; hosts
-                          without a live ssh connection (ControlMaster) are
-                          skipped, never logged in to
+       ssh-setup --all    update, in parallel, every host set up before and any
+                          other host in ~/.ssh/config (and its Includes) with a
+                          live ssh connection (ControlMaster). Hosts without one
+                          are skipped, never logged in to
+       ssh-setup --all --dry-run
+                          only print what --all would do; no host is contacted
+                          beyond asking the local ControlMaster socket
 Installs yazi, ya, micro, glow, your yazi/micro configs and your Claude Code
 status line (~/.claude/statusline.sh + the settings.json statusLine key) into ~ on <host>.
 EOF
@@ -88,25 +95,78 @@ record_host() {
 	grep -qxF -- "$1" "$HOSTS_FILE" || printf '%s\n' "$1" >>"$HOSTS_FILE"
 }
 
-# --all: re-run this script for every recorded host whose ControlMaster is
-# live (ssh -O check only asks the local master socket; it never connects),
-# in parallel, then print one summary line per host.
+# user@hostname:port as ssh resolves it (ssh -G never connects): aliases of one
+# machine compare equal
+host_id() { ssh -G "$1" 2>/dev/null | awk '$1 == "user" { u = $2 } $1 == "hostname" { h = $2 } $1 == "port" { p = $2 } END { print u "@" h ":" p }'; }
+
+# Concrete Host aliases (no patterns or negations) in an ssh config file and
+# the files it Includes, one per line ($2: the files including it, to stop on
+# a cycle). A subshell for set -f: these words must not expand against the
+# current directory.
+config_hosts() (
+	local f="$1" chain="${2:-}" line key rest w inc
+	local -a words incs
+	[ -f "$f" ] && [ -r "$f" ] || exit 0
+	case "$chain" in *"|$f|"*) exit 0 ;; esac
+	set -f
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line%%#*}"
+		read -r key rest <<<"${line/=/ }"
+		rest="${rest//\"/}"
+		words=($rest)
+		case "$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" in
+			host)
+				for w in ${words[@]+"${words[@]}"}; do
+					case "$w" in *[\*\?!]*) ;; *) printf '%s\n' "$w" ;; esac
+				done ;;
+			include)
+				for w in ${words[@]+"${words[@]}"}; do
+					case "$w" in
+						"~/"*) w="$HOME/${w#\~/}" ;;
+						/*) ;;
+						*) w="$HOME/.ssh/$w" ;;
+					esac
+					set +f; incs=($w); set -f
+					for inc in "${incs[@]}"; do config_hosts "$inc" "$chain|$f|"; done
+				done ;;
+		esac
+	done <"$f"
+)
+
+# --all: re-run this script for every recorded host and every other config
+# host whose ControlMaster is live (ssh -O check only asks the local master
+# socket; it never connects), in parallel, then print one summary line per
+# host. With DRY_RUN set, stop short of running anything.
 run_all() {
-	[ -s "$HOSTS_FILE" ] || die "no hosts recorded yet in $HOSTS_FILE; run 'ssh-setup <host>' once per host"
-	local tmp h i=0 n reason rc log t pids=() hosts=() failed=0
+	local tmp h i=0 n reason rc log t id pids=() hosts=() failed=0 updated=0 skipped=0 idle=0 seen=' '
 	tmp="$(mktemp -d "${TMPDIR:-/tmp}/ssh-setup-all.XXXXXX")"
-	while IFS= read -r h || [ -n "$h" ]; do
-		h="${h%%#*}"; h="${h//[[:space:]]/}"
-		[ -n "$h" ] && hosts+=("$h")
-	done <"$HOSTS_FILE"
-	[ ${#hosts[@]} -gt 0 ] || die "no hosts recorded in $HOSTS_FILE"
+	if [ -f "$HOSTS_FILE" ]; then
+		while IFS= read -r h || [ -n "$h" ]; do
+			h="${h%%#*}"; h="${h//[[:space:]]/}"
+			[ -n "$h" ] || continue
+			hosts+=("$h")
+			if ssh -O check "$h" >/dev/null 2>&1 </dev/null; then seen+="$(host_id "$h") "; fi
+		done <"$HOSTS_FILE"
+	fi
+	while IFS= read -r h; do
+		id="$(host_id "$h")"
+		case "$seen" in *" $id "*) continue ;; esac
+		if ssh -O check "$h" >/dev/null 2>&1 </dev/null; then
+			hosts+=("$h"); seen+="$id "
+		else
+			idle=$((idle + 1))
+		fi
+	done < <(config_hosts "$HOME/.ssh/config" | awk '!seen[$0]++')
+	[ ${#hosts[@]} -gt 0 ] || die "nothing to do: no hosts recorded in $HOSTS_FILE and none connected; run 'ssh-setup <host>' or open an ssh pane first"
 	echo "ssh-setup --all: ${hosts[*]}"
 	for h in "${hosts[@]}"; do
 		reason="$(blocked_reason "$h")"
 		if [ -n "$reason" ]; then
-			echo "skipped $h: $reason" >"$tmp/$i.sum"; pids+=("")
+			echo "skipped  $h: $reason" >"$tmp/$i.sum"; pids+=("")
 		elif ! ssh -O check "$h" >/dev/null 2>&1; then
-			echo "skipped $h: not connected (open an ssh pane to it first)" >"$tmp/$i.sum"; pids+=("")
+			echo "skipped  $h: not connected (open an ssh pane to it first)" >"$tmp/$i.sum"; pids+=("")
+		elif [ -n "${DRY_RUN:-}" ]; then
+			echo "would update  $h" >"$tmp/$i.sum"; pids+=("")
 		else
 			SSH_SETUP_MUX_ONLY=1 "$BASH" "$0" "$h" >"$tmp/$i.log" 2>&1 &
 			pids+=("$!")
@@ -116,27 +176,39 @@ run_all() {
 	n=$i
 	for ((i = 0; i < n; i++)); do
 		h="${hosts[$i]}"
-		if [ -z "${pids[$i]}" ]; then cat "$tmp/$i.sum"; continue; fi
+		if [ -z "${pids[$i]}" ]; then
+			cat "$tmp/$i.sum"
+			case "$(cat "$tmp/$i.sum")" in skipped*) skipped=$((skipped + 1)) ;; *) updated=$((updated + 1)) ;; esac
+			continue
+		fi
 		rc=0; wait "${pids[$i]}" || rc=$?
 		log="$tmp/$i.log"
 		t="$(grep -o '\[[0-9]*s\]' "$log" | tail -1 || true)"
 		if [ $rc -ne 0 ]; then
-			failed=1
-			echo "FAILED  $h (exit $rc): $({ grep '^ssh-setup:' "$log" || tail -1 "$log"; } | tail -1 | sed 's/^ssh-setup: //')"
-			echo "        log: $log"
+			failed=$((failed + 1))
+			echo "FAILED   $h (exit $rc): $({ grep '^ssh-setup:' "$log" || tail -1 "$log"; } | tail -1 | sed 's/^ssh-setup: //')"
+			echo "         log: $log"
 		elif grep -q 'already up to date' "$log"; then
-			echo "ok      $h: already up to date $t"
+			updated=$((updated + 1))
+			echo "updated  $h: already up to date $t"
 		else
-			echo "ok      $h: updated $t$(grep -q 'bashrc: block updated' "$log" && echo ' (bashrc block updated)')"
+			updated=$((updated + 1))
+			echo "updated  $h $t$(grep -q 'bashrc: block updated' "$log" && echo ' (bashrc block updated)')"
 		fi
 	done
-	[ $failed -eq 0 ] && rm -rf "$tmp"
-	return $failed
+	echo "$updated $([ -n "${DRY_RUN:-}" ] && echo 'to update' || echo updated), $skipped skipped, $failed failed$([ $idle -gt 0 ] && echo "; $idle other config hosts not connected")"
+	if [ $failed -eq 0 ]; then rm -rf "$tmp"; return 0; fi
+	return 1
 }
 
 case "${1:-}" in
 	-h|--help) usage; exit 0 ;;
-	--all) [ $# -eq 1 ] || { usage >&2; exit 2; }; run_all; exit ;;
+	--all|--dry-run)
+		case "$*" in
+			--all) run_all; exit ;;
+			'--all --dry-run'|'--dry-run --all') DRY_RUN=1 run_all; exit ;;
+		esac
+		usage >&2; exit 2 ;;
 	''|-*) usage >&2; exit 2 ;;
 esac
 [ $# -eq 1 ] || { usage >&2; exit 2; }
