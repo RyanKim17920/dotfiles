@@ -61,8 +61,9 @@ local function mux_pane(id)
 end
 
 -- Peek state per tab (see replace_peek): 'origin|peek|zoomed' = the pane
--- that was clicked, the Yazi pane covering the tab, and whether the tab was
--- zoomed on the origin before. wezterm.GLOBAL survives config reloads.
+-- that was clicked, the Yazi pane (split to its right, or alone in a new tab)
+-- and whether to zoom the origin again once it closes. wezterm.GLOBAL
+-- survives config reloads.
 local PEEK_KEY = 'peek_for_tab_' -- .. tab id
 
 local function peek_record(tab)
@@ -76,11 +77,13 @@ local function set_peek_record(tab, rec) -- nil forgets the peek
     and string.format('%d|%d|%d', rec.origin, rec.peek, rec.zoomed and 1 or 0) or nil
 end
 
--- True while a live peek pane covers `tab`: layout surgery (unzoom, rebuild,
--- pane moves) would uncover or destroy it
+-- True while a live peek pane is split into `tab`: layout surgery (rebuild,
+-- pane moves, the sidebar) would destroy it. A peek in its own tab is not.
 local function peek_open(tab)
   local rec = peek_record(tab)
-  return rec ~= nil and mux_pane(rec.peek) ~= nil
+  local peek = rec and mux_pane(rec.peek)
+  local peek_tab = peek and peek:tab()
+  return peek_tab ~= nil and peek_tab:tab_id() == tab:tab_id()
 end
 
 -- WezTerm 20240203 takes a `split-pane --move-pane-id` pane out of its tab
@@ -402,12 +405,13 @@ end
 
 -- Clickable file paths: CMD+click on a path such as ~/.ssh/config,
 -- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
--- Yazi "peek" inside the current tab, covering it, with the file hovered and
--- the preview maximized (YAZI_PEEK, see ~/.config/yazi/init.lua), or the
--- directory opened. Images and PDFs too (Yazi previews them). q quits Yazi
--- and you are back in the pane you clicked, layout untouched (see
--- replace_peek). CMD+OPT+SHIFT+click Quick Looks a file instead, and in an
--- ssh pane right-click downloads the file or folder (see download_remote).
+-- Yazi "peek" on the right half of the clicked pane (or in a new tab when it
+-- is narrow), with the file hovered and the preview maximized (YAZI_PEEK, see
+-- ~/.config/yazi/init.lua), or the directory opened. Images and PDFs too
+-- (Yazi previews them). q quits Yazi and you are back in the pane you
+-- clicked (see replace_peek). CMD+OPT+SHIFT+click Quick Looks a file instead,
+-- and in an ssh pane right-click downloads the file or folder (see
+-- download_remote).
 -- OSC 8 file:// links (ls --hyperlink) are handled the same way; web URLs are
 -- untouched.
 local PEEK_SCHEME = 'yazi-open-path:'
@@ -488,54 +492,81 @@ local function resolve_path(text, cwd)
   return nil
 end
 
--- Cells the peek pane takes from the clicked pane before it is zoomed
-local PEEK_CELLS = 2
+-- Narrowest clicked pane (columns) whose right half is still a useful peek;
+-- a narrower one gets the peek in a new tab instead
+local PEEK_MIN_COLS = 80
 
--- Back to the pane the peek was opened from, tab zoomed as it was
+-- Back to the pane the peek was opened from (and its tab), zoomed again if
+-- it was before
 local function show_origin(tab, origin, zoomed)
   origin:activate()
-  tab:set_zoomed(zoomed)
+  if zoomed then tab:set_zoomed(true) end
 end
 
--- Open a peek (`spec`: cwd, args, env) for the clicked `pane`: a tiny split
--- of that pane (never top_level, see repair_layout), zoomed over the whole
--- tab. When Yazi quits the pane closes, WezTerm unzooms and gives the cells
--- back, and restore_peeks re-activates `pane`. One peek per tab: a click
--- while one is open replaces it.
+-- Open a peek (`spec`: cwd, args, env) for the clicked `pane`: the right half
+-- of that pane (a split of the pane itself, never top_level, see
+-- repair_layout), focused. A pane under PEEK_MIN_COLS, or one that can't take
+-- the split (split_fits), gets the peek in a new tab right after its own
+-- instead. When Yazi quits the pane (or tab) closes and restore_peeks
+-- re-activates `pane`. One peek per tab: a click while one is open opens the
+-- new one in its place.
 local function replace_peek(window, pane, spec)
   local tab = pane:tab()
   local origin, zoomed = pane, select(4, tab_geometry(tab))
   local rec = peek_record(tab)
+  local old = rec and mux_pane(rec.peek)
   if rec then
     zoomed = rec.zoomed
-    local old = mux_pane(rec.peek)
-    if old and old:pane_id() == pane:pane_id() then origin = mux_pane(rec.origin) end
-    if old then cli('kill-pane', '--pane-id', tostring(rec.peek)) end
+    if old and old:pane_id() == pane:pane_id() then origin = mux_pane(rec.origin) or pane end
     set_peek_record(tab, nil)
-    origin = origin or tab:active_pane()
   end
-  tab:set_zoomed(false) -- a zoomed tab refuses splits
   spec.domain = 'DefaultDomain' -- local Yazi, even when the clicked pane is in a mux domain
-  spec.size = PEEK_CELLS
-  local ok, peek
-  for _, direction in ipairs { 'Bottom', 'Right' } do
-    spec.direction = direction
-    ok, peek = pcall(origin.split, origin, spec)
-    if ok then break end
+  -- An open peek is split and then closed, so the new one takes over its
+  -- cells: closing it first would not help, as 20240203 hands its cells back
+  -- only after this handler returns
+  local target = old
+  if not old then
+    tab:set_zoomed(false) -- a zoomed tab refuses splits and hides geometry
+    if origin:get_dimensions().cols >= PEEK_MIN_COLS and split_fits(origin:pane_id(), '--right', 50) then
+      target = origin
+    end
   end
-  if not ok then
+  local ok, peek = false, nil
+  if target then
+    target:tab():set_zoomed(false)
+    spec.direction, spec.size = 'Right', 0.5
+    ok, peek = pcall(target.split, target, spec)
+    spec.direction, spec.size = nil, nil
+  end
+  if old then cli('kill-pane', '--pane-id', tostring(old:pane_id())) end
+  if ok then
+    peek:activate()
+  else
     show_origin(tab, origin, zoomed)
-    toast(window, 'Peek: no room to split this pane')
-    return
+    zoomed = false -- the origin tab keeps its zoom while the peek tab is open
+    local mux_window = window:mux_window()
+    local index = 0 -- 0-based position of the origin tab
+    for i, t in ipairs(mux_window:tabs()) do
+      if t:tab_id() == tab:tab_id() then index = i - 1 end
+    end
+    local peek_tab
+    ok, peek_tab, peek = pcall(mux_window.spawn_tab, mux_window, spec)
+    if not ok then
+      toast(window, 'Peek: could not open a tab: ' .. tostring(peek_tab))
+      return
+    end
+    peek_tab:activate()
+    if index + 1 < #mux_window:tabs() - 1 then
+      -- MoveTab moves the active tab; perform_action waits for it to finish
+      window:perform_action(act.MoveTab(index + 1), peek)
+    end
   end
-  peek:activate()
-  tab:set_zoomed(true)
   set_peek_record(tab, { origin = origin:pane_id(), peek = peek:pane_id(), zoomed = zoomed })
 end
 
--- A peek pane has closed (Yazi quit): activate the pane it came from again
--- and re-zoom it if the tab was zoomed there. WezTerm has no pane-exit
--- event, so update-status (every status_update_interval) notices.
+-- A peek pane has closed (Yazi quit): activate the pane (and tab) it came
+-- from again and re-zoom it if the tab was zoomed there. WezTerm has no
+-- pane-exit event, so update-status (every status_update_interval) notices.
 local function restore_peeks(mux_window)
   for _, tab in ipairs(mux_window:tabs()) do
     local rec = peek_record(tab)
@@ -2531,9 +2562,9 @@ end
 
 -- Capture ---------------------------------------------------------------------
 
--- Pane geometry stays hidden while a tab is zoomed or peeked, so the last
--- unzoomed layout is remembered per tab (one JSON string in wezterm.GLOBAL,
--- rebuilt each capture so closed tabs drop out).
+-- Pane geometry is hidden while a tab is zoomed and skewed while a peek is
+-- split in, so the last clean layout is remembered per tab (one JSON string in
+-- wezterm.GLOBAL, rebuilt each capture so closed tabs drop out).
 local function capture_tab(tab, geoms_in, geoms_out)
   local tab_id = tostring(tab:tab_id())
   local sidebar_id = wezterm.GLOBAL[SIDEBAR_KEY .. tab:tab_id()]
@@ -2590,11 +2621,23 @@ local function capture_session()
   end
   local all = wezterm.mux.all_windows()
   table.sort(all, function(a, b) return a:window_id() < b:window_id() end)
+  -- Peeks in a tab of their own (see replace_peek) are not saved; peek tab id
+  -- -> the tab it was opened from
+  local peek_tabs = {}
+  for _, mw in ipairs(all) do
+    for _, tab in ipairs(mw:tabs()) do
+      local rec = not peek_open(tab) and peek_record(tab)
+      local peek = rec and mux_pane(rec.peek)
+      local peek_tab = peek and peek:tab()
+      if peek_tab and #peek_tab:panes() == 1 then peek_tabs[peek_tab:tab_id()] = tab end
+    end
+  end
   for _, mw in ipairs(all) do
     local tabs, active = {}, mw:active_tab()
+    if active and peek_tabs[active:tab_id()] then active = peek_tabs[active:tab_id()] end
     local wrec = { title = mw:get_title(), workspace = mw:get_workspace(), focused = focused[mw:window_id()] }
     for _, tab in ipairs(mw:tabs()) do
-      table.insert(tabs, capture_tab(tab, geoms_in, geoms_out))
+      if not peek_tabs[tab:tab_id()] then table.insert(tabs, capture_tab(tab, geoms_in, geoms_out)) end
       if active and tab:tab_id() == active:tab_id() then
         wrec.active_tab = #tabs
         local size = tab:get_size()
