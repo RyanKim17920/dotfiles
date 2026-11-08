@@ -407,8 +407,8 @@ end
 -- /Users/me/x.md, ./foo.py, tasks/todo.md, README.md or src/app.py:42 opens a
 -- Yazi "peek" on the right half of the clicked pane (or in a new tab when it
 -- is narrow), with the file hovered and the preview maximized (YAZI_PEEK, see
--- ~/.config/yazi/init.lua), or the directory opened. Images and PDFs too
--- (Yazi previews them). q quits Yazi and you are back in the pane you
+-- ~/.config/yazi/init.lua), or the directory opened. Images too (Yazi
+-- previews them); PDFs open in Preview instead (see preview_file). q quits Yazi and you are back in the pane you
 -- clicked (see replace_peek). CMD+OPT+SHIFT+click Quick Looks a file instead,
 -- and in an ssh pane right-click downloads the file or folder (see
 -- download_remote).
@@ -834,6 +834,11 @@ local function is_media(path)
   return ext ~= nil and MEDIA_EXT[ext:lower()] == true
 end
 
+-- A plain click opens PDFs in Preview, which zooms and scrolls them properly
+local function is_pdf(path)
+  return path:lower():match '%.pdf$' ~= nil
+end
+
 local reveal_local -- defined below, after file_cmd
 
 -- Quick Look (CMD+OPT+SHIFT+click), see LINK_MODE_KEY
@@ -858,6 +863,13 @@ local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
 --                      see DOWNLOAD_NOTES) and reveal it in Finder. Exit 1-2
 --                      are tar's "some files changed or were unreadable";
 --                      higher is ssh or the remote shell failing.
+--   preview <status> <file>
+--                      open it in Preview; status as for download (kind
+--                      `opened` or `failed`)
+--   preview-copy <dir> <name> <status> <stat cmd> <cat cmd> <ssh...>
+--                      copy a remote file into dir/name (ssh... + cat cmd)
+--                      unless dir/.stamp still matches its size and mtime
+--                      (ssh... + stat cmd), then preview it
 local FILE_SCRIPT = [[
 pf=$1 mode=$2; shift 2
 reveal() {
@@ -910,6 +922,28 @@ download() {
   report "$kind" "$dest" "$(du -sh "$dest" | awk '{ print $1 }')"
   reveal "$dest"
 }
+fail() { report failed '' "$(tail -n 1 "$st.err" 2>/dev/null)"; rm -f "$st.err"; }
+preview() {
+  st=$1
+  mkdir -p "$(dirname "$st")"
+  if open -a Preview -- "$2" 2> "$st.err"; then report opened "$2" ''; rm -f "$st.err"; else fail; fi
+}
+preview_copy() {
+  dir=$1 name=$2 st=$3 statcmd=$4 catcmd=$5; shift 5
+  f=$dir/$name
+  mkdir -p "$dir" "$(dirname "$st")" || { report failed '' 'cannot write the cache'; return; }
+  stamp=$("$@" "$statcmd" 2> "$st.err") && [ -n "$stamp" ] || { fail; return; }
+  if [ ! -f "$f" ] || [ "$(cat "$dir/.stamp" 2>/dev/null)" != "$stamp" ]; then
+    rm -f "$dir/.stamp"
+    "$@" "$catcmd" > "$f.part" 2> "$st.err" && mv -f "$f.part" "$f" \
+      || { rm -f "$f.part"; fail; return; }
+    printf '%s\n' "$stamp" > "$dir/.stamp"
+  fi
+  rm -f "$st.err"
+  preview "$st" "$f"
+}
+if [ "$mode" = preview ]; then preview "$@"; exit; fi
+if [ "$mode" = preview-copy ]; then preview_copy "$@"; exit; fi
 if [ "$mode" = look ]; then look "$1"; exit; fi
 if [ "$mode" = reveal ]; then reveal "$1"; exit; fi
 if [ "$mode" = download ]; then download "$@"; exit; fi
@@ -937,7 +971,7 @@ end
 
 -- Copies from the pane's host over the master.
 -- (A do-block: the main chunk is near Lua's limit of 200 local variables.)
-local reveal_remote, quicklook_remote, download_remote
+local reveal_remote, quicklook_remote, download_remote, preview_file
 do
 -- Copy remote file `path` into local `dir` over the master, then reveal or
 -- Quick Look it (mode 'reveal-copy' / 'look-copy')
@@ -975,8 +1009,8 @@ end
 -- there, and this Mac's is openrsync). The transfer outlives this config
 -- (reloads, ...), so it is not waited for here: `download` in FILE_SCRIPT
 -- leaves a status file, which update-status picks up. wezterm.time.call_after
--- would be dropped by a reload.
-local DOWNLOADS_KEY = 'downloads' -- JSON list of { status, window, what }
+-- would be dropped by a reload. preview_file tracks its copies the same way.
+local DOWNLOADS_KEY = 'downloads' -- JSON list of { status, window, what, area? }
 local DOWNLOAD_STATUS_DIR = wezterm.home_dir .. '/.local/state/wezterm/downloads/'
 local DOWNLOAD_NOTES = {
   done = 'Download: %s (%s) in %s',
@@ -998,25 +1032,66 @@ local function downloads()
   return wezterm.json_parse(wezterm.GLOBAL[DOWNLOADS_KEY] or '[]')
 end
 
-function download_remote(window, ssh, path)
-  local sub = host_dir(ssh)
+-- New status file path for a background copy
+local function new_status()
   local seq = (wezterm.GLOBAL.download_seq or 0) + 1
   wezterm.GLOBAL.download_seq = seq
-  local status = DOWNLOAD_STATUS_DIR .. os.time() .. '-' .. seq
+  return DOWNLOAD_STATUS_DIR .. os.time() .. '-' .. seq
+end
+
+-- Have update-status toast the outcome written to `status`
+local function track(window, status, what, area)
+  local list = downloads()
+  table.insert(list, { status = status, window = window:window_id(), what = what, area = area })
+  set_downloads(list)
+end
+
+function download_remote(window, ssh, path)
+  local sub = host_dir(ssh)
+  local status = new_status()
   local cmd = file_cmd('download', wezterm.home_dir .. '/Downloads/' .. sub, status)
   for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
   table.insert(cmd, 'sh -c ' .. sh_quote(REMOTE_TAR) .. ' sh ' .. sh_quote(path))
   wezterm.background_child_process(cmd)
   local what = ssh_host(ssh) .. ':' .. path
-  local list = downloads()
-  table.insert(list, { status = status, window = window:window_id(), what = what })
-  set_downloads(list)
+  track(window, status, what)
   toast(window, 'Download: ' .. what .. ' to ~/Downloads/' .. sub .. '/', 4000)
 end
 
+-- 8 hex digits (FNV-1a) naming the cache folder of one remote path, so files
+-- with the same name in different remote folders don't overwrite each other
+local function short_hash(s)
+  local h = 2166136261
+  for k = 1, #s do h = ((h ~ s:byte(k)) * 16777619) & 0xffffffff end
+  return string.format('%08x', h)
+end
+
+-- Open a PDF in Preview without blocking the GUI. A local one opens in
+-- place; a remote one (ssh given) is copied over the master to
+-- PEEK_CACHE/<host>/<hash of path>/<name> first, or reused from there when
+-- its size and mtime are unchanged. Failures toast via update-status.
+function preview_file(window, path, ssh)
+  local name = path:match '[^/]+$' or path
+  local status = new_status()
+  local cmd, what = file_cmd('preview', status, path), name
+  if ssh then
+    local q = sh_quote(path)
+    cmd = file_cmd('preview-copy', PEEK_CACHE .. host_dir(ssh) .. '/' .. short_hash(path), name,
+      status, 'sh -c ' .. sh_quote('{ stat -L -c "%s %Y" -- ' .. q .. ' || stat -L -f "%z %m" -- '
+        .. q .. '; } 2>/dev/null || { echo "cannot read the file" >&2; exit 1; }'),
+      'cat -- ' .. q)
+    for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
+    what = ssh_host(ssh) .. ':' .. path
+  end
+  wezterm.background_child_process(cmd)
+  track(window, status, what, 'Preview')
+  toast(window, 'Preview: opening ' .. name .. (ssh and (' from ' .. ssh_host(ssh)) or '') .. '…', 2000)
+end
+
 local function download_note(d, kind, dest, info)
+  if kind == 'opened' then return nil end -- preview_file: Preview shows it
   if not DOWNLOAD_NOTES[kind] then
-    return 'Download failed: ' .. d.what .. ((info or '') ~= '' and (': ' .. info) or '')
+    return (d.area or 'Download') .. ' failed: ' .. d.what .. ((info or '') ~= '' and (': ' .. info) or '')
   end
   local dir, name = dest:match '^(.*)/([^/]*)$'
   if dir:sub(1, #wezterm.home_dir + 1) == wezterm.home_dir .. '/' then
@@ -1035,7 +1110,8 @@ local function poll_downloads(window)
       local kind, dest, info = f:read('a'):match '^([^\n]*)\n([^\n]*)\n([^\n]*)'
       f:close()
       os.remove(d.status)
-      table.insert(finished, { d = d, note = download_note(d, kind, dest, info) })
+      local note = download_note(d, kind, dest, info)
+      if note then table.insert(finished, { d = d, note = note }) end
     else
       table.insert(left, d)
     end
@@ -1679,6 +1755,8 @@ wezterm.on('open-uri', function(window, pane, uri)
       reveal_remote(window, ssh, kind, path)
     elseif kind == 'f' and look then
       quicklook_remote(window, ssh, path)
+    elseif kind == 'f' and is_pdf(path) then
+      preview_file(window, path, ssh)
     else
       open_remote_peek(window, pane, ssh, kind, path, click_line(text, path))
     end
@@ -1715,6 +1793,8 @@ wezterm.on('open-uri', function(window, pane, uri)
     if not reveal then toast(window, 'Finder: ' .. (path:match '[^/]+$' or path), 2000) end
   elseif look and not is_dir(path) then
     quicklook_local(window, path)
+  elseif not is_dir(path) and is_pdf(path) then
+    preview_file(window, path)
   else
     open_peek(window, pane, path, click_line(text, path))
   end
