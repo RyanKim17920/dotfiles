@@ -83,6 +83,28 @@ local function peek_open(tab)
   return rec ~= nil and mux_pane(rec.peek) ~= nil
 end
 
+-- WezTerm 20240203 takes a `split-pane --move-pane-id` pane out of its tab
+-- before attempting the split, so a refused split ("No space for split!", or
+-- a zoomed target tab) loses the pane. Mirror split_and_insert's checks
+-- (mux/src/tab.rs) first: true if splitting pane `target_id` along `flag`
+-- with `percent` for the new part will succeed.
+local function split_fits(target_id, flag, percent)
+  local target = mux_pane(target_id)
+  local tab = target and target:tab()
+  if not tab then return false end
+  local size = tab:get_size()
+  for _, info in ipairs(tab:panes_with_info()) do
+    if info.is_zoomed then return false end
+    if info.pane:pane_id() == target_id then
+      local span = flag == '--right' and info.width or info.height
+      local second = math.max(1, math.floor(span * percent / 100))
+      return span - second - 1 >= 1
+        and info.left + info.width <= size.cols and info.top + info.height <= size.rows
+    end
+  end
+  return false
+end
+
 -- Heading for PromptInputLine: accent icon, bold title, dim hint below
 local function prompt_text(icon, title, hint)
   return wezterm.format {
@@ -1877,28 +1899,6 @@ local function plan_splits(group, steps)
     target = anchor_of(first).id, flag = flag, percent = pct, move = anchor_of(second).id,
   })
   return plan_splits(first, steps) and plan_splits(second, steps)
-end
-
--- WezTerm 20240203 takes a `split-pane --move-pane-id` pane out of its tab
--- before attempting the split, so a refused split ("No space for split!", or
--- a zoomed target tab) loses the pane. Mirror split_and_insert's checks
--- (mux/src/tab.rs) first: true if splitting pane `target_id` along `flag`
--- with `percent` for the new part will succeed.
-local function split_fits(target_id, flag, percent)
-  local target = mux_pane(target_id)
-  local tab = target and target:tab()
-  if not tab then return false end
-  local size = tab:get_size()
-  for _, info in ipairs(tab:panes_with_info()) do
-    if info.is_zoomed then return false end
-    if info.pane:pane_id() == target_id then
-      local span = flag == '--right' and info.width or info.height
-      local second = math.max(1, math.floor(span * percent / 100))
-      return span - second - 1 >= 1
-        and info.left + info.width <= size.cols and info.top + info.height <= size.rows
-    end
-  end
-  return false
 end
 
 -- Move one tab's panes into window `target_window` as a single new tab with the
