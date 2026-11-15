@@ -465,7 +465,8 @@ local function uri_to_path(uri)
 end
 
 -- Spellings of a clicked path to try in order: as is, without a trailing
--- :line, :line:col or :first-last, then each %-decoded (My%20File.md)
+-- :line, :line:col or :first-last, then each %-decoded (My%20File.md), then
+-- each with shell backslash escapes removed (My\ File.md)
 local function path_variants(text)
   local out = { text }
   local stripped = text:match '^(.-):%d+[:-]%d+$' or text:match '^(.-):%d+$'
@@ -473,6 +474,10 @@ local function path_variants(text)
   for i = 1, #out do
     local decoded = percent_decode(out[i])
     if decoded ~= out[i] then table.insert(out, decoded) end
+  end
+  for i = 1, #out do
+    local unescaped = out[i]:gsub('\\(.)', '%1')
+    if unescaped ~= out[i] then table.insert(out, unescaped) end
   end
   return out
 end
@@ -636,9 +641,9 @@ local function remote_word(text)
   return '"$HOME"/' .. sh_quote(text)
 end
 
--- Remote side of a path click, one round trip. Prints "d <dir>" or "f
--- <file>" (absolute, ./.. collapsed) for the first argument that exists, exit
--- 1 if none does. Arguments are A:<absolute path> or R:<relative path>. A
+-- Remote side of a path click, one round trip. Prints "d <n> <dir>" or "f
+-- <n> <file>" (absolute, ./.. collapsed) for the first argument that exists
+-- (the n-th), exit 1 if none does. Arguments are A:<absolute path> or R:<relative path>. A
 -- relative path is tried against $RCWD (the shell's OSC 7 cwd) first, then
 -- against the cwds of the user's own processes (Linux /proc; those on a tty
 -- named claude/node/python/bash first, other tty ones next, the rest last)
@@ -647,9 +652,9 @@ end
 local REMOTE_RESOLVE = [[
 emit() {
   if [ -d "$1" ]; then
-    cd -- "$1" && printf 'd %s\n' "$(pwd)" && exit 0
+    cd -- "$1" && printf 'd %s %s\n' "$n" "$(pwd)" && exit 0
   else
-    d=$(cd -- "$(dirname -- "$1")" && pwd) && printf 'f %s\n' "${d%/}/$(basename -- "$1")" && exit 0
+    d=$(cd -- "$(dirname -- "$1")" && pwd) && printf 'f %s %s\n' "$n" "${d%/}/$(basename -- "$1")" && exit 0
   fi
 }
 mtime() { stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null || echo 0; }
@@ -666,8 +671,9 @@ bases() {
   done | sort -n -k1,1 | awk '!seen[substr($0, 3)]++ { print substr($0, 3) }'
   printf '%s\n' "$HOME"
 }
-B=
+B= n=0
 for w in "$@"; do
+  n=$((n + 1))
   case $w in
     A:*) p=${w#A:}; [ -e "$p" ] && emit "$p" ;;
     R:*)
@@ -704,45 +710,61 @@ local function resolve_words(text)
   return words
 end
 
--- kind ('f' or 'd') and absolute path on the pane's host of the first of
--- `texts` that exists there, or nil and a message
+-- kind ('f' or 'd'), absolute path on the pane's host and index in `texts`
+-- of the first of them that exists there, or nil and a message. The GUI
+-- waits for this, so a remote that hangs (dead NFS mount, ...) is given up
+-- on after REMOTE_RESOLVE_TIMEOUT seconds (perl's alarm survives the exec).
+local REMOTE_RESOLVE_TIMEOUT = 5
 local function resolve_remote(ssh, texts, rcwd)
   if not ssh_master_pid(ssh) then
     return nil, 'ssh: no live connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
   end
-  local words = {}
-  for _, text in ipairs(texts) do
-    for _, w in ipairs(resolve_words(text)) do table.insert(words, w) end
+  local words, owner = {}, {}
+  for t, text in ipairs(texts) do
+    for _, w in ipairs(resolve_words(text)) do
+      table.insert(words, w)
+      table.insert(owner, t)
+    end
   end
   local script = 'RCWD=' .. sh_quote(rcwd or '') .. '\nset -- ' .. table.concat(words, ' ')
     .. '\n' .. REMOTE_RESOLVE
-  local cmd = ssh_batch_cmd(ssh)
+  local cmd = { '/usr/bin/perl', '-e', 'alarm shift; exec @ARGV or exit 127', tostring(REMOTE_RESOLVE_TIMEOUT) }
+  for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
   table.insert(cmd, 'sh -c ' .. sh_quote(script))
   local ok, out = wezterm.run_child_process(cmd)
-  local kind, path
-  if ok then kind, path = out:match '^([fd]) (/[^\n]*)' end
-  if not kind then return nil, 'Path: not found on ' .. ssh_host(ssh) .. ': ' .. texts[1] end
-  return kind, path
+  local kind, n, path
+  if ok then kind, n, path = out:match '^([fd]) (%d+) (/[^\n]*)' end
+  if not kind then return nil, 'Path: not found on ' .. ssh_host(ssh) .. ': ' .. texts[#texts] end
+  return kind, path, owner[tonumber(n)]
 end
 
--- Hard-wrapped paths: TUIs like Claude Code break long lines themselves
--- (newline + indentation, often behind a gutter such as │ or ⎿), so a click
--- sees only one piece of a long path. wrapped_candidates rebuilds it from
--- the pane's recent text: the clicked piece plus the path characters that
--- continue it at the start of the next lines and/or end the previous ones,
--- longest first. `wrapped` is true when the piece ends its line and a
--- continuation follows, i.e. on its own it is likely a cut-off prefix.
+-- Paths with spaces and hard-wrapped paths: a click only hands over the
+-- token a hyperlink rule matched, i.e. one space-free piece of a path like
+-- /Volumes/My Disk/clip.mp4, or one line's piece of a path a TUI like
+-- Claude Code broke onto the next line itself (newline + indentation, often
+-- behind a gutter such as │ or ⎿). path_candidates rebuilds the longer
+-- spellings from the pane's recent text: the clicked piece extended by whole
+-- words to the left and right, across line breaks (joined as is and with a
+-- space, gutters stripped), longest first. Unquoted spaces are ambiguous, so
+-- the caller takes the longest candidate that exists. Quotes, brackets and
+-- trailing punctuation at either end are also tried without. `wrapped` is
+-- true when the piece ends its line and a continuation follows, i.e. on its
+-- own it is likely a cut-off prefix.
+local path_candidates
+do
 local WRAP_LINES = 3 -- lines joined at most in each direction
-local WRAP_SCAN_LINES = 500
-local WRAP_GUTTERS = { '│', '┃', '⎿', '●', '⏺', '▎', '▏', '•', '>', '*', '`', '|' }
-local PATH_CHARS = '[%w%._~/@+%%:-]'
+local SCAN_LINES = 500
+local SPAN_WORDS = 8 -- words added at most, both sides together
+local SPAN_CHARS = 1024
+local GUTTERS = { '│', '┃', '⎿', '●', '⏺', '▎', '▏', '•', '>', '*', '`', '|' }
+local OPENERS = '["\'`(%[{<=*]' -- what may precede a path (see the rules)
 
 -- `s` without leading (or, with at_end, trailing) whitespace and gutter marks
 local function strip_gutter(s, at_end)
   repeat
     local before = s
     s = at_end and (s:gsub('%s+$', '')) or (s:gsub('^%s+', ''))
-    for _, g in ipairs(WRAP_GUTTERS) do
+    for _, g in ipairs(GUTTERS) do
       if at_end and s:sub(-#g) == g then
         s = s:sub(1, -#g - 1)
       elseif not at_end and s:sub(1, #g) == g then
@@ -753,47 +775,94 @@ local function strip_gutter(s, at_end)
   return s
 end
 
-local function wrapped_candidates(pane, text)
-  local ok, all = pcall(pane.get_lines_as_text, pane, WRAP_SCAN_LINES)
+-- A line's text between its gutters
+local function body(line)
+  return strip_gutter(strip_gutter(line, true), false)
+end
+
+-- Suffixes that extend a piece ending before `rest` (the remainder of line
+-- k) by whole words, each as { text, words used }, into `out`; at the end of
+-- the line the next one continues it, joined as is or with a space
+local function grow_right(lines, k, rest, acc, n, out, last)
+  for sep, w in strip_gutter(rest, true):gmatch '(%s*)(%S+)' do
+    if n >= SPAN_WORDS then return end
+    acc, n = acc .. sep .. w, n + 1
+    table.insert(out, { acc, n })
+    local trimmed = acc:gsub('["\'`)%]}>*.,:;!?]+$', '')
+    if trimmed ~= acc and not trimmed:match '%s$' then table.insert(out, { trimmed, n }) end
+  end
+  if k < last and n < SPAN_WORDS then
+    local next = body(lines[k + 1])
+    if next == '' then return end
+    for _, join in ipairs { '', ' ' } do grow_right(lines, k + 1, join .. next, acc, n, out, last) end
+  end
+end
+
+-- Prefixes the same way, to the left of a piece starting after `before`
+local function grow_left(lines, k, before, acc, n, out, first)
+  local words = {}
+  for w, sep in strip_gutter(before, false):gmatch '(%S+)(%s*)' do table.insert(words, { w, sep }) end
+  for j = #words, 1, -1 do
+    if n >= SPAN_WORDS then return end
+    local w, sep = words[j][1], words[j][2]
+    acc, n = w .. sep .. acc, n + 1
+    table.insert(out, { acc, n })
+    local cut = w:match('^.*' .. OPENERS .. '(.+)$')
+    if cut then table.insert(out, { cut .. sep .. acc:sub(#w + 1 + #sep), n }) end
+  end
+  if k > first and n < SPAN_WORDS then
+    local prev = body(lines[k - 1])
+    if prev == '' then return end
+    for _, join in ipairs { '', ' ' } do grow_left(lines, k - 1, prev .. join, acc, n, out, first) end
+  end
+end
+
+-- Start of the last occurrence of `text` in `line` that begins a word (line
+-- start, whitespace or one of OPENERS before it), or nil
+local function find_piece(line, text)
+  local found, from = nil, 1
+  while true do
+    local s = line:find(text, from, true)
+    if not s then return found end
+    if s == 1 or line:sub(s - 1, s - 1):match('[%s' .. OPENERS:sub(2)) then found = s end
+    from = s + 1
+  end
+end
+
+path_candidates = function(pane, text)
+  local ok, all = pcall(pane.get_logical_lines_as_text, pane, SCAN_LINES)
   local lines = {}
   for line in ((ok and all or '') .. '\n'):gmatch '([^\n]*)\n' do table.insert(lines, line) end
   for i = #lines, 1, -1 do
-    local first, last = lines[i]:find(text, 1, true)
-    if first then
-      local prefixes, suffixes = { '' }, { '' }
-      if strip_gutter(lines[i]:sub(last + 1), true) == '' then
-        local acc = ''
-        for k = i + 1, math.min(i + WRAP_LINES, #lines) do
-          local rest = strip_gutter(lines[k], false)
-          local frag = rest:match('^' .. PATH_CHARS .. '+')
-          if not frag then break end
-          acc = acc .. frag
-          table.insert(suffixes, acc)
-          if frag ~= (rest:gsub('%s+$', '')) then break end -- the path ends on this line
+    local s = find_piece(lines[i], text)
+    if s then
+      local e = s + #text - 1
+      local lefts, rights = { { '', 0 } }, { { '', 0 } }
+      grow_left(lines, i, lines[i]:sub(1, s - 1), '', 0, lefts, math.max(i - WRAP_LINES, 1))
+      grow_right(lines, i, lines[i]:sub(e + 1), '', 0, rights, math.min(i + WRAP_LINES, #lines))
+      local cands, seen = {}, { [text] = true }
+      for _, l in ipairs(lefts) do
+        for _, r in ipairs(rights) do
+          local c = l[1] .. text .. r[1]
+          if l[2] + r[2] <= SPAN_WORDS and #c <= SPAN_CHARS and not seen[c] then
+            seen[c] = true
+            table.insert(cands, c)
+          end
         end
       end
-      if strip_gutter(lines[i]:sub(1, first - 1), false) == '' then
-        local acc = ''
-        for k = i - 1, math.max(i - WRAP_LINES, 1), -1 do
-          local rest = strip_gutter(lines[k], true)
-          local frag = rest:match(PATH_CHARS .. '+$')
-          if not frag then break end
-          acc = frag .. acc
-          table.insert(prefixes, acc)
-          if frag ~= strip_gutter(rest, false) then break end -- the path starts on this line
-        end
-      end
-      local cands = {}
-      for _, pre in ipairs(prefixes) do
-        for _, suf in ipairs(suffixes) do
-          if pre ~= '' or suf ~= '' then table.insert(cands, pre .. text .. suf) end
-        end
-      end
-      table.sort(cands, function(a, b) return #a > #b end)
-      return cands, #suffixes > 1
+      local order = {}
+      for idx, c in ipairs(cands) do order[c] = idx end
+      table.sort(cands, function(a, b)
+        if #a ~= #b then return #a > #b end
+        return order[a] < order[b]
+      end)
+      local wrapped = strip_gutter(lines[i]:sub(e + 1), true) == '' and i < #lines
+        and body(lines[i + 1]):match '^[%w%._~/@+%%:-]' ~= nil
+      return cands, wrapped
     end
   end
   return {}, false
+end
 end
 
 local function open_remote_peek(window, pane, ssh, kind, path, line)
@@ -1732,18 +1801,17 @@ wezterm.on('open-uri', function(window, pane, uri)
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
 
   if ssh then
-    local rcwd = remote_cwd(pane)
-    local kind, path = resolve_remote(ssh, { text }, rcwd)
-    if custom and kind ~= 'f' then
-      local cands, wrapped = wrapped_candidates(pane, text)
-      local full_kind, full = nil, nil
-      if #cands > 0 then full_kind, full = resolve_remote(ssh, cands, rcwd) end
-      if full_kind then
-        kind, path = full_kind, full
-      elseif kind == 'd' and wrapped then
-        toast(window, "Path: couldn't resolve wrapped path: " .. text)
-        return false
-      end
+    -- The longer spellings (see path_candidates) and the clicked text, in
+    -- one round trip; the first that exists wins
+    local texts, wrapped = {}, false
+    if custom then texts, wrapped = path_candidates(pane, text) end
+    table.insert(texts, text)
+    local kind, path, which = resolve_remote(ssh, texts, remote_cwd(pane))
+    if which and which < #texts then
+      text = texts[which]
+    elseif kind == 'd' and wrapped then
+      toast(window, "Path: couldn't resolve wrapped path: " .. text)
+      return false
     end
     if not kind then
       toast(window, path)
@@ -1766,17 +1834,21 @@ wezterm.on('open-uri', function(window, pane, uri)
   -- --hyperlink use the DHCP name, which changes): use the path if it exists
   local cwd = pane_cwd(pane)
   local path = pane:get_domain_name() == 'local' and resolve_path(text, cwd)
-  if custom and path ~= false and not (path and not is_dir(path)) then
-    -- Missing, or a directory that may be the cut-off start of a wrapped path
-    local cands, wrapped = wrapped_candidates(pane, text)
+  if custom and path ~= false then
+    -- The longest existing spelling with spaces or across a wrap (see
+    -- path_candidates) beats the clicked piece, even one that exists
+    local cands, wrapped = path_candidates(pane, text)
     local full
     for _, c in ipairs(cands) do
       full = resolve_path(c, cwd)
-      if full then break end
+      if full then
+        text = c
+        break
+      end
     end
     if full then
       path = full
-    elseif path and wrapped then
+    elseif path and is_dir(path) and wrapped then
       toast(window, "Path: couldn't resolve wrapped path: " .. text)
       return false
     end
