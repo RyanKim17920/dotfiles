@@ -1808,13 +1808,24 @@ end)
 config.hyperlink_rules = wezterm.default_hyperlink_rules()
 
 -- Anchored paths: ~/, ./, ../ or /. They stop at whitespace, quotes,
--- backticks, brackets and * and never end in . , : ; ! ? so prose
--- punctuation stays out.
+-- backticks, brackets and * (unless backslash-escaped, as in My\ Disk) and
+-- never end in . , : ; ! ? so prose punctuation stays out.
 table.insert(config.hyperlink_rules, {
-  regex = [=[(?:^|[\s"'`(\[{<=*])((?:~|\.\.?)?/[^\s"'`()\[\]{}<>*]*[^\s"'`()\[\]{}<>*.,:;!?])]=],
+  regex = [=[(?:^|[\s"'`(\[{<=*])((?:~|\.\.?)?/(?:\\.|[^\s"'`()\[\]{}<>*\\])*(?:\\.|[^\s"'`()\[\]{}<>*\\.,:;!?]))]=],
   format = PEEK_SCHEME .. '$1',
   highlight = 1,
 })
+
+-- Quoted anchored paths ("/My Disk/a b.mp4", '~/x y', `./a (1).txt`) are
+-- one link up to the closing quote, spaces and brackets included. Unquoted
+-- ones with spaces are rebuilt when clicked (see path_candidates).
+for _, q in ipairs { '"', "'", '`' } do
+  table.insert(config.hyperlink_rules, {
+    regex = [=[(?:^|[\s(\[{<=:,])]=] .. q .. [=[((?:~|\.\.?)?/[^]=] .. q .. [=[]*[^\s]=] .. q .. [=[])]=] .. q,
+    format = PEEK_SCHEME .. '$1',
+    highlight = 1,
+  })
+end
 
 -- Bare relative paths as Claude Code prints them (tasks/todo.md,
 -- src/app.py:42, README.md). To keep prose like and/or, 1/2, 10/16/2026,
