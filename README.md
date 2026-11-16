@@ -15,7 +15,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 | `yazi/` | `~/.config/yazi/` |
 | `yazi-sidebar/yazi.toml` | `~/.config/yazi-sidebar/yazi.toml` |
 | `micro/settings.json` | `~/.config/micro/settings.json` |
-| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`, `ssh-pane`, `wez-claude-session`) |
+| `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`, `ssh-pane`, `wez-claude-session`, `wez-hibernate`) |
 | `claude/statusline.sh` | `~/.claude/statusline.sh` (Claude Code status line) |
 | `zsh/snippets.zsh` | source it from `~/.zshrc` |
 
@@ -127,6 +127,25 @@ Add the hook to `~/.claude/settings.json` (it records the id per pane in
   { "type": "command", "command": "\"$HOME/.local/bin/wez-claude-session\"", "timeout": 5 }
 ] } ] }
 ```
+
+## Hibernation
+
+A Claude Code pane left idle for an hour is put to sleep to free its memory:
+the process is stopped (SIGTERM) and the pane keeps showing its last screen,
+dimmed, under a "💤 Hibernated <time>" banner (`bin/wez-hibernate`). Any key
+or a click resumes the same conversation with `claude --resume <id>` in its
+cwd, through the same shell. Session restore saves a sleeping pane as the
+Claude Code pane it was.
+
+Idle means, for the whole hour: the screen above the input box unchanged, the
+process tree the same and at about no CPU, and not the focused pane. Every
+check is repeated right before the stop, and any doubt keeps it awake:
+anything running under it besides its MCP servers (a shell, tool command,
+build, `sleep`, `ssh`, `tmux`, ...), a spinner, "esc to interrupt", running
+agents or background tasks, a dialog or permission prompt, a draft in the
+input box, no known session id, or a pane that would not survive the exit.
+Reasons a pane stays awake go to the WezTerm log (`hibernate:`). Disable with
+`~/.local/state/wezterm/hibernate-off` or `WEZTERM_HIBERNATE=0`.
 
 ## Yazi keys added
 
