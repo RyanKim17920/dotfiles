@@ -1,5 +1,34 @@
--- WezTerm config (WezTerm 20240203, macOS). Features live in features/, shared
--- code in lib/.
+-- WezTerm config (WezTerm 20240203, macOS): Ghostty-style splits that follow
+-- you into ssh, Yazi peeks on clicked paths, session restore and more.
+--
+-- Features: each one lives in features/<name>.lua with its own keys, mouse
+-- bindings, link rules and event handlers (shared code is in lib/). Set one
+-- to false to leave it out. To do that without editing this tracked file,
+-- put the overrides in local.lua next to it (gitignored), e.g.
+--   return { hibernation = false, sidebar = false }
+local features = {
+  tab_bar = true,          -- Catppuccin retro tab bar (number, icon, ssh host or cwd) and pickers
+  ghostty_keys = true,     -- Ghostty-style pane keys: splits, close, focus, resize, zoom, swap, rotate, tab order
+  ssh_aware = true,        -- CMD+D/T/N from an ssh pane open ssh-pane to the same host
+  copy_paste = true,       -- CMD/CTRL+C/V copy-or-interrupt, image paste into ssh panes
+  sidebar = true,          -- CMD+E toggles a Yazi file sidebar
+  rename = true,           -- CMD+SHIFT+R / CMD+CTRL+R rename the tab / window
+  paths = true,            -- CMD+click a path opens it in a Yazi peek (local and over ssh)
+  finder_reveal = true,    -- CMD+OPT+click a path reveals it in Finder (needs paths)
+  quicklook = true,        -- CMD+OPT+SHIFT+click a path opens Quick Look (needs paths)
+  media_reveal = true,     -- CMD+click a video/audio file reveals it in Finder (needs paths)
+  pdf_preview = true,      -- CMD+click a PDF opens it in Preview (needs paths)
+  downloads = true,        -- right-click a path in an ssh pane downloads it (needs paths)
+  port_forward = true,     -- CMD+click localhost URLs / ssh -L commands forwards the port; CMD+SHIFT+L
+  layout_repair = true,    -- CMD+SHIFT+= and window resizes refit panes that spill off the window
+  fullscreen_refit = true, -- refit a fullscreen window after a monitor is unplugged
+  pane_moves = true,       -- CMD+OPT+T/N/1..9 move panes, CMD+SHIFT+M merges windows
+  md_preview = true,       -- side-by-side Markdown preview for mdedit over ssh
+  session_restore = true,  -- reopen windows, tabs, splits and their commands at launch
+  hibernation = true,      -- stop agent CLI panes idle for an hour, resume on a key
+  reload_toast = true,     -- "config reloaded" toast on the tab bar
+}
+
 local wezterm = require 'wezterm'
 
 -- require() and the reload watcher need this file's real directory: WezTerm
@@ -14,7 +43,23 @@ end
 local DIR = real_dir()
 package.path = DIR .. '/?.lua;' .. DIR .. '/?/init.lua;' .. package.path
 
-local features = setmetatable({}, { __index = function() return true end })
+local LOCAL_FILE = DIR .. '/local.lua'
+local f = io.open(LOCAL_FILE)
+if f then
+  f:close()
+  local ok, overrides = pcall(dofile, LOCAL_FILE)
+  if not ok or type(overrides) ~= 'table' then
+    wezterm.log_error('features: local.lua must return a table of flags: ' .. tostring(overrides))
+  else
+    for name, on in pairs(overrides) do
+      if features[name] == nil or type(on) ~= 'boolean' then
+        wezterm.log_warn('features: local.lua: ignoring ' .. tostring(name) .. ' = ' .. tostring(on))
+      else
+        features[name] = on
+      end
+    end
+  end
+end
 
 local config = wezterm.config_builder()
 local with_editor = require('lib.core').with_editor
@@ -52,33 +97,54 @@ config.hyperlink_rules = wezterm.default_hyperlink_rules()
 config.keys = {}
 config.mouse_bindings = {}
 
+-- Features, in this order (link rules and update-status handlers keep it) --
+
+local ORDER = {
+  'tab_bar',
+  'ghostty_keys',
+  'ssh_aware',
+  'copy_paste',
+  'sidebar',
+  'rename',
+  'paths',
+  'finder_reveal',
+  'quicklook',
+  'media_reveal',
+  'pdf_preview',
+  'downloads',
+  'port_forward',
+  'layout_repair',
+  'fullscreen_refit',
+  'pane_moves',
+  'md_preview',
+  'session_restore',
+  'hibernation',
+  'reload_toast',
+}
+
+-- Handed to every feature: the flags, and the click predicates that
+-- media_reveal and pdf_preview replace
 local function never() return false end
 local ctx = { features = features, is_media = never, is_pdf = never }
-
-require('features.tab_bar').apply(config, ctx)
-require('features.ghostty_keys').apply(config, ctx)
-require('features.ssh_aware').apply(config, ctx)
-require('features.copy_paste').apply(config, ctx)
-require('features.sidebar').apply(config, ctx)
-require('features.rename').apply(config, ctx)
-require('features.paths').apply(config, ctx)
-require('features.finder_reveal').apply(config, ctx)
-require('features.quicklook').apply(config, ctx)
-require('features.media_reveal').apply(config, ctx)
-require('features.pdf_preview').apply(config, ctx)
-require('features.downloads').apply(config, ctx)
-require('features.port_forward').apply(config, ctx)
-require('features.layout_repair').apply(config, ctx)
-require('features.fullscreen_refit').apply(config, ctx)
-require('features.pane_moves').apply(config, ctx)
-require('features.md_preview').apply(config, ctx)
-require('features.session_restore').apply(config, ctx)
-require('features.hibernation').apply(config, ctx)
-require('features.reload_toast').apply(config, ctx)
+for _, name in ipairs(ORDER) do
+  if features[name] then
+    local feature = require('features.' .. name)
+    local missing
+    for _, need in ipairs(feature.needs or {}) do
+      if not features[need] then missing = need end
+    end
+    if missing then
+      features[name] = false
+      wezterm.log_warn('features: ' .. name .. ' needs ' .. missing .. ', which is off; skipped')
+    else
+      feature.apply(config, ctx)
+    end
+  end
+end
 
 -- WezTerm reloads when a module it loaded changes; also watch this file by
--- its real path
-for _, pattern in ipairs { '/wezterm.lua' } do
+-- its real path and local.lua
+for _, pattern in ipairs { '/wezterm.lua', '/local.lua' } do
   for _, path in ipairs(wezterm.glob(DIR .. pattern)) do wezterm.add_to_config_reload_watch_list(path) end
 end
 
