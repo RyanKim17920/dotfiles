@@ -7,8 +7,9 @@
 -- same shell so its `claude` function and environment apply. Idle means, at
 -- every check for the whole time: the screen above its input box unchanged,
 -- its process tree the same and at about no CPU, and not the active pane of
--- the focused window. Right before the stop every gate is checked again, and
--- any doubt keeps it running:
+-- the focused window, and nothing written to its session's files (below).
+-- Right before the stop every gate is checked again, and any doubt keeps it
+-- running:
 -- * nothing runs under it but its MCP servers (children started within
 --   HIB_MCP_WINDOW of it, none of them a shell or in HIB_NOT_MCP): a tool or
 --   background command, a build, a sleep, caffeinate (claude holds it while
@@ -16,7 +17,13 @@
 -- * its screen shows an empty input box and no sign of work: spinner, "esc
 --   to interrupt", background agents/shells/monitors, queued messages, a
 --   permission prompt or other dialog, a draft in the input box
--- * a session id whose transcript exists, and a directory to resume it in
+-- * a session id whose transcript exists, nothing changed for the whole idle
+--   time in its files (an independent sign of work: subagents run inside the
+--   process, so they start nothing and may show nothing on the main screen):
+--   the transcript, the directory beside it (subagent transcripts, tool
+--   results) and its temp directory (task outputs, background command logs);
+--   files that cannot be found or read count as work
+-- * a directory to resume it in
 -- * the pane outlives claude: started from a shell that stays when it exits
 --   (typed at a prompt, or restore_spec's `...; exec $SHELL -l`), where the
 --   wake command is typed once claude is gone; or the pane's own process,
@@ -197,9 +204,32 @@ local function hib_script()
   end
 end
 
-local function hib_transcript(id)
-  local ok, found = pcall(wezterm.glob, glob_quote(wezterm.home_dir) .. '/.claude*/projects/*/' .. id .. '.jsonl')
-  return ok and #found > 0
+local function hib_glob(pattern)
+  local ok, found = pcall(wezterm.glob, pattern)
+  return ok and found or {}
+end
+
+-- Why session `id` may be at work, judged by its files: something in them
+-- changed in the last `window` seconds, or they cannot be found or read; nil
+-- when quiet. Its files: <config dir>/projects/<project>/<id>.jsonl, the
+-- <id>/ directory beside it (subagents/, tool-results/) and the temp
+-- directory /private/tmp/claude-<uid>/<project>/<id>/ (tasks/*.output).
+local function hib_session_busy(id, window)
+  if not (id and id:match '^[%w_-]+$') then return 'no session id' end
+  local projects = glob_quote(wezterm.home_dir) .. '/.claude*/projects/*/' .. id
+  local transcripts = hib_glob(projects .. '.jsonl')
+  if #transcripts == 0 then return 'no transcript for ' .. id end
+  local find = { '/usr/bin/find' }
+  for _, roots in ipairs { transcripts, hib_glob(projects), hib_glob('/private/tmp/claude-*/*/' .. id) } do
+    for _, root in ipairs(roots) do find[#find + 1] = root end
+  end
+  for _, arg in ipairs { '-mtime', '-' .. math.max(1, math.ceil(window)) .. 's', '-print', '-quit' } do
+    find[#find + 1] = arg
+  end
+  local ok, success, out = pcall(wezterm.run_child_process, find)
+  if not (ok and success) then return 'session files unreadable' end
+  local changed = out:match '^([^\n]+)'
+  if changed then return 'session at work (its files changed)' end
 end
 
 -- How the pane outlives claude: 'shell' (its parent is a shell that stays:
@@ -219,11 +249,9 @@ end
 
 -- Stop the idle claude in `pane` (state `s`) after the last gates; true,
 -- or nil and why not
-local function hib_stop(pane, info, s, now)
+local function hib_stop(pane, info, s, now, idle)
   local key = tostring(pane:pane_id())
   local id, id_cwd = claude_session(pane:pane_id(), info)
-  if not (id and id:match '^[%w_-]+$') then return nil, 'no session id' end
-  if not hib_transcript(id) then return nil, 'no transcript for ' .. id end
   local cwd = present(id_cwd) and id_cwd or (present(info.cwd) and info.cwd or nil)
   if not cwd then return nil, 'no directory to resume in' end
   local shape = hib_shape(info)
@@ -237,6 +265,8 @@ local function hib_stop(pane, info, s, now)
   if kids ~= s.kids or cpu - s.cpu > HIB_CPU * math.max(1, now - s.at) then return nil, 'became busy' end
   local hash, why = hib_screen(pane)
   if hash ~= s.hash then return nil, why or 'screen changed' end
+  local files = hib_session_busy(id, math.max(idle, now - s.since))
+  if files then return nil, files end
   local ok, shown = pcall(pane.get_lines_as_escapes, pane, pane:get_dimensions().viewport_rows)
   local screen = HIB_DIR .. '/' .. key .. '.screen'
   if not (ok and write_atomic(screen, shown)) then return nil, 'could not save the screen' end
@@ -330,13 +360,24 @@ local function hib_check_pane(pane, c, now)
   end
   s.cpu, s.at = cpu, now
   c.fresh[key] = s
-  if now - s.since < c.idle then return end
-  local stopped, reason = hib_stop(pane, info, s, now)
-  if stopped then
-    c.fresh[key], c.n = nil, c.n + 1
-  elseif reason ~= s.blocked then
+  local function blocked(reason)
+    if reason == s.blocked then return end
     s.blocked = reason
     wezterm.log_info('hibernate: pane ' .. key .. ' stays awake: ' .. reason)
+  end
+  -- Anything written to the session's files since the pane looked idle
+  -- restarts the clock (a little slack for the write that ended the turn)
+  local files = hib_session_busy((claude_session(pane:pane_id(), info)), now - s.since + 2)
+  if files then
+    s.since = now
+    return blocked(files)
+  end
+  if now - s.since < c.idle then return end
+  local stopped, reason = hib_stop(pane, info, s, now, c.idle)
+  if stopped then
+    c.fresh[key], c.n = nil, c.n + 1
+  else
+    blocked(reason)
   end
 end
 
