@@ -37,7 +37,9 @@ local hib_json, hib_store = agent.hib_json, agent.hib_store
 local HIB_IDLE = 3600 -- seconds idle before hibernating
 local HIB_CHECK = 30 -- seconds between idle checks
 local HIB_MCP_WINDOW = 90 -- children started this soon after claude are its MCP servers
-local HIB_CPU = 0.03 -- CPU share at or below which the process tree is idle (~1% at rest)
+-- CPU share of the process tree above which it is busy: measured, an idle
+-- claude uses 0.6-0.7%, one whose subagents work 2-7%
+local HIB_CPU = 0.015
 local HIB_TERM_WAIT = 20 -- seconds for claude to exit after SIGTERM before SIGKILL
 local HIB_GIVE_UP = 60 -- seconds after which a stop that has not finished is dropped
 local HIB_SHELL_READY = 2 -- seconds the shell is back before the wake command is typed
