@@ -11,7 +11,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 
 | Path | Installs to |
 | --- | --- |
-| `wezterm/wezterm.lua` | `~/.wezterm.lua` |
+| `wezterm/wezterm.lua` (+ `lib/`, `features/`) | `~/.wezterm.lua` (a symlink; the modules are found next to the real file) |
 | `yazi/` | `~/.config/yazi/` |
 | `yazi-sidebar/yazi.toml` | `~/.config/yazi-sidebar/yazi.toml` |
 | `micro/settings.json` | `~/.config/micro/settings.json` |
@@ -27,6 +27,44 @@ to `../yazi/`.
 Yazi `plugins/` and `flavors/` from `ya pkg` are not committed; `ya pkg install`
 fetches them from `yazi/package.toml`. The one custom plugin,
 `yazi/plugins/upscale.yazi`, is committed and symlinked by `install.sh`.
+
+## WezTerm features
+
+Each feature below is a module in `wezterm/features/` (shared code in
+`wezterm/lib/`) with a flag in the `features` table at the top of
+`wezterm/wezterm.lua`; all are on. To turn some off without editing the
+tracked file, create `wezterm/local.lua` (gitignored) and reload once (CMD+R):
+
+```lua
+return { hibernation = false, sidebar = false }
+```
+
+A feature that is off leaves WezTerm's defaults for its keys. The click
+add-ons (`finder_reveal` to `downloads`) need `paths` and are skipped without
+it. Unknown flags and skipped features are logged as `features:` warnings.
+
+| Flag | Feature |
+| --- | --- |
+| `tab_bar` | Catppuccin retro tab bar (number, icon, name / ssh host / cwd) and pickers |
+| `ghostty_keys` | Ghostty-style pane keys: CMD+D splits, CMD+W, focus, resize, zoom, swap, rotate, jump, tab order |
+| `ssh_aware` | CMD+D / CMD+T / CMD+N from an ssh pane open the same host; CMD+SHIFT+T / N stay local |
+| `copy_paste` | Unified CMD/CTRL+C/V, image paste into ssh panes |
+| `sidebar` | CMD+E Yazi sidebar |
+| `rename` | CMD+SHIFT+R / CMD+CTRL+R rename tab / window |
+| `paths` | CMD+click a path: Yazi peek, local or over ssh |
+| `finder_reveal` | CMD+OPT+click: reveal in Finder |
+| `quicklook` | CMD+OPT+SHIFT+click: Quick Look |
+| `media_reveal` | CMD+click on video / audio reveals it in Finder |
+| `pdf_preview` | CMD+click on a PDF opens Preview |
+| `downloads` | Right-click a path in an ssh pane downloads it |
+| `port_forward` | CMD+click localhost URLs and `ssh -L` commands, CMD+SHIFT+L |
+| `layout_repair` | CMD+SHIFT+= and refit after window resizes |
+| `fullscreen_refit` | Refit fullscreen after a monitor is unplugged |
+| `pane_moves` | CMD+OPT+T / N / 1..9 move panes, CMD+SHIFT+M merges windows |
+| `md_preview` | Side-by-side Markdown preview for `mdedit` over ssh |
+| `session_restore` | Session restore (below), CMD+SHIFT+O, CMD+OPT+SHIFT+O |
+| `hibernation` | Hibernation of idle agent panes (below) |
+| `reload_toast` | "config reloaded" toast |
 
 ## WezTerm keys
 
@@ -104,7 +142,7 @@ is run again, through the login shell so the pane stays a shell afterwards:
   commit reset rebase merge ...`, package-manager install/remove/update, docker
   `rm/prune/stop`, `kubectl delete/apply`, `terraform apply/destroy`, and `sh
   -c` strings with those words or a `>` redirect). See `DENY_*` in
-  `wezterm.lua`. An interpreter running a script on PATH (`python
+  `wezterm/features/session_restore.lua`. An interpreter running a script on PATH (`python
   ~/.local/bin/tool`) comes back as `tool`; Yazi drops its `--cwd-file` and
   runs through the `y` function; commands on a `$TMPDIR` file are only typed.
 * An idle shell comes back as a shell in its cwd (also in folders such as
