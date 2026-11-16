@@ -2754,8 +2754,12 @@ local function capture_pane(pane, is_sidebar)
   local info = pane:get_domain_name() == 'local' and pane:get_foreground_process_info()
   local ssh = info and info_ssh_args(info)
   local argv = info and info.argv or {}
+  local hib_id, hib_cwd = hibernated_session(pane:pane_id(), info)
   if is_sidebar then
     rec.kind = 'sidebar'
+  elseif hib_id then -- saved as the claude pane it was, never as its wake screen
+    rec.kind, rec.claude = 'claude', hib_id
+    cwd = present(hib_cwd) and hib_cwd or cwd
   elseif ssh then
     rec.kind, rec.ssh = 'ssh', { table.unpack(ssh, 2) }
     cwd = nil -- the local shell's cwd means nothing on the host
