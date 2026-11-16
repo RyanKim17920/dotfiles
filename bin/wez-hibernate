@@ -1,0 +1,266 @@
+#!/usr/bin/python3
+"""wez-hibernate: the sleeping screen of a hibernated agent pane.
+
+WezTerm (wezterm.lua, "Hibernation") stops an agent CLI that sat idle in a
+pane for an hour and runs, in the shell left behind (or in a shell split in
+first, when the agent was the pane's own process and its pane closes):
+
+    cd <cwd> && wez-hibernate --id <id> --cwd <cwd> [--after <pid>] <screen file> \
+      && claude --resume <id>
+
+This draws the screen saved just before the stop (the output of
+pane:get_lines_as_escapes), dimmed, with a banner on top, and exits 0 on any
+key or mouse click so that shell resumes the session (through the shell, so
+its `claude` function and environment apply). Scrolling is ignored; a resize
+redraws. With --after it waits for that process (the stopped agent) to be
+gone before exiting 0, so two never run on one session. Killed (pane closed,
+WezTerm quit) it exits 1 and nothing is resumed; session restore brings the
+pane back from the --id on its command line. --cwd is only read there.
+
+`wez-hibernate --check` exits 0: WezTerm runs it to see the interpreter works.
+Standard library only; the screen file is removed once read.
+"""
+
+import os
+import re
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+import unicodedata
+
+ESC = "\x1b"
+# Escape sequences in the saved screen: CSI (SGR ends in m), OSC (to BEL or
+# ST), charset designators like ESC ( B, and any other two-byte escape
+SEQ = re.compile(
+    r"\x1b\[([0-9;:<=>?]*)([ -/]*[@-~])"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[()*+][0-9A-Za-z]"
+    r"|\x1b[@-_]"
+)
+# A click in SGR mouse mode: ESC [ < button ; x ; y M (press) or m (release)
+MOUSE = re.compile(r"\x1b\[<(\d+);\d+;\d+([Mm])")
+
+BANNER_FG = "38;2;205;214;244"  # Catppuccin Mocha text / surface0, as in wezterm.lua
+BANNER_BG = "48;2;49;50;68"
+BANNER_ACCENT = "38;2;250;179;135"  # peach
+
+
+def width(ch):
+    if unicodedata.combining(ch) or ch in "‍︎️":
+        return 0
+    if unicodedata.east_asian_width(ch) in "WF":
+        return 2
+    return 1
+
+
+def text_width(s):
+    return sum(width(c) for c in s)
+
+
+def fg_of(params, fg):
+    """The foreground color after an SGR with `params`, as SGR text (None = default)."""
+    parts = params.split(";") if params else ["0"]
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        head = p.split(":")[0]
+        if head in ("", "0", "39"):
+            fg = None
+        elif head.isdigit() and (30 <= int(head) <= 37 or 90 <= int(head) <= 97):
+            fg = head
+        elif head in ("38", "48", "58"):
+            if ":" in p:  # 38:2::r:g:b or 38:5:n in one parameter
+                color = p
+            else:  # 38;2;r;g;b or 38;5;n across parameters
+                n = 5 if parts[i + 1 : i + 2] == ["2"] else 2
+                color = ";".join(parts[i : i + 1 + n])
+                i += n
+            if head == "38":
+                fg = color
+        i += 1
+    return fg
+
+
+def dim_line(line, cols):
+    """`line` (text with escapes) cut to `cols` cells, colors kept as faint
+    foregrounds only (no backgrounds, bold, reverse or underline)."""
+    out, used, fg, pos = [], 0, None, 0
+    out.append(ESC + "[0;2m")
+    for m in list(SEQ.finditer(line)) + [None]:
+        chunk = line[pos : m.start() if m else len(line)]
+        for ch in chunk:
+            if ch in "\r\n":
+                continue
+            w = width(ch)
+            if used + w > cols:
+                return "".join(out)
+            out.append(ch)
+            used += w
+        if not m:
+            break
+        pos = m.end()
+        if m.group(2) == "m":  # SGR: keep only the foreground, always faint
+            fg = fg_of(m.group(1), fg)
+            out.append(ESC + "[0;2" + (";" + fg if fg else "") + "m")
+    return "".join(out)
+
+
+def fit(s, cols):
+    out, used = [], 0
+    for ch in s:
+        w = width(ch)
+        if used + w > cols:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
+class Screen:
+    def __init__(self, path, since):
+        self.lines = []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                self.lines = f.read().split("\n")
+        except OSError:
+            pass
+        while self.lines and not SEQ.sub("", self.lines[-1]).strip():
+            self.lines.pop()
+        stamp = time.strftime("%-I:%M %p", time.localtime(since))
+        self.head = "\U0001f4a4 Hibernated " + stamp
+        self.tail = "press any key or click to wake"
+
+    def draw(self):
+        try:
+            cols, rows = os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            cols, rows = 80, 24
+        out = [ESC + "[0m" + ESC + "[H" + ESC + "[2J"]
+        lines = self.lines[-rows:]  # the bottom of the saved screen (the prompt) if smaller
+        for row, line in enumerate(lines, 1):
+            out.append(ESC + "[%d;1H" % row + dim_line(line, cols))
+        one = self.head + " \u2014 " + self.tail  # one line if it fits, else two
+        banner = [one] if text_width(one) + 6 <= cols else [self.head, self.tail]
+        inner = max(text_width(b) for b in banner) + 4
+        boxed = inner + 2 <= cols and rows >= len(banner) + 2
+        body = [b.center(inner - (text_width(b) - len(b))) for b in banner]
+        if boxed:
+            body = ["╭" + "─" * inner + "╮"] + [
+                "│" + b + "│" for b in body
+            ] + ["╰" + "─" * inner + "╯"]
+        body = [fit(b, cols) for b in body]
+        top = max(1, (rows - len(body)) // 2 + 1)
+        for i, b in enumerate(body):
+            left = max(1, (cols - text_width(b)) // 2 + 1)
+            color = BANNER_ACCENT if "Hibernated" in b and len(banner) > 1 else BANNER_FG
+            out.append(ESC + "[%d;%dH" % (top + i, left))
+            out.append(ESC + "[0;1;" + color + ";" + BANNER_BG + "m" + b + ESC + "[0m")
+        os.write(sys.stdout.fileno(), "".join(out).encode("utf-8"))
+
+
+def wants_wake(data):
+    """Any key, or a left/middle/right button press; wheel and releases do not."""
+    for m in MOUSE.finditer(data):
+        button = int(m.group(1))
+        if m.group(2) == "M" and button < 64 and (button & 3) != 3:
+            return True
+    rest = MOUSE.sub("", data)
+    return rest != ""
+
+
+def gone(pid):
+    """Has process `pid` exited (or was there none)?"""
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def wait_gone(pid, seconds):
+    end = time.time() + seconds
+    while not gone(pid):
+        if time.time() > end:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+USAGE = "usage: wez-hibernate --id <session id> [--cwd <dir>] [--after <pid>] <screen file>\n"
+
+
+def main(argv):
+    args = argv[1:]
+    if args == ["--check"]:
+        return 0
+    opts = {}
+    while len(args) >= 2 and args[0] in ("--id", "--cwd", "--after"):
+        opts[args[0]], args = args[1], args[2:]
+    session, after = opts.get("--id", ""), opts.get("--after")
+    if len(args) != 1 or not re.match(r"^[\w-]+$", session) or (after and not after.isdigit()):
+        sys.stderr.write(USAGE)
+        return 2
+    after = int(after) if after else None
+    path = args[0]
+    try:
+        since = os.path.getmtime(path)
+    except OSError:
+        since = time.time()
+    screen = Screen(path, since)
+    try:
+        os.remove(path)  # read: WezTerm sweeps up only files nobody read
+    except OSError:
+        pass
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    resized = []
+    done = []
+
+    def leave(code):
+        os.write(sys.stdout.fileno(), (ESC + "[?1006l" + ESC + "[?1000l" + ESC + "[0m"
+                                       + ESC + "[2J" + ESC + "[?25h" + ESC + "[?1049l").encode())
+        termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+        if code == 0 and not gone(after):
+            sys.stdout.write("Waiting for the stopped session to exit...\n")
+            sys.stdout.flush()
+            if not wait_gone(after, 30):
+                sys.stdout.write("It is still running (pid %d): not resuming.\n" % after)
+                return 1
+        return code
+
+    def stop(signum, frame):
+        done.append(1)
+
+    signal.signal(signal.SIGWINCH, lambda s, f: resized.append(1))
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+    tty.setraw(fd)
+    os.write(sys.stdout.fileno(), (ESC + "[?1049h" + ESC + "[?25l" + ESC + "[?1000h" + ESC + "[?1006h").encode())
+    screen.draw()
+    while not done:
+        if resized:
+            del resized[:]
+            screen.draw()
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.25)
+        except InterruptedError:
+            continue
+        if not ready:
+            continue
+        data = os.read(fd, 4096)
+        if not data:  # the terminal is gone
+            break
+        if wants_wake(data.decode("utf-8", "replace")):
+            return leave(0)
+    return leave(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
