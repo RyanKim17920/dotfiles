@@ -56,7 +56,7 @@ it. Unknown flags and skipped features are logged as `features:` warnings.
 | `quicklook` | CMD+OPT+SHIFT+click: Quick Look |
 | `media_reveal` | CMD+click on video / audio reveals it in Finder |
 | `pdf_preview` | CMD+click on a PDF opens Preview |
-| `downloads` | Right-click a path in an ssh pane downloads it |
+| `downloads` | Right-click a path in an ssh pane downloads it; so does `g m` in remote Yazi |
 | `port_forward` | CMD+click localhost URLs and `ssh -L` commands, CMD+SHIFT+L |
 | `layout_repair` | CMD+SHIFT+= and refit after window resizes |
 | `fullscreen_refit` | Refit fullscreen after a monitor is unplugged |
@@ -92,6 +92,7 @@ it. Unknown flags and skipped features are logged as `features:` warnings.
 | CMD+SHIFT+L | Same without a click: a port, a localhost URL or a whole `ssh -L` command |
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. CTRL+V pastes only in ssh panes; in local panes the raw key goes through, for Claude Code's image paste. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | Right-click a path in an ssh pane | Download the file or folder to `~/Downloads/<host>/` in the background over the ControlMaster (tar, so the remote only needs ssh and tar; never logs in, toasts if there is no live master), then reveal it in Finder. Toasts at start and end, with the size. A different item of the same name is kept and the new one numbered (`name (1).ext`); an identical one is reused. Unbound elsewhere. An app that grabs the mouse still gets the press but not the release |
+| `g m` in Yazi on an ssh host | Download the selected files and folders (or the hovered one) the same way. Yazi sets the `wez_download` user var, which WezTerm honours only in a local pane running ssh; at most 50 items per request. Inside tmux it uses passthrough: always on before tmux 3.3, turned on for that pane on 3.3+. Ships with `ssh-setup` (the keymap) |
 | CMD+W / CTRL+SHIFT+W | Close the pane. WezTerm's own confirm, shown over that pane only: y closes, n or Esc cancels (Enter does nothing). Skipped when the pane only runs an idle shell (bash, zsh, sh, fish, nu; tmux still asks) |
 | CMD+[ / CMD+] | Previous / next pane |
 | CMD+OPT+arrows | Focus pane in that direction |
