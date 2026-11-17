@@ -453,24 +453,35 @@ fetch_release() {
 	url="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$rel")"
 	digest="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .digest // empty' <<<"$rel")"
 	[ -n "$url" ] || die "$repo v$ver has no asset $name"
-	dir="$CACHE/$ARCH/dl"; mkdir -p "$dir"; file="$dir/$name"
-	if [ ! -s "$file" ]; then
-		echo "  downloading $name" >&2
-		curl -fsSL -o "$file.part" "$url" || die "download failed: $url"
-		mv "$file.part" "$file"
-	fi
+	# cache per release: some asset names carry no version (resvg, jq, yazi), so
+	# a flat dl/<name> kept an older release's file and failed its new digest
+	dir="$CACHE/$ARCH/dl/${repo##*/}-$ver"; mkdir -p "$dir"; file="$dir/$name"
 	if [ -z "$digest" ]; then
 		# fall back to a published checksum file (checksums.txt or <asset>.sha)
 		local sums
 		sums="$(jq -r --arg n "$name" '.assets[] | select(.name == "checksums.txt" or .name == "sha256sum.txt" or .name == ($n + ".sha")) | .browser_download_url' <<<"$rel" | head -1)"
 		[ -n "$sums" ] && digest="sha256:$(curl -fsSL "$sums" | awk -v n="$name" '$2 == n || $2 == "*" n || NF == 1 { print $1; exit }')"
 	fi
-	if [ -n "$digest" ] && [ "$digest" != "sha256:" ]; then
-		local got; got="sha256:$(shasum -a 256 "$file" | awk '{ print $1 }')"
-		[ "$got" = "$digest" ] || { rm -f "$file"; die "checksum mismatch for $name ($got != $digest)"; }
-	else
-		warn "no published checksum for $name; not verified"
-	fi
+	[ "$digest" = "sha256:" ] && digest=""
+	# a file that fails its digest (bad cache or partial download) is deleted
+	# and downloaded again, once
+	local try got
+	for try in 1 2; do
+		if [ ! -s "$file" ]; then
+			echo "  downloading $name" >&2
+			curl -fsSL -o "$file.part" "$url" || { rm -f "$file.part"; die "download failed: $url"; }
+			mv "$file.part" "$file"
+		fi
+		if [ -z "$digest" ]; then
+			warn "no published checksum for $name; not verified"
+			break
+		fi
+		got="sha256:$(shasum -a 256 "$file" | awk '{ print $1 }')"
+		[ "$got" = "$digest" ] && break
+		rm -f "$file"
+		[ "$try" = 1 ] || die "checksum mismatch for $name v$ver after re-download (got $got, expected $digest)"
+		warn "checksum mismatch for $name v$ver (got $got, expected $digest); re-downloading"
+	done
 	printf '%s %s\n' "$file" "$ver"
 }
 
