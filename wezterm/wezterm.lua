@@ -18,7 +18,7 @@ local features = {
   quicklook = true,        -- CMD+OPT+SHIFT+click a path opens Quick Look (needs paths)
   media_reveal = true,     -- CMD+click a video/audio file reveals it in Finder (needs paths)
   pdf_preview = true,      -- CMD+click a PDF opens it in Preview (needs paths)
-  downloads = true,        -- right-click a path in an ssh pane downloads it (needs paths)
+  downloads = true,        -- right-click a path in an ssh pane (or g m in remote Yazi) downloads it (needs paths)
   port_forward = true,     -- CMD+click localhost URLs / ssh -L commands forwards the port; CMD+SHIFT+L
   layout_repair = true,    -- CMD+SHIFT+= and window resizes refit panes that spill off the window
   fullscreen_refit = true, -- refit a fullscreen window after a monitor is unplugged
