@@ -64,19 +64,127 @@ local function path_variants(text)
   return out
 end
 
+-- `dir` with a leading ~ made the local home
+local function expand_home(dir)
+  if dir == '~' or dir:sub(1, 2) == '~/' then return wezterm.home_dir .. dir:sub(2) end
+  return dir
+end
+
 -- Existing absolute path for `text` (see path_variants), resolving ~ and
--- relative paths against `cwd`; nil if nothing exists.
-local function resolve_path(text, cwd)
+-- relative paths against `cwd`, then each of `dirs` (see search_dirs) in
+-- order; nil if nothing exists.
+local function resolve_path(text, cwd, dirs)
   for _, c in ipairs(path_variants(text)) do
-    if c == '~' or c:sub(1, 2) == '~/' then
-      c = wezterm.home_dir .. c:sub(2)
-    elseif c:sub(1, 1) ~= '/' then
-      c = cwd .. '/' .. c
+    if c == '~' or c:sub(1, 2) == '~/' or c:sub(1, 1) == '/' then
+      c = normalize(expand_home(c))
+      if exists(c) then return c end
+    else
+      for k = 0, #(dirs or {}) do
+        local full = normalize(expand_home(k == 0 and cwd or dirs[k]) .. '/' .. c)
+        if exists(full) then return full end
+      end
     end
-    c = normalize(c)
-    if exists(c) then return c end
   end
   return nil
+end
+
+-- A bare name or relative path (README.md, figs/plot.png) is often printed
+-- by a program that means a directory shown elsewhere on screen, or one a
+-- recent click resolved, not the shell's cwd. search_dirs lists those
+-- directories for resolve_path and resolve_remote: for each absolute (or ~)
+-- path in the pane's last SCAN_DIR_LINES lines, the path itself (it may be a
+-- directory), its parent and, for a text like figs/plot.png, the part of it
+-- before a figs segment, nearest to the clicked line first, then the
+-- directories of the last clicks on the same host (remember_dir), newest
+-- first; de-duplicated, at most MAX_DIRS. Nothing is checked here, so this
+-- costs no round trip; the caller tests `dir/text` for each.
+local SCAN_DIR_LINES, MAX_DIRS, MAX_RECENT = 2000, 40, 10
+local DIRS_KEY = 'path_click_dirs'
+-- What may precede an absolute path on screen (as in the path link rules)
+local DIR_BOUNDARY = '[%s"\'`(%[{<=*]'
+
+local function recent_dirs(host_key)
+  local ok, all = pcall(wezterm.json_parse, wezterm.GLOBAL[DIRS_KEY] or '{}')
+  return ok and type(all) == 'table' and all[host_key] or {}, ok and type(all) == 'table' and all or {}
+end
+
+-- Remember the directory of a resolved click (`path`, a directory when
+-- `is_dir`) on host `host_key` for later relative clicks
+local function remember_dir(host_key, path, is_dir)
+  local dir = is_dir and path or path:match '^(.+)/[^/]*$'
+  if not dir or dir == '' then return end
+  local list, all = recent_dirs(host_key)
+  local out = { dir }
+  for _, d in ipairs(list) do
+    if d ~= dir and #out < MAX_RECENT then table.insert(out, d) end
+  end
+  all[host_key] = out
+  wezterm.GLOBAL[DIRS_KEY] = wezterm.json_encode(all)
+end
+
+-- Absolute (or ~) paths in `line`, cleaned of trailing punctuation, a
+-- :line[:col] suffix and a trailing /
+local function line_paths(line)
+  local out = {}
+  for s, p in line:gmatch '()(~?/[^%s"\'`()%[%]{}<>*]+)' do
+    if s == 1 or line:sub(s - 1, s - 1):match(DIR_BOUNDARY) then
+      p = p:gsub('[.,:;!?]+$', ''):gsub(':%d+[:-]%d+$', ''):gsub(':%d+$', ''):gsub('/+$', '')
+      if p ~= '' and p ~= '~' then table.insert(out, p) end
+    end
+  end
+  return out
+end
+
+-- The part of absolute path `p` before the last segment equal to `first`
+-- (the first segment of a clicked relative path like figs/plot.png), or nil
+local function prefix_before(p, first)
+  local found, from = nil, 1
+  while true do
+    local s, e = p:find('/' .. first, from, true)
+    if not s then return found end
+    local after = p:sub(e + 1, e + 1)
+    if after == '' or after == '/' then found = p:sub(1, s - 1) end
+    from = s + 1
+  end
+end
+
+local function search_dirs(pane, text, host_key)
+  local ok, all = pcall(pane.get_logical_lines_as_text, pane, SCAN_DIR_LINES)
+  local lines = {}
+  for line in ((ok and all or '') .. '\n'):gmatch '([^\n]*)\n' do table.insert(lines, line) end
+  -- The clicked line: the last one showing `text`, else the bottom
+  local at = #lines
+  for i = #lines, 1, -1 do
+    if lines[i]:find(text, 1, true) then
+      at = i
+      break
+    end
+  end
+  local dirs, seen = {}, {}
+  local function add(d)
+    if d ~= '' and d ~= '/' and not seen[d] and #dirs < MAX_DIRS then
+      seen[d] = true
+      table.insert(dirs, d)
+    end
+  end
+  -- A relative path with a directory part (figs/plot.png) may sit under a
+  -- shown path's ancestor: the one just above its first segment
+  local first = text:gsub('^%./', ''):match '^([^/]+)/'
+  if first == '..' then first = nil end
+  -- Lines by distance from the clicked one, the one above first on a tie
+  for dist = 0, math.max(at - 1, #lines - at) do
+    for _, i in ipairs(dist == 0 and { at } or { at - dist, at + dist }) do
+      for _, p in ipairs(lines[i] and line_paths(lines[i]) or {}) do
+        p = p:sub(1, 1) == '/' and normalize(p) or p
+        add(p)
+        add(p:match '^(.+)/[^/]*$' or '')
+        if first then add(prefix_before(p, first) or '') end
+      end
+    end
+    if #dirs >= MAX_DIRS then break end
+  end
+  for _, d in ipairs((recent_dirs(host_key))) do add(d) end
+  return dirs
 end
 
 -- "29:15", "29" or nil: the :line[:col] (or :first-last) a clicked path
@@ -90,9 +198,10 @@ end
 -- are resolved there over the existing ControlMaster and opened in remote
 -- Yazi (installed by ssh-setup, whose synced init.lua handles YAZI_PEEK)
 -- through ssh-pane. Relative paths resolve against the remote shell's cwd
--- when it reports one with OSC 7 (ssh-setup's ~/.bashrc block does), else
--- against the cwds of the user's processes there (Claude Code inside tmux
--- reports nothing) and the remote home; see REMOTE_RESOLVE.
+-- when it reports one with OSC 7 (ssh-setup's ~/.bashrc block does), then
+-- the directories on screen and of recent clicks (search_dirs), then the
+-- cwds of the user's processes there (an agent CLI inside tmux reports
+-- nothing) and the remote home; see REMOTE_RESOLVE.
 
 -- The remote shell's cwd from OSC 7 (file://<remote host>/dir), or nil.
 -- The local shell's last report is still there while ssh runs, and its
@@ -120,10 +229,11 @@ end
 -- <n> <file>" (absolute, ./.. collapsed) for the first argument that exists
 -- (the n-th), exit 1 if none does. Arguments are A:<absolute path> or R:<relative path>. A
 -- relative path is tried against $RCWD (the shell's OSC 7 cwd) first, then
--- against the cwds of the user's own processes (Linux /proc; those on a tty
--- named claude/node/python/bash first, other tty ones next, the rest last)
--- and $HOME; of several matches the newest (mtime) wins, the earlier one in
--- that order on a tie. `/` is never a base.
+-- each of $DIRS (newline-separated, see search_dirs; a leading ~ is $HOME)
+-- in order, then against the cwds of the user's own processes (Linux /proc;
+-- those on a tty named claude/node/python/bash first, other tty ones next,
+-- the rest last) and $HOME; of several of those last matches the newest
+-- (mtime) wins, the earlier one in that order on a tie. `/` is never a base.
 local REMOTE_RESOLVE = [[
 emit() {
   if [ -d "$1" ]; then
@@ -154,6 +264,12 @@ for w in "$@"; do
     R:*)
       r=${w#R:}
       [ -n "$RCWD" ] && [ -e "$RCWD/$r" ] && emit "$RCWD/$r"
+      while IFS= read -r b; do
+        case $b in '~') b=$HOME ;; '~/'*) b=$HOME/${b#'~/'} ;; esac
+        [ -n "$b" ] && [ -e "$b/$r" ] && emit "$b/$r"
+      done <<EOF
+$DIRS
+EOF
       [ -n "$B" ] || B=$(bases)
       best= bt=-1
       while IFS= read -r b; do
@@ -190,7 +306,7 @@ end
 -- waits for this, so a remote that hangs (dead NFS mount, ...) is given up
 -- on after REMOTE_RESOLVE_TIMEOUT seconds (perl's alarm survives the exec).
 local REMOTE_RESOLVE_TIMEOUT = 5
-local function resolve_remote(ssh, texts, rcwd)
+local function resolve_remote(ssh, texts, rcwd, dirs)
   if not ssh_master_pid(ssh) then
     return nil, 'ssh: no live connection to ' .. ssh_host(ssh) .. ' (ControlMaster)'
   end
@@ -201,7 +317,8 @@ local function resolve_remote(ssh, texts, rcwd)
       table.insert(owner, t)
     end
   end
-  local script = 'RCWD=' .. sh_quote(rcwd or '') .. '\nset -- ' .. table.concat(words, ' ')
+  local script = 'RCWD=' .. sh_quote(rcwd or '') .. '\nDIRS=' .. sh_quote(table.concat(dirs or {}, '\n'))
+    .. '\nset -- ' .. table.concat(words, ' ')
     .. '\n' .. REMOTE_RESOLVE
   local cmd = { '/usr/bin/perl', '-e', 'alarm shift; exec @ARGV or exit 127', tostring(REMOTE_RESOLVE_TIMEOUT) }
   for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
@@ -342,7 +459,8 @@ end
 return {
   PEEK_SCHEME = PEEK_SCHEME, normalize = normalize, percent_decode = percent_decode,
   is_local_host = is_local_host, uri_to_path = uri_to_path, path_variants = path_variants,
-  resolve_path = resolve_path, click_line = click_line, remote_cwd = remote_cwd,
+  resolve_path = resolve_path, search_dirs = search_dirs, remember_dir = remember_dir,
+  line_paths = line_paths, click_line = click_line, remote_cwd = remote_cwd,
   remote_word = remote_word, resolve_words = resolve_words, resolve_remote = resolve_remote,
   path_candidates = path_candidates,
 }
