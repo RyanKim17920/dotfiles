@@ -26,7 +26,9 @@ local PEEK_CACHE = wezterm.home_dir .. '/Library/Caches/wezterm/peek/'
 --   download <dir> <status> <cmd...>
 --                      unpack the tar stream of one file or folder that cmd
 --                      writes into dir, under a numbered name if a different
---                      item already has that name, write the outcome to the
+--                      item already has that name (picked under a lock, so
+--                      parallel downloads of the same name each keep their
+--                      own copy), write the outcome to the
 --                      status file (three lines: kind, path, size or error;
 --                      see DOWNLOAD_NOTES) and reveal it in Finder. Exit 1-2
 --                      are tar's "some files changed or were unreadable";
@@ -81,11 +83,15 @@ download() {
   fi
   dest=$dir/$base n=0 kind=done
   [ "$rc" -eq 0 ] || kind=partial
+  # A lock left by a killed download is ignored after ~10s
+  lock=$dir/.download.lock w=0
+  until mkdir "$lock" 2>/dev/null || [ "$w" -ge 100 ]; do sleep 0.1; w=$((w + 1)); done
   while [ -e "$dest" ] || [ -L "$dest" ]; do
     if diff -rq "$dest" "$item" > /dev/null 2>&1; then kind=same; break; fi
     n=$((n + 1)) dest="$dir/$stem ($n)$ext"
   done
   [ "$kind" = same ] || mv -n "$item" "$dest"
+  rmdir "$lock" 2>/dev/null
   rm -rf "$tmp"
   report "$kind" "$dest" "$(du -sh "$dest" | awk '{ print $1 }')"
   reveal "$dest"
