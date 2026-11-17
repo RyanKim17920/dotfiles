@@ -217,15 +217,20 @@ local function track(window, status, what, area)
   set_downloads(list)
 end
 
-local function download_remote(window, ssh, path)
+-- Download each remote path in `paths` (a list) in parallel, each with its
+-- own status file (so its own toast when done), after one toast for all
+local function download_remote(window, ssh, paths)
   local sub = host_dir(ssh)
-  local status = new_status()
-  local cmd = file_cmd('download', wezterm.home_dir .. '/Downloads/' .. sub, status)
-  for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
-  table.insert(cmd, 'sh -c ' .. sh_quote(REMOTE_TAR) .. ' sh ' .. sh_quote(path))
-  wezterm.background_child_process(cmd)
-  local what = ssh_host(ssh) .. ':' .. path
-  track(window, status, what)
+  for _, path in ipairs(paths) do
+    local status = new_status()
+    local cmd = file_cmd('download', wezterm.home_dir .. '/Downloads/' .. sub, status)
+    for _, a in ipairs(ssh_batch_cmd(ssh)) do table.insert(cmd, a) end
+    table.insert(cmd, 'sh -c ' .. sh_quote(REMOTE_TAR) .. ' sh ' .. sh_quote(path))
+    wezterm.background_child_process(cmd)
+    track(window, status, ssh_host(ssh) .. ':' .. path)
+  end
+  local what = #paths == 1 and (ssh_host(ssh) .. ':' .. paths[1])
+    or (#paths .. ' items from ' .. ssh_host(ssh))
   toast(window, 'Download: ' .. what .. ' to ~/Downloads/' .. sub .. '/', 4000)
 end
 

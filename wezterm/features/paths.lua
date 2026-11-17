@@ -182,7 +182,7 @@ local function open_path(window, pane, uri, click, ctx)
     end
     remember_dir(host_key, path, kind == 'd')
     if download then
-      download_remote(window, ssh, path)
+      download_remote(window, ssh, { path })
     elseif reveal or (kind == 'f' and is_media(path)) then
       reveal_remote(window, ssh, kind, path)
     elseif kind == 'f' and look then
