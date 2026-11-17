@@ -25,7 +25,7 @@ local SSH_PANE, pane_ssh_args = ssh_lib.SSH_PANE, ssh_lib.pane_ssh_args
 local split_fits, tab_geometry = layout.split_fits, layout.tab_geometry
 local PEEK_SCHEME, uri_to_path, resolve_path = paths.PEEK_SCHEME, paths.uri_to_path, paths.resolve_path
 local click_line, remote_cwd, resolve_remote = paths.click_line, paths.remote_cwd, paths.resolve_remote
-local path_candidates = paths.path_candidates
+local path_candidates, search_dirs, remember_dir = paths.path_candidates, paths.search_dirs, paths.remember_dir
 local reveal_local, quicklook_local, preview_file = files.reveal_local, files.quicklook_local, files.preview_file
 local reveal_remote, quicklook_remote, download_remote = files.reveal_remote, files.quicklook_remote, files.download_remote
 
@@ -157,6 +157,11 @@ local function open_path(window, pane, uri, click, ctx)
   local text, host = uri_to_path(uri)
   if not text then return end -- web URL etc.: default opener
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
+  -- Directories besides the cwd that a relative path may be in (see
+  -- search_dirs), keyed by host so recent clicks on one don't leak to another
+  local host_key = ssh and ('ssh ' .. table.concat(ssh, ' ', 2)) or 'local'
+  local dirs = {}
+  if custom and text:sub(1, 1) ~= '/' and text:sub(1, 1) ~= '~' then dirs = search_dirs(pane, text, host_key) end
 
   if ssh then
     -- The longer spellings (see path_candidates) and the clicked text, in
@@ -164,7 +169,7 @@ local function open_path(window, pane, uri, click, ctx)
     local texts, wrapped = {}, false
     if custom then texts, wrapped = path_candidates(pane, text) end
     table.insert(texts, text)
-    local kind, path, which = resolve_remote(ssh, texts, remote_cwd(pane))
+    local kind, path, which = resolve_remote(ssh, texts, remote_cwd(pane), dirs)
     if which and which < #texts then
       text = texts[which]
     elseif kind == 'd' and wrapped then
@@ -175,6 +180,7 @@ local function open_path(window, pane, uri, click, ctx)
       toast(window, path)
       return false
     end
+    remember_dir(host_key, path, kind == 'd')
     if download then
       download_remote(window, ssh, path)
     elseif reveal or (kind == 'f' and is_media(path)) then
@@ -191,14 +197,14 @@ local function open_path(window, pane, uri, click, ctx)
   -- Outside ssh a file:// host is this Mac under some name (OSC 7 / ls
   -- --hyperlink use the DHCP name, which changes): use the path if it exists
   local cwd = pane_cwd(pane)
-  local path = pane:get_domain_name() == 'local' and resolve_path(text, cwd)
+  local path = pane:get_domain_name() == 'local' and resolve_path(text, cwd, dirs)
   if custom and path ~= false then
     -- The longest existing spelling with spaces or across a wrap (see
     -- path_candidates) beats the clicked piece, even one that exists
     local cands, wrapped = path_candidates(pane, text)
     local full
     for _, c in ipairs(cands) do
-      full = resolve_path(c, cwd)
+      full = resolve_path(c, cwd, dirs)
       if full then
         text = c
         break
@@ -218,6 +224,7 @@ local function open_path(window, pane, uri, click, ctx)
     end
     return -- file:// we can't resolve: let the default opener try
   end
+  remember_dir(host_key, path, is_dir(path))
   if reveal or (not look and not is_dir(path) and is_media(path)) then
     reveal_local(path)
     if not reveal then toast(window, 'Finder: ' .. (path:match '[^/]+$' or path), 2000) end
