@@ -190,10 +190,8 @@ do
   local w, pane = fake_window(), fake_pane('$ claude\n' .. LINE .. '\n')
   local list = pf.screen_tunnels(w, pane)
   eq('screen: tunnel listed', #list, 1)
-  eq('screen: label', list[1] and ports._test.tunnel_label(list[1]), '⇄ :8766 (from screen: open with token)')
-  local choices = ports._test.picker_choices(nil, {}, {}, list)
-  eq('picker: first row is the tunnel', choices[1] and choices[1].label, '⇄ :8766 (from screen: open with token)')
-  eq('picker: its id', choices[1] and choices[1].id, 's1')
+  eq('screen: action', list[1] and ports._test.tunnel_action(list[1]), 'open with token')
+  eq('screen: ports', list[1] and ports._test.tunnel_ports(list[1]), ':8766')
   log_lines()
   opened = {}
   local t = list[1]
@@ -248,13 +246,13 @@ end
 do
   local function label(text)
     local list = pf.screen_tunnels(fake_window(), fake_pane(text))
-    return list[1] and ports._test.tunnel_label(list[1])
+    return list[1] and (ports._test.tunnel_ports(list[1]) .. ' ' .. ports._test.tunnel_action(list[1]))
   end
-  eq('label: no URL', label 'ssh -N -L 8888:localhost:8888 me@h', '⇄ :8888 (from screen: forward and open)')
+  eq('label: no URL', label 'ssh -N -L 8888:localhost:8888 me@h', ':8888 forward and open')
   eq('label: URL without token', label 'ssh -N -L 8888:localhost:8888 me@h && open http://localhost:8888/lab',
-    '⇄ :8888 (from screen: open /lab)')
+    ':8888 open /lab')
   eq('label: two forwards', label 'ssh -N -L 8888:localhost:8888 -L 6006:localhost:6006 me@h',
-    '⇄ :8888, :6006 (from screen: forward and open)')
+    ':8888, :6006 forward and open')
   eq('screen: same command twice is one row', #pf.screen_tunnels(fake_window(), fake_pane(LINE .. '\n' .. LINE)), 1)
   check('target: localhost is 127.0.0.1', T.same_target('localhost', '127.0.0.1'))
   check('target: node differs', not T.same_target('localhost', 'node-1'))

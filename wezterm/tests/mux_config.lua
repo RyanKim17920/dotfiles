@@ -67,12 +67,15 @@ local function run_checks(pane_id)
     local tunnels = port_forward.screen_tunnels({ mux_window = function() error 'none' end }, pane)
     local labels = {}
     for _, t in ipairs(tunnels) do
-      labels[t.forwards[1].lport] = ports._test.tunnel_label(t) .. ' ' .. t.ssh[#t.ssh] .. ' ' .. (t.url and t.url.rest or '-')
+      labels[t.forwards[1].lport] = ports._test.tunnel_ports(t) .. ' ' .. ports._test.tunnel_action(t) .. ' ' .. t.ssh[#t.ssh] .. ' ' .. (t.url and t.url.rest or '-')
     end
     eq('mux: soft-wrapped tunnel line', labels[8766],
-      '⇄ :8766 (from screen: open with token) USER@login-1.HOST.example /#otc=TOKEN_x-9')
+      ':8766 open with token USER@login-1.HOST.example /#otc=TOKEN_x-9')
     eq('mux: hard-wrapped tunnel line', labels[8767],
-      '⇄ :8767 (from screen: open with token) USER@login-1.HOST.example /#otc=TOKEN_x-9')
+      ':8767 open with token USER@login-1.HOST.example /#otc=TOKEN_x-9')
+    -- The ports list walks every window, tab and pane for ssh hosts
+    local ok, hosts = pcall(ports._test.open_hosts, { mux_window = function() error 'none' end }, pane)
+    eq('mux: ports list walks the panes', ok and type(hosts) == 'table' and #hosts, 0)
   end
   local f = io.open(ROOT .. '/results', 'w')
   f:write(table.concat(out, '\n') .. '\nDONE\n')
