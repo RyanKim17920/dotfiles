@@ -31,6 +31,16 @@ local features = {
   reload_toast = true,     -- "config reloaded" toast on the tab bar
 }
 
+-- Settings, overridden in local.lua the same way (same type as here), e.g.
+--   return { ssh_bg_hosts = { 'myhost' } }
+local settings = {
+  -- ssh destinations (as typed, no user@) whose WezTerm remote commands
+  -- (path checks, downloads, drag, previews) ride WezTerm's own key-only
+  -- background ControlMaster, so they never compete with your ssh tabs for
+  -- the server's MaxSessions (lib/ssh.lua). Duo/2FA hosts are always refused.
+  ssh_bg_hosts = {},
+}
+
 local wezterm = require 'wezterm'
 
 -- require() and the reload watcher need this file's real directory: WezTerm
@@ -54,7 +64,9 @@ if f then
     wezterm.log_error('features: local.lua must return a table of flags: ' .. tostring(overrides))
   else
     for name, on in pairs(overrides) do
-      if features[name] == nil or type(on) ~= 'boolean' then
+      if settings[name] ~= nil and type(on) == type(settings[name]) then
+        settings[name] = on
+      elseif features[name] == nil or type(on) ~= 'boolean' then
         wezterm.log_warn('features: local.lua: ignoring ' .. tostring(name) .. ' = ' .. tostring(on))
       else
         features[name] = on
@@ -62,6 +74,8 @@ if f then
     end
   end
 end
+
+require('lib.ssh').bg_hosts = settings.ssh_bg_hosts
 
 local config = wezterm.config_builder()
 local with_editor = require('lib.core').with_editor
