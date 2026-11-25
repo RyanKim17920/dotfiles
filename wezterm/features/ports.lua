@@ -4,7 +4,11 @@
 --    to forward it here (`ssh -O forward`, see features/port_forward.lua for
 --    busy local ports; ports below 1024 map to 8000+port) and open it;
 --  * ports your own processes listen on, on this Mac: pick one to open it;
---  * forwards of ours that are up: pick one to stop it (`ssh -O cancel`).
+--  * forwards of ours that are up: pick one to stop it (`ssh -O cancel`);
+--  * `ssh -L` tunnel commands on screen (this pane's scrollback, then the
+--    window's other panes): pick one to add its forwards on the live master
+--    for its host (never running it or logging in) and open the URL printed
+--    with it, token and all (see port_forward.forward_tunnel).
 -- While an ssh pane whose master is live has focus, its host is polled every
 -- POLL_SECONDS in the background, a port of yours that starts listening
 -- there toasts once, and the right status shows "⇄ N ports · CMD+SHIFT+I"
@@ -289,9 +293,24 @@ local function stop_forward(window, lport)
   toast(window, 'Ports: no forward of ours on localhost:' .. lport)
 end
 
--- Picker rows: `remote` is { ssh, path, host, ports } or nil
-local function picker_choices(remote, listeners, forwards)
+-- "⇄ :8766 (from screen: open with token)" for a tunnel command on screen
+local function tunnel_label(t)
+  local ports = {}
+  for _, f in ipairs(t.forwards) do table.insert(ports, ':' .. f.lport) end
+  local what = 'forward and open'
+  if t.url then
+    what = t.url.rest:match '[?#].-=.' and 'open with token' or ('open ' .. (t.url.rest ~= '' and t.url.rest or '/'))
+  end
+  return '⇄ ' .. table.concat(ports, ', ') .. ' (from screen: ' .. what .. ')'
+end
+
+-- Picker rows: `remote` is { ssh, path, host, ports } or nil, `tunnels`
+-- port_forward.screen_tunnels
+local function picker_choices(remote, listeners, forwards, tunnels)
   local choices, listening = {}, {}
+  for i, t in ipairs(tunnels or {}) do
+    table.insert(choices, { id = 's' .. i, label = tunnel_label(t) })
+  end
   for _, l in ipairs(listeners) do listening[l.port] = l end
   local up = {}
   for _, f in ipairs(forwards) do
@@ -332,7 +351,8 @@ local function local_listeners()
 end
 
 local function open_picker(window, pane, remote)
-  local choices = picker_choices(remote, local_listeners(), port_forward.recorded_forwards())
+  local tunnels = port_forward.screen_tunnels(window, pane)
+  local choices = picker_choices(remote, local_listeners(), port_forward.recorded_forwards(), tunnels)
   if #choices == 0 then
     toast(window, 'Ports: nothing listening' .. (remote and (' on ' .. remote.host .. ' or') or '') .. ' on this Mac')
     return
@@ -343,7 +363,10 @@ local function open_picker(window, pane, remote)
     action = wezterm.action_callback(function(win, _, id)
       if not id then return end
       local kind, port = id:sub(1, 1), tonumber(id:sub(2))
-      if kind == 'r' then
+      if kind == 's' then
+        local t = tunnels[port]
+        port_forward.forward_tunnel(win, t.pane, t.ssh, t.forwards, t.url)
+      elseif kind == 'r' then
         forward_remote(win, remote, port)
       elseif kind == 'l' then
         wezterm.open_with('http://localhost:' .. port)
@@ -482,7 +505,7 @@ end
 local M = {
   -- for tests
   _test = { control_path = control_path, gated_args = gated_args, parse_remote = parse_remote, parse_lsof = parse_lsof, new_ports = new_ports,
-    job_script = job_script, picker_choices = picker_choices, badge_text = badge_text, REMOTE_SCRIPT = REMOTE_SCRIPT },
+    job_script = job_script, picker_choices = picker_choices, tunnel_label = tunnel_label, badge_text = badge_text, REMOTE_SCRIPT = REMOTE_SCRIPT },
 }
 
 function M.apply(config)
