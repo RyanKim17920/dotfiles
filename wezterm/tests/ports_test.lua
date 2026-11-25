@@ -14,6 +14,8 @@ core.SPAWN_PATH = SHIMS .. ':' .. core.SPAWN_PATH
 local ssh_lib = require 'lib.ssh'
 local ports = require 'features.ports'
 local T = ports._test
+local port_names = require 'lib.port_names'
+local function names_row(p) return port_names.row_text(p) end
 
 local failed, passed = 0, 0
 local function check(name, ok, detail)
@@ -300,6 +302,203 @@ do
   for _, l in ipairs(log_lines()) do
     check('no master: only -G and -O check', l:find(' -G ', 1, true) or l:find('-O check', 1, true), l)
   end
+end
+
+-- 9. Naming lines: parsed, and titles cached per port until its pid changes
+do
+  local info = T.parse_info(table.concat({
+    '#home /home/u', '#lp 8888 101', '#cmd 101 python\31-m\31jupyter\31lab\31', '#cwd 101 /home/u/my proj',
+    '#lp 6006 202', '#cmd 202 tensorboard\31--logdir\31runs\31', '#cwd 202 /home/u', '#lp 7000 303', '#cwd 303 ',
+    '#titles', '#title 8888 101 Swap &amp; Explorer', '#title 6006 202 TensorBoard',
+  }, '\n'))
+  eq('info: home', info.home, '/home/u')
+  eq('info: pid of a port', info.pid[8888], '101')
+  eq('info: cmdline kept whole', info.cmd['101'], 'python\31-m\31jupyter\31lab\31')
+  eq('info: cwd with spaces', info.cwd['101'], '/home/u/my proj')
+  eq('info: empty cwd dropped', info.cwd['303'], nil)
+  eq('info: title', info.titles[8888] and info.titles[8888].text, 'Swap &amp; Explorer')
+  eq('info: titles asked', info.titled, true)
+  local ports = { { port = 6006, name = 'tensorboard', owned = true }, { port = 7000, name = 'node', owned = true },
+    { port = 8888, name = 'python', owned = true }, { port = 9000, name = 'other', owned = true } }
+  local cache = T.name_ports(ports, info, nil, {})
+  eq('name: title and project', ports[3].what .. ' | ' .. ports[3].project, 'Swap & Explorer | my proj')
+  eq('name: generic title, home cwd', ports[1].what .. ' | ' .. tostring(ports[1].project), 'TensorBoard · runs | nil')
+  eq('name: no cmdline, the process name', ports[2].what, 'node')
+  eq('name: no pid, untouched', ports[4].what, nil)
+  eq('name: pid recorded', ports[3].pid, 101)
+  eq('cache: title kept', cache['8888'] and cache['8888'].title, 'Swap &amp; Explorer')
+  eq('cache: no answer kept as empty', cache['7000'] and cache['7000'].title, '')
+  eq('cache: no pid, nothing', cache['9000'], nil)
+  -- Next poll: titles skipped for known pids (no #title lines), cache used
+  local vars = T.title_vars(cache)
+  check('vars: known has port:pid', vars:find(' 8888:101 ', 1, true) and vars:find(' 7000:303 ', 1, true), vars)
+  check('vars: titles on', vars:find('\ntitles=1\n', 1, true), vars)
+  local again = T.parse_info '#home /home/u\n#lp 8888 101\n#cmd 101 python\31-m\31jupyter\31lab\31\n#lp 7000 404\n#titles\n'
+  ports = { { port = 8888, name = 'python', owned = true }, { port = 7000, name = 'node', owned = true } }
+  cache = T.name_ports(ports, again, nil, cache)
+  eq('cache: same pid, title from cache', ports[1].what, 'Swap & Explorer')
+  eq('cache: new pid asked again, no answer', cache['7000'] and cache['7000'].pid, '404')
+  eq('cache: ports gone dropped', cache['6006'], nil)
+  -- Titles off: nothing asked, nothing cached, names still there
+  ports[1].what = nil
+  local off = T.parse_info '#lp 8888 101\n#cmd 101 python\31-m\31jupyter\31lab\31\n'
+  cache = T.name_ports(ports, off, nil, {})
+  eq('off: name without a title', ports[1].what, 'Jupyter Lab')
+  eq('off: nothing cached', next(cache), nil)
+  require('features.ports').fetch_titles = false
+  check('off: titles=0', T.title_vars({}):find('\ntitles=0\n', 1, true))
+  require('features.ports').fetch_titles = true
+end
+
+-- 10. Rows say what a port is; the process name stays in the text, dimmed
+do
+  local hs = { { key = '/cm/gpubox', host = 'gpubox', ports = {
+    { port = 8888, name = 'python', owned = true, what = 'Jupyter Lab', project = 'cswap' },
+    { port = 6006, name = 'tensorboard', owned = true, what = 'tensorboard' },
+  } } }
+  local locs = { { port = 5173, name = 'node', what = 'vite', project = 'web' } }
+  local r = T.picker_rows(locs, hs, {}, {})
+  local i, jl = find(r, ':8888 +Jupyter Lab · cswap ')
+  check('row: name · project', jl, plain(r[3] and r[3].label or ''))
+  check('row: process name searchable', jl and plain(jl.label):find('python · forward and open', 1, true))
+  check('row: process name dimmed', jl and jl.label:find('\27[90m' .. 'python', 1, true) or
+    (jl and jl.label:find('python', jl.label:find('\27[', 1, true), true)), jl and jl.label)
+  local _, tb = find(r, ':6006 +tensorboard ')
+  check('row: name same as process, said once', tb and not plain(tb.label):find('tensorboard · forward', 1, true),
+    tb and plain(tb.label))
+  local _, vite = find(r, ':5173 +vite · web ')
+  check('row: mac row named too', vite and plain(vite.label):find('node · open', 1, true), vite and plain(vite.label))
+  eq('row: ids unchanged', i and r[i].id, 'r1:8888')
+end
+
+-- 11. New-port toast
+eq('toast: name (project)', T.toast_message('gpubox', { { port = 8888, what = 'Jupyter Lab', project = 'cswap' } }),
+  '⇄ gpubox:8888 Jupyter Lab (cswap) started · CMD+SHIFT+I to open')
+eq('toast: several, plain name', T.toast_message('gpubox', { { port = 8888, what = 'Jupyter Lab' },
+  { port = 9000, name = 'node' }, { port = 9001 } }), '⇄ gpubox:8888 Jupyter Lab, :9000 node, :9001 started · CMD+SHIFT+I to open')
+
+-- 12. REMOTE_SCRIPT itself, in sh and dash, over a fake ss (or /proc/net/tcp
+-- and fd links), a fake /proc with real NUL cmdlines and a fake curl
+local function sh(script)
+  local ok, out, err = wezterm.run_child_process { '/bin/sh', '-c', script }
+  return ok, out, err
+end
+local FAKE = ROOT .. '/fake'
+do
+  local setup = [=[
+set -e
+F=$1; rm -rf "$F"; mkdir -p "$F/bin" "$F/proc/net" "$F/proc/101/fd" "$F/proc/202/fd" "$F/proc/303" "$F/home/u/my proj"
+cat >"$F/bin/ss" <<'X'
+#!/bin/sh
+cat "$WZ_PROC/ss.txt"
+X
+cat >"$F/proc/ss.txt" <<'X'
+LISTEN 0 128 127.0.0.1:8888 0.0.0.0:* users:(("python",pid=101,fd=3))
+LISTEN 0 128 [::1]:8888 [::]:* users:(("python",pid=101,fd=4))
+LISTEN 0 128 0.0.0.0:6006 0.0.0.0:* users:(("tensorboard",pid=202,fd=5))
+LISTEN 0 128 0.0.0.0:7000 0.0.0.0:* users:(("node",pid=303,fd=5))
+LISTEN 0 128 0.0.0.0:5432 0.0.0.0:* users:(("postgres",pid=303,fd=6))
+LISTEN 0 128 0.0.0.0:9999 0.0.0.0:*
+X
+cat >"$F/bin/curl" <<'X'
+#!/bin/sh
+for a; do u=$a; done
+echo "$u" >>"$WZ_PROC/curl.log"
+case $u in
+  *:8888/) printf '<html><head>\n<TITLE>Swap &amp; Explorer</TITLE></head><svg><title>x</title></svg>' ;;
+  *:6006/) printf '<title>TensorBoard</title>' ;;
+  *:7000/) sleep 4 ;;
+esac
+X
+cat >"$F/bin/find" <<'X'
+#!/bin/sh
+for l in "$WZ_PROC"/[0-9]*/fd/*; do printf '%s %s\n' "${l%/*}" "$(readlink "$l")"; done
+X
+chmod +x "$F/bin/ss" "$F/bin/curl" "$F/bin/find"
+printf 'python3\0-m\0jupyter\0lab\0--no-browser\0' >"$F/proc/101/cmdline"
+printf '/env/bin/python\0/env/bin/tensorboard\0--logdir\0runs/exp 1/\0' >"$F/proc/202/cmdline"
+printf 'node\0server.js\0' >"$F/proc/303/cmdline"
+ln -s "$F/home/u/my proj" "$F/proc/101/cwd"
+ln -s "$F/home/u" "$F/proc/202/cwd"
+echo python >"$F/proc/101/comm"; echo tensorboard >"$F/proc/202/comm"
+me=$(id -u)
+printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n' >"$F/proc/net/tcp"
+printf '   0: 0100007F:22B8 00000000:0000 0A 00000000:00000000 00:00000000 00000000 %s 0 55501 1 0 100 0 0 10 0\n' "$me" >>"$F/proc/net/tcp"
+printf '   1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 %s 0 66601 1 0 100 0 0 10 0\n' 99999 >>"$F/proc/net/tcp"
+printf '   0: 00000000000000000000000000000000:178E 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 %s 0 55502 1 0 100 0 0 10 0\n' "$me" >"$F/proc/net/tcp6"
+ln -s 'socket:[55501]' "$F/proc/101/fd/3"
+ln -s 'socket:[55502]' "$F/proc/202/fd/5"
+]=]
+  local f = assert(io.open(ROOT .. '/setup.sh', 'w'))
+  f:write(setup)
+  f:close()
+  local ok, _, err = sh('/bin/sh ' .. ROOT .. '/setup.sh ' .. FAKE)
+  check('fake: set up', ok, err)
+end
+local function run_remote(shell, vars, no_ss)
+  write(ROOT .. '/remote.sh', vars .. T.REMOTE_SCRIPT)
+  os.remove(FAKE .. '/proc/curl.log')
+  local bin = FAKE .. '/bin'
+  if no_ss then
+    sh('mkdir -p ' .. FAKE .. '/bin2 && cp ' .. bin .. '/curl ' .. bin .. '/find ' .. FAKE .. '/bin2/')
+    bin = FAKE .. '/bin2'
+  end
+  local t0 = os.time()
+  local _, out = sh('cd / && HOME=' .. FAKE .. '/home/u WZ_PROC=' .. FAKE .. '/proc PATH=' .. bin
+    .. ':/usr/bin:/bin ' .. shell .. ' -s <' .. ROOT .. '/remote.sh')
+  local f = io.open(FAKE .. '/proc/curl.log')
+  local log = f and f:read 'a' or ''
+  if f then f:close() end
+  return out, log, os.time() - t0
+end
+for _, shell in ipairs { '/bin/sh', '/bin/dash' } do
+  local out, log, secs = run_remote(shell, T.title_vars {})
+  local ports = T.parse_remote(out)
+  check(shell .. ': listed', ports and #ports == 5, out)
+  local cache = T.name_ports(ports or {}, T.parse_info(out), nil, {})
+  local by = {}
+  for _, p in ipairs(ports or {}) do by[p.port] = p end
+  eq(shell .. ': title and project', by[8888] and names_row(by[8888]), 'Swap & Explorer · my proj')
+  eq(shell .. ': NUL argv, spaces, home cwd', by[6006] and names_row(by[6006]), 'TensorBoard · exp 1')
+  eq(shell .. ': slow page, script name', by[7000] and names_row(by[7000]), 'server.js')
+  eq(shell .. ': other user\'s port unnamed', by[9999] and by[9999].what, nil)
+  check(shell .. ': postgres port never asked', not log:find(':5432/', 1, true), log)
+  check(shell .. ': capped near 2 s', secs <= 4, secs)
+  eq(shell .. ': slow page cached as none', cache['7000'] and cache['7000'].title, '')
+  -- Next poll: nothing asked again
+  out, log = run_remote(shell, T.title_vars(cache))
+  eq(shell .. ': known pids not asked again', log, '')
+  ports = T.parse_remote(out)
+  T.name_ports(ports, T.parse_info(out), nil, cache)
+  eq(shell .. ': title from cache', ports[4] and ports[4].port == 8888 and ports[4].what, 'Swap & Explorer')
+  -- Titles off: no curl at all
+  out, log = run_remote(shell, 'known=\ntitles=0\n')
+  eq(shell .. ': titles off, no requests', log, '')
+  check(shell .. ': titles off, no marker', not out:find('#titles', 1, true), out)
+  -- /proc/net/tcp fallback: ports from tcp and tcp6, pids from fd links
+  out = run_remote(shell, 'known=\ntitles=0\n', true)
+  ports = T.parse_remote(out)
+  check(shell .. ': proc listing', ports and #ports == 3, out)
+  if ports then T.name_ports(ports, T.parse_info(out), nil, {}) end
+  by = {}
+  for _, p in ipairs(ports or {}) do by[p.port] = p end
+  eq(shell .. ': proc names 8888', by[8888] and names_row(by[8888]), 'Jupyter Lab · my proj')
+  eq(shell .. ': proc names 6030 (tcp6)', by[6030] and names_row(by[6030]), 'TensorBoard · exp 1')
+  eq(shell .. ': proc, another uid unnamed', by[8080] and tostring(by[8080].what) .. ' ' .. tostring(by[8080].owned),
+    'nil false')
+end
+
+-- 13. LOCAL_SCRIPT on this Mac: a real process's args and cwd
+do
+  wezterm.run_child_process { '/bin/mkdir', '-p', ROOT .. '/my web' }
+  write(ROOT .. '/local.sh', 'known=\ntitles=0\n' .. T.LOCAL_SCRIPT)
+  local ok, out = sh('cd ' .. core.sh_quote(ROOT .. '/my web') .. ' && { /bin/sleep 7 & p=$!; } && pairs="5173 $p" pids=$p '
+    .. '/bin/sh ' .. ROOT .. '/local.sh; kill $p; echo "#pid $p"')
+  local pid = out and out:match '#pid (%d+)'
+  local info = T.parse_info(out)
+  check('local: ran', ok and pid, out)
+  check('local: args', pid and info.cmd[pid] and info.cmd[pid]:find('^/bin/sleep 7'), out)
+  eq('local: cwd', pid and info.cwd[pid] and info.cwd[pid]:gsub('^/private', ''), (ROOT .. '/my web'):gsub('^/private', ''))
 end
 
 io.stderr:write('RESULT ', passed, ' passed, ', failed, ' failed\n')
