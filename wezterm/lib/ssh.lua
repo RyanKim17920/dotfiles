@@ -130,6 +130,30 @@ master_gate() {
 }
 ]]
 
+-- argv that runs the sh command `cmd` on the pane's host (ssh: a
+-- pane_ssh_args result) over its live ControlMaster (master_gate,
+-- master_ssh), or writes "GATE: <why>" to stderr and exits 3 when there is
+-- none. One local sh, one round trip; it never logs in. A -J (part of the
+-- ControlPath, so kept for the gate) is dropped after it: ssh refuses -J
+-- next to ProxyCommand=false, and -S names the master anyway.
+local GATED_SH = MASTER_SH .. [[
+c=$1; shift
+master_gate "$@" || { printf 'GATE: %s\n' "$why" >&2; exit 3; }
+skip=
+for a do
+  shift
+  if [ -n "$skip" ]; then skip=; continue; fi
+  case $a in -J) skip=1; continue ;; esac
+  set -- "$@" "$a"
+done
+master_ssh "$@" "$c"
+]]
+local function ssh_gated_cmd(ssh, cmd)
+  local argv = { '/usr/bin/env', 'PATH=' .. SPAWN_PATH, 'sh', '-c', GATED_SH, 'sh', cmd }
+  for k = 2, #ssh do table.insert(argv, ssh[k]) end
+  return argv
+end
+
 -- Destination without user@, for messages and file names
 local function ssh_host(ssh)
   return (ssh[#ssh]:gsub('^.*@', ''))
@@ -139,4 +163,5 @@ return {
   RESTORE_TAG = RESTORE_TAG, ssh_split_args = ssh_split_args, info_ssh_args = info_ssh_args,
   pane_ssh_args = pane_ssh_args, ssh_cmd = ssh_cmd, ssh_batch_cmd = ssh_batch_cmd,
   ssh_master_pid = ssh_master_pid, ssh_host = ssh_host, MASTER_SH = MASTER_SH,
+  ssh_gated_cmd = ssh_gated_cmd,
 }
