@@ -45,6 +45,7 @@ local LOOPBACK = {
 }
 local FORWARD_KEY = 'ssh_forward_' -- .. master args .. '|' .. target:rport -> local port
 local FORWARD_PORT_KEY = 'ssh_forward_port_' -- .. local port -> "args\ttarget\trport" (ours)
+local FORWARD_INDEX_KEY = 'ssh_forward_ports' -- " lport lport ... " with a FORWARD_PORT_KEY record
 local SCROLLBACK_LINES = 2000
 
 -- { scheme, host, rport, rest } for a loopback http(s) URL, else nil
@@ -240,6 +241,12 @@ local function forward_key(ssh, target, rport)
   return FORWARD_KEY .. table.concat(ssh, ' ', 2) .. '|' .. target .. ':' .. rport
 end
 
+-- Add or drop local `port` in the index of recorded forwards
+local function index_forward(port, keep)
+  local index = (wezterm.GLOBAL[FORWARD_INDEX_KEY] or ' '):gsub(' ' .. port .. ' ', ' ')
+  wezterm.GLOBAL[FORWARD_INDEX_KEY] = keep and (index .. port .. ' ') or index
+end
+
 -- -O forward / -O cancel of lport:target:rport on master `ssh`, keeping the
 -- GLOBAL records in step
 local function add_forward(ssh, lport, target, rport)
@@ -247,6 +254,7 @@ local function add_forward(ssh, lport, target, rport)
   if not wezterm.run_child_process(ssh_cmd(ssh, '-O', 'forward', '-L', spec)) then return false end
   wezterm.GLOBAL[forward_key(ssh, target, rport)] = lport
   wezterm.GLOBAL[FORWARD_PORT_KEY .. lport] = table.concat(ssh, '\t') .. '\n' .. target .. '\n' .. rport
+  index_forward(lport, true)
   return true
 end
 
@@ -255,6 +263,7 @@ local function cancel_forward(ssh, lport, target, rport)
   if listener(lport) then return false end
   wezterm.GLOBAL[FORWARD_PORT_KEY .. lport] = nil
   wezterm.GLOBAL[forward_key(ssh, target, rport)] = nil
+  index_forward(lport, false)
   return true
 end
 
@@ -266,6 +275,21 @@ local function recorded_forward(port)
   local ssh = {}
   for v in args:gmatch '[^\t]+' do table.insert(ssh, v) end
   return ssh, { lport = port, host = target, rport = tonumber(rport) }
+end
+
+-- Every forward recorded as ours, { ssh, lport, host, rport } by local port.
+-- A record outlives its master: check the port still listens.
+local function recorded_forwards()
+  local list = {}
+  for port in (wezterm.GLOBAL[FORWARD_INDEX_KEY] or ''):gmatch '%d+' do
+    local ssh, f = recorded_forward(tonumber(port))
+    if ssh then
+      f.ssh = ssh
+      table.insert(list, f)
+    end
+  end
+  table.sort(list, function(a, b) return a.lport < b.lport end)
+  return list
 end
 
 -- Forward local `want` (or a free port near it) to target:rport through
@@ -592,7 +616,11 @@ local forward_prompt = act.PromptInputLine {
   end),
 }
 
-local M = {}
+-- Shared with features/ports.lua
+local M = {
+  ssh_forward = ssh_forward, cancel_forward = cancel_forward,
+  recorded_forwards = recorded_forwards, describe_forward = describe_forward,
+}
 
 function M.apply(config)
   -- `ssh ... -L ... dest` commands (tunnel hints printed by servers and
