@@ -88,9 +88,14 @@ local function ssh_cmd(ssh, ...)
 end
 
 -- ssh_cmd that can only ride an existing ControlMaster: never prompts, never
--- logs in on its own
+-- logs in on its own. ProxyCommand=false makes it fail at once instead of
+-- connecting when there is no master; ssh refuses it next to -J, whose
+-- jump host is part of the ControlPath (%C), so a -J pane goes without.
 local function ssh_batch_cmd(ssh)
-  return ssh_cmd(ssh, '-o', 'BatchMode=yes', '-o', 'ControlMaster=no')
+  for k = 2, #ssh do
+    if ssh[k] == '-J' then return ssh_cmd(ssh, '-o', 'BatchMode=yes', '-o', 'ControlMaster=no') end
+  end
+  return ssh_cmd(ssh, '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', '-o', 'ProxyCommand=false')
 end
 
 -- pid (string) of the live ControlMaster for the pane's host, or nil. Only
