@@ -16,6 +16,7 @@ local SIDEBAR_KEY, sidebar_spec = core.SIDEBAR_KEY, core.sidebar_spec
 local info_ssh_args, ssh_host, SSH_PANE, RESTORE_TAG = ssh_lib.info_ssh_args, ssh_lib.ssh_host, ssh_lib.SSH_PANE, ssh_lib.RESTORE_TAG
 local find_cut, anchor_of = layout.find_cut, layout.anchor_of
 local STATE_DIR, CLAUDE_DIR, read_file, write_atomic = agent.STATE_DIR, agent.CLAUDE_DIR, agent.read_file, agent.write_atomic
+local glob_quote = agent.glob_quote
 local present, base, set_of, SHELLS = agent.present, agent.base, agent.set_of, agent.SHELLS
 local is_idle_shell, is_claude, claude_session = agent.is_idle_shell, agent.is_claude, agent.claude_session
 local RESTORE_SHELL, shell_args, hibernated_session = agent.RESTORE_SHELL, agent.shell_args, agent.hibernated_session
@@ -366,13 +367,25 @@ fi
 unset WEZ_RESTORE_DELAY WEZ_RESTORE_WAIT
 exec "$@"]]
 
--- Spawn spec for a pane record, plus the text to type at its prompt (or nil)
+local function claude_id(rec)
+  return rec.kind == 'claude' and type(rec.claude) == 'string' and rec.claude:match '^[%w_-]+$' and rec.claude or nil
+end
+
+-- Spawn spec for a pane record, plus the text to type at its prompt (or nil).
+-- A claude session already running (ctx.claude: in a pane, elsewhere, or
+-- resumed earlier in this restore) is never resumed a second time: its pane
+-- comes back as a shell in its directory.
 local function restore_spec(rec, ctx)
   local spec = {}
   -- The shell cds there itself: WezTerm drops a spawn cwd it cannot list
   local cwd = present(rec.cwd) and rec.cwd or nil
   if cwd and is_dir(cwd) then spec.cwd = cwd end
-  local kind = rec.kind
+  local kind, id = rec.kind, claude_id(rec)
+  if id and ctx.claude[id] then
+    kind = 'shell'
+  elseif id then
+    ctx.claude[id] = true
+  end
   if kind == 'sidebar' then
     return sidebar_spec(cwd or wezterm.home_dir)
   elseif kind == 'ssh' and type(rec.ssh) == 'table' and #rec.ssh > 0 then
@@ -390,8 +403,8 @@ local function restore_spec(rec, ctx)
       WEZ_RESTORE_DELAY = tostring(first and 2 * (ctx.nhosts - 1) or 1),
       WEZ_RESTORE_WAIT = first and '' or '1',
     }
-  elseif kind == 'claude' and type(rec.claude) == 'string' and rec.claude:match '^[%w_-]+$' then
-    spec.args = shell_args('claude --resume ' .. rec.claude, cwd)
+  elseif kind == 'claude' and id then
+    spec.args = shell_args('claude --resume ' .. id, cwd)
   elseif kind == 'run' and type(rec.argv) == 'table' and #rec.argv > 0 then
     local cmd = join_argv(rec.argv)
     if rec.argv[1] == 'yazi' then -- via the shell's `y` wrapper (cd to where yazi was left), if it has one
@@ -468,10 +481,14 @@ local function restore_tab(tab, pane, trec, ctx, typed)
   end
 end
 
-local function restore_window(wrec, ctx)
-  local mw, tabs = nil, {}
-  for _, trec in ipairs(wrec.tabs) do
-    if type(trec.panes) == 'table' and #trec.panes > 0 then
+-- Re-create the tabs of a saved window (those in `only`, or all): into the
+-- live window `into`, whose active tab stays active, or a new window.
+-- Returns how many tabs came back.
+local function restore_window(wrec, ctx, into, only)
+  local mw, tabs, n = into, {}, 0
+  local was_active = into and into:active_tab()
+  for i, trec in ipairs(wrec.tabs) do
+    if not only or only[trec] then
       local spec, typed = restore_spec(anchor_of(trec.panes), ctx)
       local tab, pane
       if mw then
@@ -484,40 +501,271 @@ local function restore_window(wrec, ctx)
         tab, pane, mw = wezterm.mux.spawn_window(spec)
       end
       restore_tab(tab, pane, trec, ctx, typed)
-      tabs[#tabs + 1] = tab
+      tabs[i], n = tab, n + 1
     end
   end
-  if tabs[wrec.active_tab] then tabs[wrec.active_tab]:activate() end
-  -- last: programs starting in the tabs above retitle the window
-  if mw and (wrec.title or '') ~= '' then mw:set_title(wrec.title) end
-  return mw ~= nil
+  if into then
+    if was_active then was_active:activate() end
+  else
+    if tabs[wrec.active_tab] then tabs[wrec.active_tab]:activate() end
+    -- last: programs starting in the tabs above retitle the window
+    if mw and (wrec.title or '') ~= '' then mw:set_title(wrec.title) end
+  end
+  return n
 end
 
--- Re-create the windows of `snap`; the focused window last so it ends on top.
--- Returns how many windows came back.
-local function restore_session(snap)
-  local ctx = { skip = skip_hosts(), hosts = {}, nhosts = 0 }
-  local order = {}
-  for _, w in ipairs(snap.windows) do
-    if type(w.tabs) == 'table' then table.insert(order, w) end
-  end
-  -- Stable, focused window last (table.sort is not stable)
-  local rank = {}
-  for i, w in ipairs(order) do rank[w] = (w.focused and 1e6 or 0) + i end
-  table.sort(order, function(a, b) return rank[a] < rank[b] end)
-  wezterm.GLOBAL.session_restoring = true
-  local n = 0
-  for _, w in ipairs(order) do
-    local ok, made = pcall(restore_window, w, ctx)
-    if ok and made then
-      n = n + 1
-    else
-      wezterm.log_error('session: window restore failed: ' .. tostring(made))
+-- Where saved pane `a` lay beside saved pane `b` (a split direction) and the
+-- length of the edge they shared, 0 if they did not touch
+local function beside(a, b)
+  for _, r in ipairs { a, b } do
+    for _, f in ipairs { 'left', 'top', 'width', 'height' } do
+      if type(r[f]) ~= 'number' then return 'Right', 0 end
     end
   end
-  if snap.workspace and n > 0 then pcall(wezterm.mux.set_active_workspace, snap.workspace) end
-  wezterm.GLOBAL.session_restoring = nil
+  local rows = math.min(a.top + a.height, b.top + b.height) - math.max(a.top, b.top)
+  local cols = math.min(a.left + a.width, b.left + b.width) - math.max(a.left, b.left)
+  -- neighbours are a divider cell apart
+  if rows > 0 and math.abs(a.left - (b.left + b.width)) <= 1 then return 'Right', rows end
+  if rows > 0 and math.abs(b.left - (a.left + a.width)) <= 1 then return 'Left', rows end
+  if cols > 0 and math.abs(a.top - (b.top + b.height)) <= 1 then return 'Bottom', cols end
+  if cols > 0 and math.abs(b.top - (a.top + a.height)) <= 1 then return 'Top', cols end
+  return 'Right', 0
+end
+
+-- Split the missing panes of a saved tab into the live tab holding the rest,
+-- each beside the pane it shared the longest edge with. Returns how many
+-- came back.
+local function add_panes(part, ctx)
+  local live, n = {}, 0
+  for rec, lp in pairs(part.matched) do live[rec] = lp.pane end
+  for _, rec in ipairs(part.missing) do
+    local id = claude_id(rec)
+    if not (id and ctx.claude[id]) then -- resumed meanwhile by another tab: skip, not a shell in its place
+      local near, dir, edge = nil, 'Right', -1
+      for _, other in ipairs(part.trec.panes) do
+        if live[other] then
+          local d, e = beside(rec, other)
+          if e > edge then near, dir, edge = other, d, e end
+        end
+      end
+      local spec, typed = restore_spec(rec, ctx)
+      spec.direction = dir
+      if edge > 0 then
+        local span = (dir == 'Left' or dir == 'Right') and 'width' or 'height'
+        spec.size = math.max(0.1, math.min(0.9, rec[span] / (rec[span] + near[span] + 1)))
+      end
+      local ok, pane = pcall(live[near].split, live[near], spec)
+      if ok then
+        live[rec], n = pane, n + 1
+        finish_pane(pane, typed)
+        if rec.kind == 'sidebar' then wezterm.GLOBAL[SIDEBAR_KEY .. part.tab:tab_id()] = pane:pane_id() end
+      else
+        wezterm.log_error('session: pane restore failed: ' .. tostring(pane))
+      end
+    end
+  end
   return n
+end
+
+-- Restore without duplicates ------------------------------------------------
+--
+-- Restoring compares the snapshot with what is open, so pressing the key
+-- again (or a launch that finds windows open) never opens a session twice: a
+-- saved tab counts as open when a live tab holds any of its panes, and only
+-- the tabs and panes that are not open come back. A claude session running
+-- anywhere is never resumed again (see restore_spec).
+
+-- The open windows: { mw, tabs = { { tab, title, panes = { { rec, pane } } } } },
+-- each pane as the record capture_pane would save
+local function live_session()
+  local wins = {}
+  for _, mw in ipairs(wezterm.mux.all_windows()) do
+    local w = { mw = mw, tabs = {} }
+    for _, tab in ipairs(mw:tabs()) do
+      local sidebar_id = wezterm.GLOBAL[SIDEBAR_KEY .. tab:tab_id()]
+      local t = { tab = tab, title = tab:get_title(), panes = {} }
+      for _, p in ipairs(tab:panes()) do
+        table.insert(t.panes, { rec = capture_pane(p, p:pane_id() == sidebar_id), pane = p })
+      end
+      table.insert(w.tabs, t)
+    end
+    table.insert(wins, w)
+  end
+  return wins
+end
+
+-- Claude session ids running now: in the open panes (hibernated ones too:
+-- their wake screen resumes them) and, from the sessions file each live
+-- claude process publishes (see lib/agent.lua), in other terminals and tmux
+local function running_claude(wins)
+  local ids = {}
+  for _, w in ipairs(wins) do
+    for _, t in ipairs(w.tabs) do
+      for _, lp in ipairs(t.panes) do
+        local id = claude_id(lp.rec)
+        if id then ids[id] = true end
+      end
+    end
+  end
+  local ok, files = pcall(wezterm.glob, glob_quote(wezterm.home_dir) .. '/.claude*/sessions/*.json')
+  for _, path in ipairs(ok and files or {}) do
+    local parsed, s = pcall(wezterm.json_parse, read_file(path) or '')
+    if parsed and type(s) == 'table' and type(s.pid) == 'number' and type(s.sessionId) == 'string' then
+      local got, info = pcall(wezterm.procinfo.get_info_for_pid, s.pid)
+      -- pids get reused: only a file written after its process started
+      if got and info and is_claude(info) and (type(s.startedAt) ~= 'number'
+          or type(info.start_time) ~= 'number' or s.startedAt / 1000 >= info.start_time - 5) then
+        ids[s.sessionId] = true
+      end
+    end
+  end
+  return ids
+end
+
+local function words(v)
+  local out = {}
+  for _, x in ipairs(type(v) == 'table' and v or {}) do table.insert(out, tostring(x)) end
+  return out
+end
+
+-- Saved panes are matched to live ones in passes, each looser than the last:
+-- the same thing (claude session, ssh args, command and directory, shell
+-- directory), the same kind of thing (claude in that directory, ssh to that
+-- host, that program, a shell), then anything in the same directory
+local MATCH_PASSES = {
+  { weight = 4, key = function(rec)
+    if rec.kind == 'claude' then return 'claude ' .. tostring(rec.claude) end
+    if rec.kind == 'ssh' then return 'ssh ' .. table.concat(words(rec.ssh), ' ') end
+    if rec.kind == 'run' or rec.kind == 'typed' then
+      return 'run ' .. tostring(rec.cwd) .. ' ' .. table.concat(words(rec.argv), ' ')
+    end
+    return tostring(rec.kind) .. ' ' .. tostring(rec.cwd)
+  end },
+  { weight = 2, key = function(rec)
+    if rec.kind == 'claude' then return 'claude ' .. tostring(rec.cwd) end
+    if rec.kind == 'ssh' then return 'ssh ' .. (words(rec.ssh)[#words(rec.ssh)] or ''):gsub('^.*@', '') end
+    if rec.kind == 'run' then return 'run ' .. base(words(rec.argv)[1]) end
+    return rec.kind == 'sidebar' and 'sidebar' or 'shell' -- typed: a shell with a draft
+  end },
+  { weight = 1, key = function(rec) return type(rec.cwd) == 'string' and 'cwd ' .. rec.cwd or nil end },
+}
+
+-- Match the panes of saved tab `trec` to live tab `lt`: a score and saved
+-- record -> live { rec, pane }. The score is 0 (not this tab) unless a pane
+-- matched exactly or the titles are the same: loose matches alone (a shell
+-- anywhere, the same program elsewhere) do not make it the same tab.
+local function match_tab(trec, lt)
+  local matched, taken, score, exact = {}, {}, 0, false
+  for _, pass in ipairs(MATCH_PASSES) do
+    for _, rec in ipairs(trec.panes) do
+      local key = not matched[rec] and pass.key(rec)
+      for i, lp in ipairs(key and lt.panes or {}) do
+        if not taken[i] and pass.key(lp.rec) == key then
+          matched[rec], taken[i], score = lp, true, score + pass.weight
+          exact = exact or pass == MATCH_PASSES[1]
+          break
+        end
+      end
+    end
+  end
+  local same_title = (trec.title or '') ~= '' and trec.title == lt.title
+  if same_title and score > 0 then
+    score = score + 3
+  elseif not exact then
+    score = 0
+  end
+  return score, matched
+end
+
+local function valid_tab(trec)
+  if type(trec) ~= 'table' or type(trec.panes) ~= 'table' or #trec.panes == 0 then return false end
+  for _, rec in ipairs(trec.panes) do
+    if type(rec) ~= 'table' then return false end
+  end
+  return true
+end
+
+-- What of `snap` is not open in `wins`, given the claude sessions `running`:
+-- windows = { { wrec, into (live window or nil), only = { [trec] = true }, tabs } }
+-- (missing tabs, into the live window holding most of that window's open
+-- tabs, else a new one; focused window last) and partial = { { trec, tab,
+-- matched, missing } } (missing panes of open tabs; one saved tab per live
+-- tab), plus the counts `tabs` and `panes`
+local function plan_restore(snap, wins, running)
+  local plan = { windows = {}, partial = {}, tabs = 0, panes = 0 }
+  local order, rank, claimed = {}, {}, {}
+  for _, w in ipairs(snap.windows) do
+    if type(w) == 'table' and type(w.tabs) == 'table' then table.insert(order, w) end
+  end
+  -- Stable, focused window last (table.sort is not stable)
+  for i, w in ipairs(order) do rank[w] = (w.focused and 1e6 or 0) + i end
+  table.sort(order, function(a, b) return rank[a] < rank[b] end)
+  for _, wrec in ipairs(order) do
+    local only, n, homes = {}, 0, {}
+    for _, trec in ipairs(wrec.tabs) do
+      if valid_tab(trec) then
+        local best, best_score, matched = nil, 0, {}
+        for _, w in ipairs(wins) do
+          for _, lt in ipairs(w.tabs) do
+            local score, m = match_tab(trec, lt)
+            if score > best_score then best, best_score, matched = { w = w, lt = lt }, score, m end
+          end
+        end
+        local missing = {}
+        for _, rec in ipairs(trec.panes) do
+          local id = claude_id(rec)
+          if not matched[rec] and not (id and running[id]) then table.insert(missing, rec) end
+        end
+        if best then
+          homes[best.w] = (homes[best.w] or 0) + 1
+          if #missing > 0 and not claimed[best.lt] then
+            table.insert(plan.partial, { trec = trec, tab = best.lt.tab, matched = matched, missing = missing })
+            plan.panes = plan.panes + #missing
+          end
+          claimed[best.lt] = true
+        elseif #missing > 0 then
+          only[trec], n = true, n + 1
+        end
+      end
+    end
+    if n > 0 then
+      local into, most = nil, 0
+      for _, w in ipairs(wins) do
+        if (homes[w] or 0) > most then into, most = w.mw, homes[w] end
+      end
+      table.insert(plan.windows, { wrec = wrec, into = into, only = only, tabs = n })
+      plan.tabs = plan.tabs + n
+    end
+  end
+  return plan
+end
+
+-- Restore what of `snap` is not open (with fresh, all of it into new
+-- windows; running claude sessions are still not resumed again). Returns
+-- how many windows, tabs and panes (into open tabs) came back.
+local function restore_session(snap, fresh)
+  local wins = live_session()
+  local ctx = { skip = skip_hosts(), hosts = {}, nhosts = 0, claude = running_claude(wins) }
+  local plan = plan_restore(snap, fresh and {} or wins, ctx.claude)
+  local G = wezterm.GLOBAL
+  G.session_restoring = true
+  local windows, tabs, panes = 0, 0, 0
+  for _, part in ipairs(plan.partial) do
+    local ok, n = pcall(add_panes, part, ctx)
+    if ok then panes = panes + n else wezterm.log_error('session: pane restore failed: ' .. tostring(n)) end
+  end
+  for _, w in ipairs(plan.windows) do
+    local ok, n = pcall(restore_window, w.wrec, ctx, w.into, w.only)
+    if ok then
+      tabs = tabs + n
+      if not w.into and n > 0 then windows = windows + 1 end
+    else
+      wezterm.log_error('session: window restore failed: ' .. tostring(n))
+    end
+  end
+  if snap.workspace and windows > 0 then pcall(wezterm.mux.set_active_workspace, snap.workspace) end
+  G.session_restoring = nil
+  return windows, tabs, panes
 end
 
 local function load_snapshot(path)
@@ -535,7 +783,9 @@ end
 
 -- Fresh launch: keep the last session as session.prev.json (unless it is just
 -- one empty-looking window and a better one is already kept), forget stale
--- Claude ids (pane ids restart from 0), then restore or open the default window
+-- Claude ids (pane ids restart from 0), then restore or open the default
+-- window. Windows already open (a mux that kept them) are matched like a
+-- Cmd+Shift+O restore: only what is missing comes back.
 local function startup(cmd)
   local current = load_snapshot(SESSION_FILE)
   if current then
@@ -545,7 +795,7 @@ local function startup(cmd)
       write_atomic(SESSION_PREV, read_file(SESSION_FILE))
     end
   end
-  prune_claude_files {}
+  if #wezterm.mux.all_windows() == 0 then prune_claude_files {} end
   local n = 0
   if current and not cmd and not restore_disabled() then
     local ok, made = pcall(restore_session, current)
@@ -554,14 +804,32 @@ local function startup(cmd)
   end
   if n == 0 and #wezterm.mux.all_windows() == 0 then wezterm.mux.spawn_window(cmd or {}) end
 end
+
+local function counted(n, what)
+  return string.format('%d %s%s', n, what, n == 1 and '' or 's')
+end
+
+local function restore_and_report(window, snap, fresh)
+  local ok, windows, tabs, panes = pcall(restore_session, snap, fresh)
+  if not ok then
+    wezterm.log_error('session: restore failed: ' .. tostring(windows))
+    toast(window, 'Session: restore failed (see the debug overlay)', 3000)
+  elseif tabs + panes == 0 then
+    toast(window, 'Session: already open, nothing to restore', 3000)
+  else
+    toast(window, string.format('Session: restored %s, %s (%s)', counted(tabs, 'tab'), counted(panes, 'pane'),
+      counted(windows, 'new window')), 3000)
+  end
+end
+
+-- Cmd+Shift+O: bring back what of the previous session is not open
 local restore_previous = wezterm.action_callback(function(window)
   local snap = load_snapshot(SESSION_PREV)
   if not snap then
     toast(window, 'Session: no previous session saved', 2000)
     return
   end
-  local n = restore_session(snap)
-  toast(window, string.format('Session: restored %d window%s', n, n == 1 and '' or 's'), 3000)
+  restore_and_report(window, snap, false)
 end)
 
 local toggle_auto_restore = wezterm.action_callback(function(window)
@@ -573,7 +841,10 @@ local toggle_auto_restore = wezterm.action_callback(function(window)
   end
 end)
 
-local M = {}
+local M = {
+  -- for tests in a headless mux
+  restore_session = restore_session, load_snapshot = load_snapshot,
+}
 
 function M.apply(config)
   wezterm.on('update-status', function()
@@ -585,8 +856,8 @@ function M.apply(config)
   end)
   wezterm.on('gui-startup', startup)
   for _, key in ipairs {
-    -- Session restore: reopen the session from before this launch; toggle
-    -- whether launching restores the last session on its own
+    -- Session restore: reopen what of the session from before this launch
+    -- is not open; toggle whether launching restores the last session
     { key = 'o', mods = 'CMD|SHIFT', action = restore_previous },
     { key = 'o', mods = 'CMD|SHIFT|OPT', action = toggle_auto_restore },
   } do table.insert(config.keys, key) end
