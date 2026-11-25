@@ -261,6 +261,23 @@ local function ssh_config_aliases()
   return aliases
 end
 
+-- The ~/.ssh/config alias for the destination of `ssh` (same hostname and
+-- port, an alias with the same user first), or nil: the name to show for a
+-- host a tunnel line spells as user@FQDN. Only asks ssh -G.
+local function host_alias(ssh)
+  local host, user, port = ssh_identity(ssh)
+  if not host then return nil end
+  local loose
+  for _, alias in ipairs(ssh_config_aliases()) do
+    local h, u, p = ssh_identity { SSH_PANE, alias }
+    if h == host and p == port then
+      if u == user then return alias end
+      loose = loose or alias
+    end
+  end
+  return loose
+end
+
 -- Gated args (lib/ssh.lua gated_args) for the live ControlMaster of the
 -- destination of `ssh`, and the master's pid; nil if none. A hint may spell
 -- the host differently from the alias that started the master
@@ -767,6 +784,7 @@ local M = {
   ssh_forward = ssh_forward, cancel_forward = cancel_forward,
   recorded_forwards = recorded_forwards, describe_forward = describe_forward,
   screen_tunnels = screen_tunnels, forward_tunnel = forward_tunnel,
+  ssh_identity = ssh_identity, host_alias = host_alias,
   -- for tests
   _test = { parse_ssh_text = parse_ssh_text, hints_from_lines = hints_from_lines, find_master = find_master,
     parse_loopback_url = parse_loopback_url, ssh_forward = ssh_forward, forward_tunnel = forward_tunnel,
