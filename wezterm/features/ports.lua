@@ -2,8 +2,10 @@
 --  * This Mac: ports your own processes listen on; pick one to open it;
 --  * one group per ssh host with an open pane (the focused pane's first),
 --    named as you typed it (gpubox, not its FQDN), each with
---    (a) the TCP ports listening there and their process (listed only over
---        a live master, see start_job; never a new login): pick one to
+--    (a) the TCP ports listening there, each named for what it is
+--        ("Jupyter Lab · cswap", see REMOTE_SCRIPT and lib/port_names.lua;
+--        listed only over a live master, see start_job; never a new
+--        login): pick one to
 --        forward it here (`ssh -O forward`, see features/port_forward.lua
 --        for busy local ports; ports below 1024 map to 8000+port) and open
 --        it; one already forwarded shows its local port,
@@ -29,6 +31,7 @@ local act = wezterm.action
 local core = require 'lib.core'
 local ssh_lib = require 'lib.ssh'
 local port_forward = require 'features.port_forward'
+local names = require 'lib.port_names'
 local toast, mux_pane, sh_quote = core.toast, core.mux_pane, core.sh_quote
 local pane_ssh_args, ssh_cmd, ssh_host = ssh_lib.pane_ssh_args, ssh_lib.ssh_cmd, ssh_lib.ssh_host
 local ssh_master_pid, command_master = ssh_lib.ssh_master_pid, ssh_lib.command_master
@@ -47,6 +50,7 @@ local PICKER_KEY = 'ports_picker' -- JSON { window, pane, paths, started } waiti
 local CACHE_KEY = 'ports_cache_' -- .. control path -> JSON { t, ports | err, locals }
 local LAST_KEY = 'ports_last_' -- .. control path -> " port port ... " of the last poll
 local NOTIFIED_KEY = 'ports_notified_' -- .. control path -> " port ... " already toasted
+local TITLES_KEY = 'ports_titles_' -- .. control path or 'local' -> JSON { [port] = { pid, title } }
 
 -- Never worth a toast, a picker row or the badge: ssh, smtp, dns, rpcbind,
 -- cups, nfs, mDNS, LLMNR, and sshd's X11 forwarding displays (6010 up;
@@ -69,24 +73,99 @@ local function is_local_listed(l)
   return l.name ~= 'ssh' and not MAC_NOISE[l.name or '']
 end
 
+-- Page titles of the ports in $pairs ("port pid" lines), all at once, each
+-- request at most 1 s and all of them killed at 2 s: "#titles", then
+-- "#title port pid text" per port asked (text empty when there is none).
+-- Skips ports in $known (" port:pid ... ", titles we have) and ones that
+-- never speak HTTP. Only when $titles is 1 and curl is there.
+local TITLE_SCRIPT = [=[
+if [ "$titles" = 1 ] && command -v curl >/dev/null 2>&1; then
+  echo '#titles'
+  set --
+  while read -r port pid; do
+    [ -n "$pid" ] || continue
+    case $known in *" $port:$pid "*) continue ;; esac
+    case $port in 22|25|53|111|631|2049|3306|5432|5353|5355|6379|11211|27017) continue ;; esac
+    { t=$(curl -s -m 1 --max-filesize 65536 "http://127.0.0.1:$port/" | head -c 65536 | tr '\r\n\t' '   ' |
+        sed 's,</[Tt][Ii][Tt][Ll][Ee][[:space:]]*>.*,,' | sed -n 's,.*<[Tt][Ii][Tt][Ll][Ee][^>]*>,,p' | cut -c1-200)
+      printf '#title %s %s %s\n' "$port" "$pid" "$t"; } 2>/dev/null &
+    set -- "$@" $!
+  done <<EOF
+$pairs
+EOF
+  if [ $# -gt 0 ]; then
+    ( sleep 2; kill "$@" ) >/dev/null 2>&1 &
+    w=$!
+    wait "$@" 2>/dev/null
+    kill "$w" 2>/dev/null
+  fi
+fi
+exit 0
+]=]
+
 -- Remote listing in one round trip (POSIX sh, sent on stdin to `sh -s`).
 -- `ss` shows the process only for your own sockets; without ss,
 -- /proc/net/tcp{,6} with your uid, and which of your processes holds each
--- socket from your own /proc/<pid>/fd links.
-local REMOTE_SCRIPT = [[
+-- socket from your own /proc/<pid>/fd links. Then, to name them: "#home",
+-- and per port of yours "#lp port pid", with "#cmd pid argv" (its
+-- /proc/<pid>/cmdline, NULs as \31) and "#cwd pid dir" once per pid; then
+-- TITLE_SCRIPT. Anything missing (awk, readlink) only leaves names out.
+-- WZ_PROC is for tests.
+local REMOTE_SCRIPT = [=[
+P=${WZ_PROC:-/proc}
+pairs=
 if command -v ss >/dev/null 2>&1 && { out=$(ss -tlnpH 2>/dev/null) || out=$(ss -tlnp 2>/dev/null | sed 1d); }; then
-  printf '#ss\n%s\n' "$out"; exit 0
+  printf '#ss\n%s\n' "$out"
+  pairs=$(printf '%s\n' "$out" | awk '$1 == "LISTEN" && match($0, /pid=[0-9]+/) {
+    n = split($4, a, ":"); print a[n], substr($0, RSTART + 4, RLENGTH - 4) }' 2>/dev/null)
+elif [ -r "$P/net/tcp" ]; then
+  me=$(id -u)
+  printf '#proc %s\n' "$me"
+  tcp=$(for f in "$P/net/tcp" "$P/net/tcp6"; do [ -r "$f" ] && cat "$f"; done)
+  socks=$(find "$P"/[0-9]*/fd -maxdepth 1 -lname 'socket:*' -printf '%h %l\n' 2>/dev/null |
+  while read -r h l; do
+    p=${h#"$P"/}; p=${p%/fd}; i=${l#"socket:["}; i=${i%]}
+    printf '#sock %s %s %s\n' "$i" "$p" "$(cat "$P/$p/comm" 2>/dev/null)"
+  done)
+  printf '%s\n%s\n' "$tcp" "$socks"
+  pairs=$(printf '%s\n#\n%s\n' "$tcp" "$socks" | awk -v me="$me" '$1 == "#" { s = 1; next }
+    !s && $4 == "0A" && $8 == me { n = split($2, a, ":"); L[$10] = a[n] }
+    s && ($2 in L) { print L[$2], $3 }' 2>/dev/null |
+  while read -r h p; do printf '%d %s\n' "0x$h" "$p"; done)
+else
+  echo '#unsupported'; exit 0
 fi
-[ -r /proc/net/tcp ] || { echo '#unsupported'; exit 0; }
-printf '#proc %s\n' "$(id -u)"
-for f in /proc/net/tcp /proc/net/tcp6; do [ -r "$f" ] && cat "$f"; done
-find /proc/[0-9]*/fd -maxdepth 1 -lname 'socket:*' -printf '%h %l\n' 2>/dev/null |
-while read -r h l; do
-  p=${h#/proc/}; p=${p%/fd}; i=${l#"socket:["}; i=${i%]}
-  printf '#sock %s %s %s\n' "$i" "$p" "$(cat "/proc/$p/comm" 2>/dev/null)"
-done
-exit 0
-]]
+pairs=$(printf '%s\n' "$pairs" | sort -u -k1,1n 2>/dev/null)
+printf '#home %s\n' "$HOME"
+seen=' '
+while read -r port pid; do
+  [ -n "$pid" ] || continue
+  printf '#lp %s %s\n' "$port" "$pid"
+  case $seen in *" $pid "*) continue ;; esac
+  seen="$seen$pid "
+  printf '#cmd %s %s\n' "$pid" "$({ tr '\000\n' '\037 ' <"$P/$pid/cmdline"; } 2>/dev/null)"
+  printf '#cwd %s %s\n' "$pid" "$(readlink "$P/$pid/cwd" 2>/dev/null)"
+done <<EOF
+$pairs
+EOF
+]=] .. TITLE_SCRIPT
+
+-- This Mac's half of REMOTE_SCRIPT's naming, for $pids (comma-separated)
+-- of $pairs: "#cmd pid args" (ps joins argv with spaces) and "#cwd pid dir"
+local LOCAL_SCRIPT = [=[
+/bin/ps -ww -o pid=,args= -p "$pids" 2>/dev/null | sed 's/^ *\([0-9][0-9]*\) /#cmd \1 /'
+/usr/sbin/lsof -a -p "$pids" -d cwd -Fpn 2>/dev/null |
+  awk '/^p/ { p = substr($0, 2) } /^n/ { print "#cwd", p, substr($0, 2) }'
+]=] .. TITLE_SCRIPT
+
+-- Shell lines that set what TITLE_SCRIPT reads: $known from `cache` (port
+-- -> { pid, title }) and $titles from M.fetch_titles
+local M = { fetch_titles = true }
+local function title_vars(cache)
+  local known = ' '
+  for port, c in pairs(cache or {}) do known = known .. port .. ':' .. tostring(c.pid) .. ' ' end
+  return 'known=' .. sh_quote(known) .. '\ntitles=' .. (M.fetch_titles and '1' or '0') .. '\n'
+end
 
 -- Parsing ------------------------------------------------------------------
 
@@ -191,6 +270,71 @@ local function parse_lsof(text)
   return list
 end
 
+-- REMOTE_SCRIPT's and LOCAL_SCRIPT's naming lines -> { home, pid = { [port]
+-- = pid }, cmd = { [pid] = cmdline }, cwd = { [pid] = dir }, titles = {
+-- [port] = { pid, text } }, titled (titles were asked for) }
+local function parse_info(text)
+  local info = { pid = {}, cmd = {}, cwd = {}, titles = {} }
+  for line in (text or ''):gmatch '[^\n]+' do
+    local tag, rest = line:match '^#(%a+) ?(.*)$'
+    if tag == 'home' then
+      info.home = rest ~= '' and rest or nil
+    elseif tag == 'titles' then
+      info.titled = true
+    elseif tag == 'lp' then
+      local port, pid = rest:match '^(%d+) (%d+)$'
+      if port then info.pid[tonumber(port)] = pid end
+    elseif tag == 'cmd' or tag == 'cwd' then
+      local pid, value = rest:match '^(%d+) ?(.*)$'
+      if pid and value ~= '' then info[tag][pid] = value end
+    elseif tag == 'title' then
+      local port, pid, t = rest:match '^(%d+) (%d+) ?(.*)$'
+      if port then info.titles[tonumber(port)] = { pid = pid, text = t } end
+    end
+  end
+  return info
+end
+
+-- Name each of `ports` from `info` (parse_info): p.what ("Jupyter Lab") and
+-- p.project ("cswap"); `home` is the fallback home folder, `exists` checks
+-- a path (to rejoin a ps line's paths with spaces). `cache` (port -> {
+-- pid, title }) holds titles fetched before; a title is fetched again only
+-- when its port's pid changes. Returns the cache for the ports there now.
+local function name_ports(ports, info, home, cache, exists)
+  local kept = {}
+  cache = cache or {}
+  for _, p in ipairs(ports) do
+    local pid = info.pid[p.port]
+    if pid then
+      local key, t, c = tostring(p.port), info.titles[p.port], cache[tostring(p.port)]
+      local title
+      if t then
+        title, kept[key] = t.text, { pid = t.pid, title = t.text }
+      elseif c and tostring(c.pid) == pid then
+        title, kept[key] = c.title, c
+      elseif info.titled then
+        kept[key] = { pid = pid, title = '' } -- asked, no answer: not again for this pid
+      end
+      p.pid = tonumber(pid)
+      p.what, p.project = names.label {
+        argv = info.cmd[pid] and names.split_cmdline(info.cmd[pid], exists),
+        cwd = info.cwd[pid], home = info.home or home, title = title, name = p.name,
+      }
+    end
+  end
+  return kept
+end
+
+-- "⇄ gpubox:8888 Jupyter Lab (cswap), :6006 TensorBoard started · ⌘⇧I to open"
+local function toast_message(host, fresh)
+  local parts = {}
+  for _, p in ipairs(fresh) do
+    local text = names.toast_text(p)
+    table.insert(parts, ':' .. p.port .. (text and (' ' .. text) or ''))
+  end
+  return '⇄ ' .. host .. table.concat(parts, ', ') .. ' started · ' .. KEY_TEXT .. ' to open'
+end
+
 -- Ports of yours that started listening since the last poll and were never
 -- toasted. `last` and `notified` are " port ... " strings; `last` is nil on
 -- a host's first poll, which only records what is there. Returns the fresh
@@ -241,17 +385,17 @@ end
 local LSOF = { '/usr/sbin/lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn' }
 
 -- sh script that runs `check` and, only if it succeeds, `run` with
--- REMOTE_SCRIPT on stdin (its exit status and stderr as "#exit" and "#err"
+-- `script` (REMOTE_SCRIPT and its variables) on stdin (its exit status and stderr as "#exit" and "#err"
 -- lines after), else writes "#nomaster"; then this Mac's listeners after a
 -- "#local" line (for the badge). It moves the output to `out` in one step,
 -- so a reader never sees half of it.
-local function job_script(check, run, out)
+local function job_script(check, run, out, script)
   return table.concat({
     'umask 077',
     'mkdir -p ' .. sh_quote(out:match '^(.*)/') .. ' || exit 1',
     'tmp=' .. sh_quote(out .. '.tmp'),
     'if ' .. timed(CHECK_TIMEOUT, check) .. ' >/dev/null 2>&1; then',
-    '  printf %s ' .. sh_quote(REMOTE_SCRIPT) .. ' | ' .. timed(RUN_TIMEOUT, run) .. ' >"$tmp" 2>"$tmp.err"',
+    '  printf %s ' .. sh_quote(script) .. ' | ' .. timed(RUN_TIMEOUT, run) .. ' >"$tmp" 2>"$tmp.err"',
     '  echo "#exit $?" >>"$tmp"',
     '  sed "s/^/#err /" "$tmp.err" >>"$tmp"',
     '  rm -f "$tmp.err"',
@@ -296,7 +440,8 @@ local function start_job(ssh, path)
   local jobs = read_jobs()
   jobs[path] = { out = out, path = path, host = ssh_host(ssh), started = os.time() }
   save_jobs(jobs)
-  wezterm.background_child_process { '/bin/sh', '-c', job_script(ssh_cmd(gated, '-O', 'check'), run, out) }
+  local script = title_vars(read_json(TITLES_KEY .. path)) .. REMOTE_SCRIPT
+  wezterm.background_child_process { '/bin/sh', '-c', job_script(ssh_cmd(gated, '-O', 'check'), run, out, script) }
 end
 
 -- Whether the master's socket file exists: no need to even ask otherwise
@@ -309,7 +454,7 @@ end
 
 -- One icon per kind of row
 local ICON = { mac = '⌂', remote = '⇄', screen = '↗', stop = '✕' }
-local PORT_W, NAME_W = 7, 14 -- column widths of ":port" and the process
+local PORT_W, NAME_W = 7, 24 -- column widths of ":port" and what listens
 
 -- Why a host group has no listening ports to show
 local NO_LIST = {
@@ -350,6 +495,14 @@ end
 local function row(id, icon, port, name, action, group)
   return { id = id, label = '  ' .. icon .. '  ' .. pad(port, PORT_W) .. ' ' .. pad(name or '?', NAME_W) .. ' '
     .. dim(action .. '  · ' .. group) }
+end
+
+-- A listening port's row: what it is (and its project), then dimmed its
+-- process name (so "/python" still finds it), the action and the group
+local function listener_row(id, icon, p, action, group)
+  local text = names.row_text(p)
+  if p.name and text and text ~= p.name then action = p.name .. ' · ' .. action end
+  return row(id, icon, ':' .. p.port, text, action, group)
 end
 
 -- "open with token" for a tunnel command on screen
@@ -393,7 +546,7 @@ local function picker_rows(locals, hosts, forwards, tunnels)
   local before = #rows
   for _, l in ipairs(locals) do
     if is_local_listed(l) then
-      table.insert(rows, row('l' .. l.port, ICON.mac, ':' .. l.port, l.name, 'open', 'This Mac'))
+      table.insert(rows, listener_row('l' .. l.port, ICON.mac, l, 'open', 'This Mac'))
     end
   end
   if #rows == before then table.insert(rows, note('no listening ports', 'This Mac')) end
@@ -414,7 +567,7 @@ local function picker_rows(locals, hosts, forwards, tunnels)
           for _, f in ipairs(mine) do
             if f.rport == p.port then lport = f.lport end
           end
-          table.insert(rows, row('r' .. i .. ':' .. p.port, ICON.remote, ':' .. p.port, p.name,
+          table.insert(rows, listener_row('r' .. i .. ':' .. p.port, ICON.remote, p,
             (lport and ('forwarded at localhost:' .. lport .. ' · open') or 'forward and open')
               .. (p.owned == nil and ' (owner unknown)' or ''), h.host))
         end
@@ -565,9 +718,37 @@ local function stop_forward(window, lport)
   toast(window, 'Ports: no forward of ours on localhost:' .. lport)
 end
 
+-- Name this Mac's listeners the way REMOTE_SCRIPT names a host's (ps for
+-- the command line, lsof for the cwd, titles cached the same way)
+local function name_local(list)
+  local shown, lines, pids, seen = {}, {}, {}, {}
+  local info = parse_info ''
+  for _, l in ipairs(list) do
+    if is_local_listed(l) and l.pid then
+      table.insert(shown, l)
+      table.insert(lines, l.port .. ' ' .. l.pid)
+      info.pid[l.port] = l.pid
+      if not seen[l.pid] then
+        seen[l.pid] = true
+        table.insert(pids, l.pid)
+      end
+    end
+  end
+  if #shown == 0 then return end
+  local cache = read_json(TITLES_KEY .. 'local')
+  local script = title_vars(cache) .. 'pairs=' .. sh_quote(table.concat(lines, '\n')) .. '\npids='
+    .. table.concat(pids, ',') .. '\n' .. LOCAL_SCRIPT
+  local ok, out = wezterm.run_child_process { '/bin/sh', '-c', script }
+  local got = parse_info(ok and out or '')
+  got.pid = info.pid
+  wezterm.GLOBAL[TITLES_KEY .. 'local'] = wezterm.json_encode(name_ports(shown, got, wezterm.home_dir, cache, core.exists))
+end
+
 local function local_listeners()
   local ok, out = wezterm.run_child_process(LSOF)
-  return ok and parse_lsof(out) or {}
+  local list = ok and parse_lsof(out) or {}
+  name_local(list)
+  return list
 end
 
 local show_ports -- the key's action; picking a header calls it again
@@ -604,8 +785,13 @@ end
 -- A listing finished: cache it (and this Mac's count for the badge), toast
 -- new ports
 local function finish_job(window, job, text)
-  local remote, here = text:match '^(.-)#local\n(.*)$'
+  local remote, here = text:match '^(.-\n)#local\n(.*)$'
   local ports, err = parse_remote(remote or text)
+  if ports then
+    local cache = read_json(TITLES_KEY .. job.path)
+    wezterm.GLOBAL[TITLES_KEY .. job.path] = wezterm.json_encode(
+      name_ports(ports, parse_info(remote or text), nil, cache))
+  end
   local locals = 0
   for _, l in ipairs(parse_lsof(here)) do
     if is_local_listed(l) then locals = locals + 1 end
@@ -615,12 +801,7 @@ local function finish_job(window, job, text)
   local fresh, last, notified = new_ports(ports, wezterm.GLOBAL[LAST_KEY .. job.path],
     wezterm.GLOBAL[NOTIFIED_KEY .. job.path])
   wezterm.GLOBAL[LAST_KEY .. job.path], wezterm.GLOBAL[NOTIFIED_KEY .. job.path] = last, notified
-  if #fresh > 0 then
-    local names = {}
-    for _, p in ipairs(fresh) do table.insert(names, ':' .. p.port .. (p.name and (' ' .. p.name) or '')) end
-    toast(window, '⇄ ' .. job.host .. table.concat(names, ',') .. ' started · '
-      .. KEY_TEXT .. ' to open', 8000)
-  end
+  if #fresh > 0 then toast(window, toast_message(job.host, fresh), 8000) end
 end
 
 -- update-status, in the focused window: the badge for the focused ssh pane
@@ -706,12 +887,13 @@ show_ports = function(window, pane)
   toast(window, 'Ports: listing ' .. table.concat(names, ', ') .. '…', 2000)
 end
 
-local M = {
-  -- for tests
-  _test = { control_path = control_path, gated_args = gated_args, parse_remote = parse_remote, parse_lsof = parse_lsof,
-    new_ports = new_ports, job_script = job_script, start_job = start_job, read_jobs = read_jobs,
-    picker_rows = picker_rows, group_tunnels = group_tunnels, open_hosts = open_hosts, tunnel_action = tunnel_action, tunnel_ports = tunnel_ports, badge_text = badge_text,
-    REMOTE_SCRIPT = REMOTE_SCRIPT },
+-- For tests
+M._test = {
+  control_path = control_path, gated_args = gated_args, parse_remote = parse_remote, parse_lsof = parse_lsof,
+  new_ports = new_ports, job_script = job_script, start_job = start_job, read_jobs = read_jobs,
+  picker_rows = picker_rows, group_tunnels = group_tunnels, open_hosts = open_hosts, tunnel_action = tunnel_action, tunnel_ports = tunnel_ports, badge_text = badge_text,
+  REMOTE_SCRIPT = REMOTE_SCRIPT, LOCAL_SCRIPT = LOCAL_SCRIPT, title_vars = title_vars, parse_info = parse_info,
+  name_ports = name_ports, toast_message = toast_message, name_local = name_local,
 }
 
 function M.apply(config)

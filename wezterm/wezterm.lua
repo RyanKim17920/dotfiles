@@ -39,6 +39,10 @@ local settings = {
   -- background ControlMaster, so they never compete with your ssh tabs for
   -- the server's MaxSessions (lib/ssh.lua). Duo/2FA hosts are always refused.
   ssh_bg_hosts = {},
+  -- The CMD+SHIFT+I list asks each listening port of yours for its page
+  -- <title> (one quick request each, at most 2 s per host, then cached until
+  -- the process changes). false skips it, e.g. on a slow HPC login node.
+  port_titles = true,
 }
 
 local wezterm = require 'wezterm'
@@ -76,6 +80,7 @@ if f then
 end
 
 require('lib.ssh').bg_hosts = settings.ssh_bg_hosts
+require('features.ports').fetch_titles = settings.port_titles
 
 local config = wezterm.config_builder()
 local with_editor = require('lib.core').with_editor
