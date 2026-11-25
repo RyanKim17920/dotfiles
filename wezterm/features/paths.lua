@@ -300,6 +300,18 @@ function M.apply(config, ctx)
     highlight = 1,
   })
 
+  -- A line that is nothing but one word with a / in it (after indentation
+  -- or a gutter) is most likely the middle of a path a TUI hard-wrapped
+  -- mid-word over three or more lines, like the `oj/1673a7e7-252a` of
+  -- `/tmp/claude-1000/-home-user-pr` + `oj/1673a7e7-252a` +
+  -- `2fc2/shot/plot.png`, which no other rule links; path_candidates
+  -- rebuilds the whole path from it.
+  table.insert(config.hyperlink_rules, {
+    regex = [=[^[\s│┃▎▏]*([\w@+~%-][\w.@+~%-]*(?:/[\w.@+~%-]*)+)\s*$]=],
+    format = PEEK_SCHEME .. '$1',
+    highlight = 1,
+  })
+
   links.handle('path', function(window, pane, uri, click) return open_path(window, pane, uri, click, ctx) end)
   -- CMD+click opens links/paths even inside apps that capture the mouse
   -- (Claude Code, less, micro)
