@@ -28,6 +28,8 @@ local function toast(window, msg, ms)
   wezterm.log_info('notice: ' .. msg)
   local seq = (wezterm.GLOBAL.notice_seq or 0) + 1
   wezterm.GLOBAL.notice_seq = seq
+  -- Until then the right status is this notice's (features/ports.lua's badge waits)
+  wezterm.GLOBAL.notice_until = os.time() + math.ceil(ms / 1000) + 1
   window:set_right_status(wezterm.format {
     { Background = { Color = C.surface0 } }, { Foreground = { Color = C.peach } },
     { Text = ' ' .. msg .. ' ' },
