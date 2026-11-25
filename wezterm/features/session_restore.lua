@@ -6,6 +6,7 @@
 -- poller below whenever it changed; WezTerm 20240203 has no quit event, so
 -- the last settled state before quitting is what comes back.
 local wezterm = require 'wezterm'
+local act = wezterm.action
 local core = require 'lib.core'
 local ssh_lib = require 'lib.ssh'
 local layout = require 'lib.layout'
@@ -805,6 +806,9 @@ local function startup(cmd)
   if n == 0 and #wezterm.mux.all_windows() == 0 then wezterm.mux.spawn_window(cmd or {}) end
 end
 
+-- Missing tabs above which a restore with a session open asks first
+local CONFIRM_TABS = 5
+
 local function counted(n, what)
   return string.format('%d %s%s', n, what, n == 1 and '' or 's')
 end
@@ -822,14 +826,40 @@ local function restore_and_report(window, snap, fresh)
   end
 end
 
--- Cmd+Shift+O: bring back what of the previous session is not open
-local restore_previous = wezterm.action_callback(function(window)
+-- Cmd+Shift+O: bring back what of the previous session is not open; ask
+-- first when that is many tabs and something is already open
+local restore_previous = wezterm.action_callback(function(window, pane)
   local snap = load_snapshot(SESSION_PREV)
   if not snap then
     toast(window, 'Session: no previous session saved', 2000)
     return
   end
-  restore_and_report(window, snap, false)
+  local wins = live_session()
+  local plan = plan_restore(snap, wins, running_claude(wins))
+  if plan.tabs + plan.panes == 0 then
+    toast(window, 'Session: already open, nothing to restore', 3000)
+    return
+  end
+  local open = 0
+  for _, w in ipairs(wins) do
+    for _, t in ipairs(w.tabs) do open = open + #t.panes end
+  end
+  if plan.tabs <= CONFIRM_TABS or open <= 1 then
+    restore_and_report(window, snap, false)
+    return
+  end
+  window:perform_action(act.InputSelector {
+    title = 'Session: restore the previous session?',
+    choices = {
+      { id = 'missing', label = string.format('Restore %s and %s that are not open',
+        counted(plan.tabs, 'missing tab'), counted(plan.panes, 'missing pane')) },
+      { id = 'fresh', label = 'Restore all into new windows (running claude sessions are not resumed again)' },
+      { id = 'cancel', label = 'Cancel' },
+    },
+    action = wezterm.action_callback(function(win, _, id)
+      if id == 'missing' or id == 'fresh' then restore_and_report(win, snap, id == 'fresh') end
+    end),
+  }, pane)
 end)
 
 local toggle_auto_restore = wezterm.action_callback(function(window)
