@@ -100,6 +100,36 @@ local function ssh_master_pid(ssh)
   return ok and ((err or ''):match 'pid=(%d+)' or '?') or nil
 end
 
+-- Shell functions for background scripts that must ride the pane's live
+-- ControlMaster and never cause a new login (one host uses Duo). Each takes
+-- the ssh args of a pane_ssh_args result without SSH_PANE (kept opts...,
+-- dest); run them with PATH=SPAWN_PATH so ssh computes the same ControlPath.
+--   master_gate ARGS...       set $cp to the master's socket once `-O check`
+--                             says it is live (asks ssh -G and the socket
+--                             only), else set $why and return 1. Not in a
+--                             $(...) subshell: $cp must reach the caller
+--   master_ssh ARGS... CMD    run CMD on the host over $cp. Safety options
+--                             come first (ssh is first-wins), and
+--                             ProxyCommand=false makes a master that died
+--                             since the gate fail at once instead of logging in
+local MASTER_SH = [[
+master_ssh() {
+  ssh -o BatchMode=yes -o ControlMaster=no -o ProxyCommand=false -S "$cp" "$@"
+}
+master_gate() {
+  for h do :; done
+  cp=$(ssh -G "$@" 2>/dev/null | sed -n 's/^controlpath //p' | head -n 1)
+  if [ -z "$cp" ] || [ "$cp" = none ]; then
+    why="no ControlMaster is configured for ${h#*@}"
+    return 1
+  fi
+  master_ssh -O check "$@" >/dev/null 2>&1 || {
+    why="no live ssh connection to ${h#*@}; log in first"
+    return 1
+  }
+}
+]]
+
 -- Destination without user@, for messages and file names
 local function ssh_host(ssh)
   return (ssh[#ssh]:gsub('^.*@', ''))
@@ -108,5 +138,5 @@ return {
   SSH_OPTS_WITH_VALUE = SSH_OPTS_WITH_VALUE, SSH_OPTS_KEPT = SSH_OPTS_KEPT, SSH_PANE = SSH_PANE,
   RESTORE_TAG = RESTORE_TAG, ssh_split_args = ssh_split_args, info_ssh_args = info_ssh_args,
   pane_ssh_args = pane_ssh_args, ssh_cmd = ssh_cmd, ssh_batch_cmd = ssh_batch_cmd,
-  ssh_master_pid = ssh_master_pid, ssh_host = ssh_host,
+  ssh_master_pid = ssh_master_pid, ssh_host = ssh_host, MASTER_SH = MASTER_SH,
 }
