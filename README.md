@@ -18,6 +18,7 @@ Homebrew paths (`/opt/homebrew/bin`).
 | `bin/` | `~/.local/bin/` (`mdedit`, `mdview`, `mdpreview`, `glow-cached`, `yazi-open`, `clipimg-push`, `ssh-setup`, `ssh-pane`, `wez-claude-session`, `wez-hibernate`) |
 | `claude/statusline.sh` | `~/.claude/statusline.sh` (Claude Code status line) |
 | `zsh/snippets.zsh` | source it from `~/.zshrc` |
+| `macos/wez-drag/` | `~/.local/bin/wez-drag` (built, not copied: run `macos/wez-drag/build.sh`; needs only the Command Line Tools) |
 
 `~/.config/yazi-sidebar` is a second Yazi config used only by the CMD+E
 sidebar. It has its own `yazi.toml` (single column, opens files in a split) and
@@ -57,6 +58,7 @@ it. Unknown flags and skipped features are logged as `features:` warnings.
 | `media_reveal` | CMD+click on video / audio reveals it in Finder |
 | `pdf_preview` | CMD+click on a PDF opens Preview |
 | `downloads` | Right-click a path in an ssh pane downloads it; so does `g m` in remote Yazi |
+| `drag` | Finder drag and drop through the `wez-drag` helper: `g o` / `g i` in Yazi, CMD+SHIFT+U drop zone |
 | `port_forward` | CMD+click localhost URLs and `ssh -L` commands, CMD+SHIFT+L |
 | `ports` | CMD+SHIFT+I ports list, new-port toasts and a right-status badge for ssh hosts |
 | `layout_repair` | CMD+SHIFT+= and refit after window resizes |
@@ -95,6 +97,8 @@ it. Unknown flags and skipped features are logged as `features:` warnings.
 | CMD+C / CMD+V (and SHIFT / CTRL variants) | Unified copy/paste. CTRL+C with no selection still sends ^C. CTRL+V pastes only in ssh panes; in local panes the raw key goes through, for Claude Code's image paste. Pasting an image in an ssh pane uploads it to the remote `~/.cache/clipimg/` and types the path |
 | Right-click a path in an ssh pane | Download the file or folder to `~/Downloads/<host>/` in the background over the ControlMaster (tar, so the remote only needs ssh and tar; never logs in, toasts if there is no live master), then reveal it in Finder. Toasts at start and end, with the size. A different item of the same name is kept and the new one numbered (`name (1).ext`); an identical one is reused. Unbound elsewhere. An app that grabs the mouse still gets the press but not the release |
 | `g m` in Yazi on an ssh host | Download the selected files and folders (or the hovered one) the same way. Yazi sets the `wez_download` user var, which WezTerm honours only in a local pane running ssh; at most 50 items per request. Inside tmux it uses passthrough: always on before tmux 3.3, turned on for that pane on 3.3+. Ships with `ssh-setup` (the keymap) |
+| `g o` in Yazi | Drag the selected files and folders (or the hovered one) out: a small floating window by the mouse shows them; drag it to Finder, the Desktop, Mail... It closes after the drop, on Esc or after 60 s idle. Local Yazi runs `wez-drag` itself; on an ssh host Yazi sets the `wez_drag_out` user var and WezTerm first copies the items over the live ControlMaster to `~/Library/Caches/wezterm/drag/<host>/` (never a new login; toasts if there is no live master; at most 50 items) |
+| `g i` in Yazi / CMD+SHIFT+U | Drop zone: a small window that takes files and folders dropped from Finder and copies them into Yazi's folder (`g i`, user var `wez_drag_in`) or the focused pane's cwd (CMD+SHIFT+U; an ssh pane's remote cwd from OSC 7, else the remote home). Over ssh each item goes as `tar` over the live ControlMaster. Nothing is overwritten: a taken name becomes `name (1).ext`. A toast reports the result |
 | CMD+W / CTRL+SHIFT+W | Close the pane. WezTerm's own confirm, shown over that pane only: y closes, n or Esc cancels (Enter does nothing). Skipped when the pane only runs an idle shell (bash, zsh, sh, fish, nu; tmux still asks) |
 | CMD+[ / CMD+] | Previous / next pane |
 | CMD+OPT+arrows | Focus pane in that direction |
