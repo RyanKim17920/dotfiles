@@ -19,6 +19,7 @@ local features = {
   media_reveal = true,     -- CMD+click a video/audio file reveals it in Finder (needs paths)
   pdf_preview = true,      -- CMD+click a PDF opens it in Preview (needs paths)
   downloads = true,        -- right-click a path in an ssh pane (or g m in remote Yazi) downloads it (needs paths)
+  drag = true,             -- Finder drag and drop: g o / g i in Yazi, CMD+SHIFT+U drop zone (wez-drag helper)
   port_forward = true,     -- CMD+click localhost URLs / ssh -L commands forwards the port; CMD+SHIFT+L
   ports = true,            -- CMD+SHIFT+I lists remote/local ports to forward or open; toasts new remote ports
   layout_repair = true,    -- CMD+SHIFT+= and window resizes refit panes that spill off the window
@@ -113,6 +114,7 @@ local ORDER = {
   'media_reveal',
   'pdf_preview',
   'downloads',
+  'drag',
   'port_forward',
   'ports',
   'layout_repair',
