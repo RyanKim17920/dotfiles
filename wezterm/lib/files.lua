@@ -284,6 +284,7 @@ local function download_note(d, kind, dest, info)
   if kind == 'opened' then return nil end -- preview_file: Preview shows it
   if kind == 'note' then return info end -- the copy wrote its own message
   if not DOWNLOAD_NOTES[kind] then
+    info = ssh_lib.refusal_note(info) or info
     return (d.area or 'Download') .. ' failed: ' .. d.what .. ((info or '') ~= '' and (': ' .. info) or '')
   end
   local dir, name = dest:match '^(.*)/([^/]*)$'

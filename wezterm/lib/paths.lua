@@ -480,11 +480,8 @@ local function resolve_remote(ssh, texts, rcwd, dirs, find)
   err = err or ''
   local why = err:match 'GATE: ([^\n]*)'
   if why then return nil, 'ssh: ' .. why end
-  -- sshd's MaxSessions (10 by default) caps the sessions on one connection
-  if err:find('refused', 1, true) then
-    return nil, 'ssh: ' .. ssh_host(ssh) .. ' refused one more session on the shared connection'
-      .. ' (sshd MaxSessions); close an ssh tab or pane to it'
-  end
+  local refused = ssh_lib.refusal_note(err, ssh)
+  if refused then return nil, refused end
   return nil, 'Path: not found on ' .. ssh_host(ssh) .. ': ' .. texts[#texts]
 end
 
