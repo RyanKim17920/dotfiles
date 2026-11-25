@@ -73,6 +73,16 @@ local function is_claude(info)
   return base(argv[1]) == 'node' and (argv[2] or ''):find('/claude', 1, true) ~= nil
 end
 
+-- Agent CLIs (claude, codex, opencode; also run as `node <cli>`), whose
+-- cwd is what the relative paths they print are under (features/paths.lua)
+local AGENTS = set_of 'claude codex opencode'
+local function is_agent(info)
+  local argv = info.argv or {}
+  local name = base(argv[1])
+  if name == 'node' or name == 'bun' then name = (base(argv[2]):gsub('%.[cm]?js$', '')) end
+  return AGENTS[name] == true or AGENTS[base(info.executable)] == true or is_claude(info)
+end
+
 local claude_session
 do
 -- Session id on a claude command line: --resume/-r <id>, --session-id <id>
@@ -167,7 +177,7 @@ end
 return {
   STATE_DIR = STATE_DIR, CLAUDE_DIR = CLAUDE_DIR, read_file = read_file, write_atomic = write_atomic,
   glob_quote = glob_quote, present = present, base = base, set_of = set_of, SHELLS = SHELLS,
-  is_idle_shell = is_idle_shell, is_claude = is_claude, claude_session = claude_session,
+  is_idle_shell = is_idle_shell, is_claude = is_claude, is_agent = is_agent, claude_session = claude_session,
   RESTORE_SHELL = RESTORE_SHELL, shell_args = shell_args, hib_json = hib_json, hib_store = hib_store,
   hibernated_session = hibernated_session,
 }
