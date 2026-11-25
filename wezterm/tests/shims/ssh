@@ -1,15 +1,31 @@
 #!/bin/sh
 # Fake ssh for tests/run.sh: logs its arguments, answers -G and -O check as
-# $WZT_ROOT/ssh-mode says (up, down, refuse) and runs the remote command
-# here with sh, never connecting anywhere
+# $WZT_ROOT/ssh-mode says (up, down, refuse, sockets) and runs the remote
+# command here with sh, never connecting anywhere. Modes combine
+# ("sockets refuse"). -G prints
+# $WZT_ROOT/ssh-G/<destination> when that file exists. In sockets mode a
+# master is live when the -S path exists as a file. -O forward/cancel only
+# talk to the master, so they succeed even in refuse mode (MaxSessions).
 printf ' %s \n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$FAKE_SSH_LOG"
-mode=$(cat "$WZT_ROOT/ssh-mode" 2>/dev/null)
+mode=" $(cat "$WZT_ROOT/ssh-mode" 2>/dev/null) "
+has() { case $mode in *" $1 "*) return 0 ;; esac; return 1; }
+sock= prev= last=
+for a; do
+  [ "$prev" = -S ] && sock=$a
+  prev=$a last=$a
+done
 case " $* " in
-  *' -G '*) echo "controlpath $WZT_ROOT/cm"; exit 0 ;;
+  *' -G '*)
+    [ -f "$WZT_ROOT/ssh-G/$last" ] && { cat "$WZT_ROOT/ssh-G/$last"; exit 0; }
+    echo "controlpath $WZT_ROOT/cm"; exit 0 ;;
   *' -O check '*)
-    [ "$mode" = down ] && { echo 'Control socket connect: No such file or directory' >&2; exit 255; }
+    if has down || { has sockets && [ ! -f "$sock" ]; }; then
+      echo 'Control socket connect: No such file or directory' >&2; exit 255
+    fi
     echo 'Master running (pid=4242)' >&2; exit 0 ;;
+  *' -O forward '* | *' -O cancel '*)
+    has sockets && [ ! -f "$sock" ] && exit 255
+    exit 0 ;;
 esac
-[ "$mode" = refuse ] && { echo 'mux_client_request_session: session request failed: Session open refused by peer' >&2; exit 255; }
-for last; do :; done
+has refuse && { echo 'mux_client_request_session: session request failed: Session open refused by peer' >&2; exit 255; }
 exec sh -c "$last"
