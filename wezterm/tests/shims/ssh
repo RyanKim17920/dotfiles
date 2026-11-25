@@ -1,0 +1,15 @@
+#!/bin/sh
+# Fake ssh for tests/run.sh: logs its arguments, answers -G and -O check as
+# $WZT_ROOT/ssh-mode says (up, down, refuse) and runs the remote command
+# here with sh, never connecting anywhere
+printf ' %s \n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$FAKE_SSH_LOG"
+mode=$(cat "$WZT_ROOT/ssh-mode" 2>/dev/null)
+case " $* " in
+  *' -G '*) echo "controlpath $WZT_ROOT/cm"; exit 0 ;;
+  *' -O check '*)
+    [ "$mode" = down ] && { echo 'Control socket connect: No such file or directory' >&2; exit 255; }
+    echo 'Master running (pid=4242)' >&2; exit 0 ;;
+esac
+[ "$mode" = refuse ] && { echo 'mux_client_request_session: session request failed: Session open refused by peer' >&2; exit 255; }
+for last; do :; done
+exec sh -c "$last"
