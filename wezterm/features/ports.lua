@@ -9,7 +9,7 @@
 -- POLL_SECONDS in the background, a port of yours that starts listening
 -- there toasts once, and the right status shows "⇄ N ports · CMD+SHIFT+I"
 -- (status text can't be clicked on 20240203; the key opens the list). Every remote call first asks the master (-O check) and
--- carries gated_args, so nothing here can prompt or authenticate.
+-- carries gated_args (lib/ssh.lua), so nothing here can prompt or authenticate.
 local wezterm = require 'wezterm'
 local act = wezterm.action
 local core = require 'lib.core'
@@ -18,33 +18,7 @@ local port_forward = require 'features.port_forward'
 local toast, mux_pane, sh_quote = core.toast, core.mux_pane, core.sh_quote
 local pane_ssh_args, ssh_cmd, ssh_host = ssh_lib.pane_ssh_args, ssh_lib.ssh_cmd, ssh_lib.ssh_host
 local ssh_master_pid = ssh_lib.ssh_master_pid
-
--- ControlPath ssh would use for the pane's host (ssh -G never connects), or
--- nil when it has none. Cached in wezterm.GLOBAL per argument list.
-local CONTROL_PATH_KEY = 'ssh_control_path_' -- .. args -> path, or '' for none
-local function control_path(ssh)
-  local key = CONTROL_PATH_KEY .. table.concat(ssh, ' ', 2)
-  local cached = wezterm.GLOBAL[key]
-  if cached then return cached ~= '' and cached or nil end
-  local ok, out = wezterm.run_child_process(ssh_cmd(ssh, '-G'))
-  if not ok then return nil end
-  local path = out:match '\ncontrolpath ([^\n]+)' or out:match '^controlpath ([^\n]+)'
-  if path == 'none' then path = nil end
-  wezterm.GLOBAL[key] = path or ''
-  return path
-end
-
--- Args like `ssh` that can only ever ride the master at `path`: ssh options
--- are first-wins, so these come before the pane's own. BatchMode never
--- prompts; ControlMaster=no never starts a master; ProxyCommand=false makes
--- a fallback direct connection (master died after the check) fail at once
--- instead of logging in; -S keeps the socket -O check just found live.
-local function gated_args(ssh, path)
-  local args = { ssh[1], '-o', 'BatchMode=yes', '-o', 'ControlMaster=no',
-    '-o', 'ProxyCommand=false', '-S', path }
-  for k = 2, #ssh do table.insert(args, ssh[k]) end
-  return args
-end
+local control_path, gated_args = ssh_lib.control_path, ssh_lib.gated_args
 
 local KEY, KEY_MODS, KEY_TEXT = 'i', 'CMD|SHIFT', 'CMD+SHIFT+I'
 local POLL_SECONDS = 10

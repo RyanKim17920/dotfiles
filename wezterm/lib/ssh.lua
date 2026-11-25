@@ -105,6 +105,55 @@ local function ssh_master_pid(ssh)
   return ok and ((err or ''):match 'pid=(%d+)' or '?') or nil
 end
 
+-- ControlPath ssh would use for `ssh` (a pane_ssh_args result; ssh -G never
+-- connects), or nil when it has none. Cached in wezterm.GLOBAL per argument
+-- list.
+local CONTROL_PATH_KEY = 'ssh_control_path_' -- .. args -> path, or '' for none
+local function control_path(ssh)
+  local key = CONTROL_PATH_KEY .. table.concat(ssh, ' ', 2)
+  local cached = wezterm.GLOBAL[key]
+  if cached then return cached ~= '' and cached or nil end
+  local ok, out = wezterm.run_child_process(ssh_cmd(ssh, '-G'))
+  if not ok then return nil end
+  local path = out:match '\ncontrolpath ([^\n]+)' or out:match '^controlpath ([^\n]+)'
+  if path == 'none' then path = nil end
+  wezterm.GLOBAL[key] = path or ''
+  return path
+end
+
+-- Args like `ssh` that can only ever ride the master at `path`: ssh options
+-- are first-wins, so these come before the pane's own. BatchMode never
+-- prompts; ControlMaster=no never starts a master; ProxyCommand=false makes
+-- a fallback direct connection (master died after the check) fail at once
+-- instead of logging in; -S keeps the socket -O check just found live. A -J
+-- is dropped: ssh refuses it next to ProxyCommand=false, and -S names the
+-- master anyway.
+local function gated_args(ssh, path)
+  local args = { ssh[1], '-o', 'BatchMode=yes', '-o', 'ControlMaster=no',
+    '-o', 'ProxyCommand=false', '-S', path }
+  local k = 2
+  while k <= #ssh do
+    if ssh[k] == '-J' then
+      k = k + 2
+    else
+      table.insert(args, ssh[k])
+      k = k + 1
+    end
+  end
+  return args
+end
+
+-- gated_args for the live ControlMaster of `ssh` and the master's pid, or
+-- nil. Asks ssh -G and the socket (-O check, gated) only: never connects.
+local function live_master(ssh)
+  local path = control_path(ssh)
+  if not path then return nil end
+  local gated = gated_args(ssh, path)
+  local pid = ssh_master_pid(gated)
+  if not pid then return nil end
+  return gated, pid
+end
+
 -- Shell functions for background scripts that must ride the pane's live
 -- ControlMaster and never cause a new login (one host uses Duo). Each takes
 -- the ssh args of a pane_ssh_args result without SSH_PANE (kept opts...,
@@ -168,5 +217,6 @@ return {
   RESTORE_TAG = RESTORE_TAG, ssh_split_args = ssh_split_args, info_ssh_args = info_ssh_args,
   pane_ssh_args = pane_ssh_args, ssh_cmd = ssh_cmd, ssh_batch_cmd = ssh_batch_cmd,
   ssh_master_pid = ssh_master_pid, ssh_host = ssh_host, MASTER_SH = MASTER_SH,
-  ssh_gated_cmd = ssh_gated_cmd,
+  ssh_gated_cmd = ssh_gated_cmd, control_path = control_path, gated_args = gated_args,
+  live_master = live_master,
 }
