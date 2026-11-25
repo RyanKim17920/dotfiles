@@ -8,6 +8,7 @@ local links = require 'lib.links'
 local toast, prompt_text, ICON = core.toast, core.prompt_text, core.ICON
 local SSH_OPTS_WITH_VALUE, SSH_PANE, ssh_split_args = ssh_lib.SSH_OPTS_WITH_VALUE, ssh_lib.SSH_PANE, ssh_lib.ssh_split_args
 local ssh_cmd, ssh_batch_cmd, ssh_master_pid = ssh_lib.ssh_cmd, ssh_lib.ssh_batch_cmd, ssh_lib.ssh_master_pid
+local live_master = ssh_lib.live_master
 local ssh_host, pane_ssh_args = ssh_lib.ssh_host, ssh_lib.pane_ssh_args
 local remote_word = paths.remote_word
 
@@ -48,8 +49,15 @@ local FORWARD_PORT_KEY = 'ssh_forward_port_' -- .. local port -> "args\ttarget\t
 local FORWARD_INDEX_KEY = 'ssh_forward_ports' -- " lport lport ... " with a FORWARD_PORT_KEY record
 local SCROLLBACK_LINES = 2000
 
--- { scheme, host, rport, rest } for a loopback http(s) URL, else nil
+-- { scheme, host, rport, rest } for a loopback http(s) URL, else nil. A
+-- link rule may have taken in a closing quote or paren from shell text like
+-- `(open 'http://localhost:8766/#otc=...')`: cut at a quote, drop unmatched
+-- closing parens.
 local function parse_loopback_url(uri)
+  uri = uri:gsub('[\'"`].*$', '')
+  while uri:sub(-1) == ')' and select(2, uri:gsub('%(', '')) < select(2, uri:gsub('%)', '')) do
+    uri = uri:sub(1, -2)
+  end
   local scheme, host, port, rest = uri:match '^(https?)://(%[::1%])(:?%d*)(.*)$'
   if not scheme then
     scheme, host, port, rest = uri:match '^(https?)://([^/:?#]+)(:?%d*)(.*)$'
@@ -98,10 +106,10 @@ local function collect_forwards(argv, first)
   return forwards
 end
 
--- Text holding `ssh ... -L ... dest` -> pane_ssh_args-style args and its
--- forwards, or nil. Quotes/backticks around words and trailing prose
--- punctuation are dropped.
-local function parse_ssh_text(text)
+-- Words of `text` from its first `ssh` word on (argv, index of `ssh`), or
+-- nil. Quotes/backticks/parens around words and trailing prose punctuation
+-- are dropped.
+local function ssh_words(text)
   local argv, first = {}, nil
   for w in text:gmatch '%S+' do
     w = w:gsub('^[`\'"(]+', ''):gsub('[`\'".,;)]+$', '')
@@ -110,34 +118,109 @@ local function parse_ssh_text(text)
       if not first and w:match '[^/]*$' == 'ssh' then first = #argv end
     end
   end
-  if not first then return nil end
+  return first and argv, first
+end
+
+-- Text holding `ssh ... -L ... dest` -> pane_ssh_args-style args and its
+-- forwards, or nil. Flags may be bundled (-fN -L, -NfL spec).
+local function parse_ssh_text(text)
+  local argv, first = ssh_words(text)
+  if not argv then return nil end
   local ssh, forwards = ssh_split_args(argv, first), collect_forwards(argv, first)
   if not ssh or #forwards == 0 then return nil end
   return ssh, forwards
 end
 
--- Tunnel commands ({ ssh, forwards }, oldest first), the last `cat <path
--- with "token">` and loopback URLs (parsed, oldest first) in the pane's
--- recent scrollback. Logical lines, so text soft-wrapped by the terminal
--- stays whole.
-local function scrollback_hints(pane)
-  local tunnels, token_path, urls = {}, nil, {}
-  local ok, text = pcall(pane.get_logical_lines_as_text, pane, SCROLLBACK_LINES)
-  for line in (ok and text or ''):gmatch '[^\n]+' do
-    local cmd = line:match '%f[%w]ssh%s.*'
-    if cmd and cmd:find('-', 1, true) then
-      local ssh, forwards = parse_ssh_text(cmd)
-      if ssh then table.insert(tunnels, { ssh = ssh, forwards = forwards }) end
-    end
-    for path in line:gmatch '%f[%w]cat%s+([^%s`\'"]+)' do
-      if path:lower():find('token', 1, true) then token_path = (path:gsub('[.,;:)]+$', '')) end
-    end
-    for u in line:gmatch 'https?://[^%s`\'"]+' do
-      local url = parse_loopback_url((u:gsub('[.,;:)]+$', '')))
-      if url then table.insert(urls, url) end
+-- Whether an `ssh ...` command looks cut short by a hard wrap (an agent's
+-- TUI breaks long lines itself): a -L whose spec is on the next line,
+-- forwards but no destination yet, or a quote left open.
+local function cut_short(cmd)
+  if cmd:match '%s%-%w*L%s*$' then return true end
+  local argv, first = ssh_words(cmd)
+  if argv and #collect_forwards(argv, first) > 0 and not ssh_split_args(argv, first) then return true end
+  return select(2, cmd:gsub("'", '')) % 2 == 1 or select(2, cmd:gsub('"', '')) % 2 == 1
+end
+
+local MAX_JOIN = 4 -- continuation lines a hard-wrapped command may take
+
+-- `cmd` (the ssh command starting on lines[i]) with the hard-wrapped
+-- continuation lines after it joined back on, and the index of its last
+-- line. Continuations lose their indent; a quoted URL split mid-word is
+-- joined without a space.
+local function join_wrapped(lines, i, cmd)
+  local j = i
+  while j < #lines and j - i < MAX_JOIN and cut_short(cmd) do
+    local more = lines[j + 1]:match '^%s*(.-)%s*$'
+    if more == '' then break end
+    j = j + 1
+    cmd = cmd:gsub('%s+$', '')
+    cmd = cmd .. (cmd:match '[\'"]https?://[^%s\'"]*$' and '' or ' ') .. more
+  end
+  return cmd, j
+end
+
+-- Loopback URLs in `text`, parsed, in order
+local function loopback_urls(text)
+  local urls = {}
+  for u in text:gmatch 'https?://[^%s`\'"]+' do
+    local url = parse_loopback_url((u:gsub('[.,;:)]+$', '')))
+    if url then table.insert(urls, url) end
+  end
+  return urls
+end
+
+-- The first of `urls` on the local port of one of `forwards`, or nil
+local function url_for(urls, forwards)
+  for _, u in ipairs(urls) do
+    for _, f in ipairs(forwards) do
+      if u.rport == f.lport then return u end
     end
   end
+  return nil
+end
+
+-- What lines of terminal text hint at: tunnel commands ({ ssh, forwards,
+-- url }, oldest first; url is a loopback URL for one of the forwards in the
+-- same command, like `ssh -fN -L ... && open 'http://localhost:...'`, or in
+-- the lines right after it, up to a blank one), the last `cat <path with
+-- "token">` and loopback URLs (parsed, oldest first).
+local function hints_from_lines(lines)
+  local tunnels, token_path, urls = {}, nil, {}
+  local i = 1
+  while i <= #lines do
+    local chunk, last = lines[i], i
+    local at = chunk:find '%f[%w]ssh%s'
+    if at and chunk:find('-', at, true) then
+      local cmd
+      cmd, last = join_wrapped(lines, i, chunk:sub(at))
+      chunk = chunk:sub(1, at - 1) .. cmd
+      local ssh, forwards = parse_ssh_text(cmd)
+      if ssh then
+        local t = { ssh = ssh, forwards = forwards, url = url_for(loopback_urls(cmd), forwards) }
+        -- Else a URL printed right after it (the rest of a wrapped line)
+        for k = last + 1, math.min(last + MAX_JOIN, #lines) do
+          if t.url or not lines[k]:find '%S' then break end
+          t.url = url_for(loopback_urls(lines[k]), forwards)
+        end
+        table.insert(tunnels, t)
+      end
+    end
+    for path in chunk:gmatch '%f[%w]cat%s+([^%s`\'"]+)' do
+      if path:lower():find('token', 1, true) then token_path = (path:gsub('[.,;:)]+$', '')) end
+    end
+    for _, url in ipairs(loopback_urls(chunk)) do table.insert(urls, url) end
+    i = last + 1
+  end
   return tunnels, token_path, urls
+end
+
+-- hints_from_lines for the pane's recent scrollback. Logical lines, so text
+-- soft-wrapped by the terminal stays whole.
+local function scrollback_hints(pane)
+  local ok, text = pcall(pane.get_logical_lines_as_text, pane, SCROLLBACK_LINES)
+  local lines = {}
+  for line in (ok and text or ''):gmatch '[^\n]+' do table.insert(lines, line) end
+  return hints_from_lines(lines)
 end
 
 -- Most recent tunnel forwarding local `port`: its args and forward
@@ -178,34 +261,39 @@ local function ssh_config_aliases()
   return aliases
 end
 
--- Args whose ControlMaster is live for the destination of `ssh`, and the
--- master's pid; nil if none. A hint may spell the host differently from the
--- alias that started the master (me@login.example.org vs myserver): with
--- ControlPath %C that is the same socket, but a per-alias ControlPath (e.g.
--- %r@%h:%p set only under `Host myserver`) is not, so config aliases
--- resolving to the same hostname/port (user too, if any alias matches it)
--- are tried as well.
+-- Gated args (lib/ssh.lua gated_args) for the live ControlMaster of the
+-- destination of `ssh`, and the master's pid; nil if none. A hint may spell
+-- the host differently from the alias that started the master
+-- (me@login.example.org vs myserver): with ControlPath %C that is the same
+-- socket, but a per-alias ControlPath (e.g. %r@%h:%p set only under `Host
+-- myserver`) is not, so config aliases that ssh -G resolves to the same
+-- hostname, port and user are tried as well. Only when the hint names no
+-- user (no user@, no -l) may an alias with another user stand in.
 local function find_master(ssh)
-  local pid = ssh_master_pid(ssh)
-  if pid then return ssh, pid end
+  local gated, pid = live_master(ssh)
+  if gated then return gated, pid end
   local host, user, port = ssh_identity(ssh)
   if not host then return nil end
+  local named_user = ssh[#ssh]:find('@', 1, true) ~= nil
+  for k = 2, #ssh - 1 do
+    if ssh[k] == '-l' then named_user = true end
+  end
   local loose = {}
   for _, alias in ipairs(ssh_config_aliases()) do
     local cand = { SSH_PANE, alias }
     local h, u, p = ssh_identity(cand)
     if h == host and p == port then
       if u == user then
-        pid = ssh_master_pid(cand)
-        if pid then return cand, pid end
-      else
+        gated, pid = live_master(cand)
+        if gated then return gated, pid end
+      elseif not named_user then
         table.insert(loose, cand)
       end
     end
   end
   for _, cand in ipairs(loose) do
-    pid = ssh_master_pid(cand)
-    if pid then return cand, pid end
+    gated, pid = live_master(cand)
+    if gated then return gated, pid end
   end
   return nil
 end
@@ -237,8 +325,12 @@ local function running_forwards(port, pid)
   return found
 end
 
+-- localhost and 127.0.0.1 name the same remote target
+local function norm_target(host) return host == 'localhost' and '127.0.0.1' or host end
+local function same_target(a, b) return norm_target(a) == norm_target(b) end
+
 local function forward_key(ssh, target, rport)
-  return FORWARD_KEY .. table.concat(ssh, ' ', 2) .. '|' .. target .. ':' .. rport
+  return FORWARD_KEY .. table.concat(ssh, ' ', 2) .. '|' .. norm_target(target) .. ':' .. rport
 end
 
 -- Add or drop local `port` in the index of recorded forwards
@@ -299,7 +391,7 @@ end
 -- message.
 local function ssh_forward(ssh, pid, target, rport, want, seen)
   want = want >= 1024 and want or 8000 + want
-  local function same(f) return f.host == target and f.rport == rport end
+  local function same(f) return same_target(f.host, target) and f.rport == rport end
   local note
   local lpid, lcmd = listener(want)
   if lpid then
@@ -465,6 +557,19 @@ local function remember_token_path(key, path)
   end
 end
 
+-- The window's panes other than `pane`, newest first
+local function other_panes(window, pane)
+  local others = {}
+  local ok, tabs = pcall(function() return window:mux_window():tabs() end)
+  for _, tab in ipairs(ok and tabs or {}) do
+    for _, p in ipairs(tab:panes()) do
+      if p:pane_id() ~= pane:pane_id() then table.insert(others, p) end
+    end
+  end
+  table.sort(others, function(a, b) return a:pane_id() > b:pane_id() end)
+  return others
+end
+
 -- Memoized finder for the token of the server on remote port `rport` behind
 -- master `ssh`, trying in order: `hint` (this pane's `cat` path), `cat`
 -- paths in the window's other panes (newest first), the remembered path for
@@ -485,15 +590,7 @@ local function token_finder(window, pane, ssh, rport, hint)
     end
     try(hint)
     if not token then
-      local others = {}
-      local ok, tabs = pcall(function() return window:mux_window():tabs() end)
-      for _, tab in ipairs(ok and tabs or {}) do
-        for _, p in ipairs(tab:panes()) do
-          if p:pane_id() ~= pane:pane_id() then table.insert(others, p) end
-        end
-      end
-      table.sort(others, function(a, b) return a:pane_id() > b:pane_id() end)
-      for _, p in ipairs(others) do
+      for _, p in ipairs(other_panes(window, pane)) do
         local _, path = scrollback_hints(p)
         try(path)
       end
@@ -530,13 +627,14 @@ local function latest_url(urls, port)
   return nil
 end
 
--- CMD+click on an `ssh ... -L ...` command: add its forwards
-local function forward_command(window, pane, text)
-  local ssh, forwards = parse_ssh_text(text)
-  if not ssh then
-    toast(window, 'Forward: no -L forward in that ssh command')
-    return
-  end
+-- Add the forwards of a tunnel command (`ssh`, `forwards`, as
+-- parse_ssh_text gives them) on the live master for its host, never running
+-- the command or logging in, then open one in the browser: `url` (the
+-- command's own, e.g. from `&& open '...#otc=...'`) if given, else the
+-- latest URL for a forwarded port in `pane`'s scrollback. The URL is opened
+-- as printed (path, query and fragment kept) with the local port swapped in
+-- when it had to change.
+local function forward_tunnel(window, pane, ssh, forwards, url)
   local master, pid = find_master(ssh)
   if not master then
     toast(window, no_master_msg(ssh), 5000)
@@ -548,23 +646,71 @@ local function forward_command(window, pane, text)
   for _, f in ipairs(forwards) do
     local lport, how, note = ssh_forward(master, pid, f.host, f.rport, f.lport, seen)
     table.insert(done, lport and describe_forward(master, lport, f.host, f.rport, how, note) or how)
-    -- Open one: the first forward with a URL in the scrollback, else the first
-    local url = lport and latest_url(urls, f.lport)
-    if lport and (not open_port or (url and not open_url)) then
-      open_url, open_port, open_rport = url, lport, f.rport
+    -- Open one: the first forward with a URL, else the first
+    local u = lport and ((url and url.rport == f.lport and url) or latest_url(urls, f.lport))
+    if lport and (not open_port or (u and not open_url)) then
+      open_url, open_port, open_rport = u, lport, f.rport
     end
   end
   local msg = 'Forward: ' .. table.concat(done, ' · ')
   if open_port then
     -- No URL printed: a findable token still gets in (Jupyter-style ?token=)
     local get_token = token_finder(window, pane, master, open_rport, token_path)
-    local url = open_url or parse_loopback_url('http://localhost:' .. open_port
+    local u = open_url or parse_loopback_url('http://localhost:' .. open_port
       .. (get_token() and '/?token=<token>' or '/'))
     local token_note
-    local opened = open_local(url, open_port, get_token, function(n) token_note = n end)
+    local opened = open_local(u, open_port, get_token, function(n) token_note = n end)
     msg = msg .. ' → opened ' .. opened .. (token_note and ('; ' .. token_note) or '')
   end
   toast(window, msg, 5000)
+end
+
+-- CMD+click on an `ssh ... -L ...` command (or one entered at CMD+SHIFT+L):
+-- add its forwards. A click on the first line of a hard-wrapped command gets
+-- no destination: the scrollback's newest whole command starting with the
+-- same -L is used.
+local function forward_command(window, pane, text)
+  local ssh, forwards = parse_ssh_text(text)
+  if not ssh then
+    local argv, first = ssh_words(text)
+    local want = argv and collect_forwards(argv, first)[1]
+    local tunnels = want and scrollback_hints(pane) or {}
+    for i = #tunnels, 1, -1 do
+      local f = tunnels[i].forwards[1]
+      if not ssh and f.lport == want.lport and f.host == want.host and f.rport == want.rport then
+        ssh, forwards = tunnels[i].ssh, tunnels[i].forwards
+      end
+    end
+  end
+  if not ssh then
+    toast(window, 'Forward: no -L forward and destination in that ssh command')
+    return
+  end
+  -- A whole line pasted at CMD+SHIFT+L may carry its URL
+  forward_tunnel(window, pane, ssh, forwards, url_for(loopback_urls(text), forwards))
+end
+
+-- Tunnel commands on screen (scrollback) in `pane`, then the window's other
+-- panes (newest first), newest first, one per destination and forwards:
+-- { ssh, forwards, url, pane }. For the CMD+SHIFT+I list.
+local function screen_tunnels(window, pane)
+  local list, seen = {}, {}
+  local panes = other_panes(window, pane)
+  table.insert(panes, 1, pane)
+  for _, p in ipairs(panes) do
+    local tunnels = scrollback_hints(p)
+    for i = #tunnels, 1, -1 do
+      local t = tunnels[i]
+      local key = ssh_host(t.ssh)
+      for _, f in ipairs(t.forwards) do key = key .. ' ' .. f.lport .. ':' .. f.host .. ':' .. f.rport end
+      if not seen[key] then
+        seen[key] = true
+        t.pane = p
+        table.insert(list, t)
+      end
+    end
+  end
+  return list
 end
 
 -- Forward for a loopback URL clicked in `pane` and open it; false when
@@ -620,6 +766,11 @@ local forward_prompt = act.PromptInputLine {
 local M = {
   ssh_forward = ssh_forward, cancel_forward = cancel_forward,
   recorded_forwards = recorded_forwards, describe_forward = describe_forward,
+  screen_tunnels = screen_tunnels, forward_tunnel = forward_tunnel,
+  -- for tests
+  _test = { parse_ssh_text = parse_ssh_text, hints_from_lines = hints_from_lines, find_master = find_master,
+    parse_loopback_url = parse_loopback_url, ssh_forward = ssh_forward, forward_tunnel = forward_tunnel,
+    forward_command = forward_command, same_target = same_target },
 }
 
 function M.apply(config)
@@ -631,6 +782,15 @@ function M.apply(config)
   table.insert(config.hyperlink_rules, {
     regex = [=[(?<![\w.-])(ssh\s+(?:[^\s`'";|&]+\s+)*?-\w*L\s*[^\s`'";|&]+(?:\s+[^\s`'";|&]+)*)]=],
     format = SSH_FORWARD_SCHEME .. '$1',
+    highlight = 1,
+  })
+
+  -- A quoted localhost URL (`open 'http://localhost:8766/#otc=...'`): the
+  -- whole URL, not the default rule's cut before a trailing _ or its take
+  -- of a closing quote and paren
+  table.insert(config.hyperlink_rules, {
+    regex = [=[['"](https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:[/?#][^\s'"`]*)?)['"]]=],
+    format = '$1',
     highlight = 1,
   })
 
