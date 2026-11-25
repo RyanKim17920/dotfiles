@@ -234,6 +234,22 @@ local function download_remote(window, ssh, paths)
   toast(window, 'Download: ' .. what .. ' to ~/Downloads/' .. sub .. '/', 4000)
 end
 
+-- Paths of a user var request from remote Yazi (g m, g o): "NONCE\n/abs/path\n..."
+-- (base64-decoded by WezTerm; the nonce makes a repeat request a change).
+-- Returns the absolute paths, deduplicated, and how many lines were not one.
+local function request_paths(value)
+  local paths, seen, bad = {}, {}, 0
+  for line in (value:match '^[^\n]*\n(.*)$' or ''):gmatch '[^\n]+' do
+    if line:sub(1, 1) ~= '/' or line:find '[\0\r]' then
+      bad = bad + 1
+    elseif not seen[line] then
+      seen[line] = true
+      table.insert(paths, line)
+    end
+  end
+  return paths, bad
+end
+
 -- 8 hex digits (FNV-1a) naming the cache folder of one remote path, so files
 -- with the same name in different remote folders don't overwrite each other
 local function short_hash(s)
@@ -266,6 +282,7 @@ end
 
 local function download_note(d, kind, dest, info)
   if kind == 'opened' then return nil end -- preview_file: Preview shows it
+  if kind == 'note' then return info end -- the copy wrote its own message
   if not DOWNLOAD_NOTES[kind] then
     return (d.area or 'Download') .. ' failed: ' .. d.what .. ((info or '') ~= '' and (': ' .. info) or '')
   end
@@ -316,4 +333,6 @@ return {
   file_cmd = file_cmd, reveal_local = reveal_local, quicklook_local = quicklook_local,
   reveal_remote = reveal_remote, quicklook_remote = quicklook_remote,
   download_remote = download_remote, preview_file = preview_file, enable_polling = enable_polling,
+  REMOTE_TAR = REMOTE_TAR, host_dir = host_dir, short_hash = short_hash, new_status = new_status,
+  track = track, request_paths = request_paths,
 }

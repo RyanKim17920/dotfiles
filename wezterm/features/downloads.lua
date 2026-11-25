@@ -17,21 +17,12 @@ local M = { needs = { 'paths' } }
 -- Most items one wez_download request may fetch (each is its own ssh + tar)
 local MAX_ITEMS = 50
 
--- user var wez_download = "NONCE\n/abs/path\n..." (base64-decoded by
--- WezTerm; the nonce makes a repeat request a change). Honoured only in a
+-- user var wez_download (see files.request_paths). Honoured only in a
 -- local pane running ssh: the paths are on that pane's host.
 local function on_download_request(window, pane, value)
   local ssh = pane_ssh_args(pane)
   if not ssh then return end
-  local paths, seen, bad = {}, {}, 0
-  for line in (value:match '^[^\n]*\n(.*)$' or ''):gmatch '[^\n]+' do
-    if line:sub(1, 1) ~= '/' or line:find '[\0\r]' then
-      bad = bad + 1
-    elseif not seen[line] then
-      seen[line] = true
-      table.insert(paths, line)
-    end
-  end
+  local paths, bad = files.request_paths(value)
   if bad > 0 then
     wezterm.log_warn('downloads: ignored ' .. bad .. ' invalid path(s) in wez_download')
   end
