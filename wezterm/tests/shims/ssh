@@ -6,18 +6,26 @@
 # $WZT_ROOT/ssh-G/<destination> when that file exists. In sockets mode a
 # master is live when the -S path exists as a file. -O forward/cancel only
 # talk to the master, so they succeed even in refuse mode (MaxSessions).
+# WezTerm's background master (a cm-wezbg socket) is never refused; its
+# start (-o ControlMaster=yes) creates the socket file in bgstart mode and
+# fails like a key-auth failure otherwise. %C expands to C.
 printf ' %s \n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$FAKE_SSH_LOG"
 mode=" $(cat "$WZT_ROOT/ssh-mode" 2>/dev/null) "
 has() { case $mode in *" $1 "*) return 0 ;; esac; return 1; }
-sock= prev= last=
+sock= cp= prev= last=
 for a; do
-  [ "$prev" = -S ] && sock=$a
+  [ "$prev" = -S ] && sock=$(printf '%s' "$a" | sed 's/%C/C/')
+  case $prev$a in -oControlPath=*) cp=$(printf '%s' "${a#ControlPath=}" | sed 's/%C/C/') ;; esac
   prev=$a last=$a
 done
 case " $* " in
   *' -G '*)
+    [ -n "$cp" ] && echo "controlpath $cp"
     [ -f "$WZT_ROOT/ssh-G/$last" ] && { cat "$WZT_ROOT/ssh-G/$last"; exit 0; }
     echo "controlpath $WZT_ROOT/cm"; exit 0 ;;
+  *' -o ControlMaster=yes '*)
+    has bgstart || { echo 'Permission denied (publickey).' >&2; exit 255; }
+    mkdir -p "$(dirname "$cp")" && : > "$cp"; exit 0 ;;
   *' -O check '*)
     if has down || { has sockets && [ ! -f "$sock" ]; }; then
       echo 'Control socket connect: No such file or directory' >&2; exit 255
@@ -27,5 +35,5 @@ case " $* " in
     has sockets && [ ! -f "$sock" ] && exit 255
     exit 0 ;;
 esac
-has refuse && { echo 'mux_client_request_session: session request failed: Session open refused by peer' >&2; exit 255; }
+case $sock in *wezbg*) ;; *) has refuse && { echo 'mux_client_request_session: session request failed: Session open refused by peer' >&2; exit 255; } ;; esac
 exec sh -c "$last"

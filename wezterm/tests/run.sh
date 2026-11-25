@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs tests/paths_test.lua and tests/forward_test.lua, each inside
+# Runs tests/paths_test.lua, forward_test.lua and ssh_bg_test.lua, each inside
 # `wezterm ls-fonts` under a fake HOME in a fresh /tmp/wz* dir, with
 # tests/shims (fake ssh, ps, readlink) first in PATH; prints the results and
 # exits 1 on any failure, Lua error or missing RESULT line.
@@ -13,7 +13,7 @@ mkdir -p "$root/proj/1673a7e7-252a-4127-a63b-ab96a4c32fc2/scratchpad/shot" "$roo
 : > "$root/proj/1673a7e7-252a-4127-a63b-ab96a4c32fc2/scratchpad/shot/pareto.png"
 : > "$root/agent-cwd/notes/plan.md"
 out=
-for t in paths_test forward_test; do
+for t in paths_test forward_test ssh_bg_test; do
   rm -f "$root/ssh-mode" "$root/ssh.log"
   out="$out
 $(HOME=$home WZT_ROOT=$root WZT_SHIMS=$here/shims WZT_SRC=$(dirname "$here") \
@@ -27,4 +27,4 @@ cfg=$(HOME=$home wezterm --config-file "$(dirname "$here")/wezterm.lua" ls-fonts
 $cfg"
 printf '%s\n' "$out" | grep -E '^(PASS|FAIL|RESULT)|ERROR'
 printf '%s\n' "$out" | grep -qE '^FAIL|ERROR' && exit 1
-[ "$(printf '%s\n' "$out" | grep -c '^RESULT')" -eq 2 ] || exit 1
+[ "$(printf '%s\n' "$out" | grep -c '^RESULT')" -eq 3 ] || exit 1
