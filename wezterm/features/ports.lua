@@ -82,7 +82,7 @@ printf '#proc %s\n' "$(id -u)"
 for f in /proc/net/tcp /proc/net/tcp6; do [ -r "$f" ] && cat "$f"; done
 find /proc/[0-9]*/fd -maxdepth 1 -lname 'socket:*' -printf '%h %l\n' 2>/dev/null |
 while read -r h l; do
-  p=${h#/proc/}; p=${p%/fd}; i=${l#socket:[}; i=${i%]}
+  p=${h#/proc/}; p=${p%/fd}; i=${l#"socket:["}; i=${i%]}
   printf '#sock %s %s %s\n' "$i" "$p" "$(cat "/proc/$p/comm" 2>/dev/null)"
 done
 exit 0
