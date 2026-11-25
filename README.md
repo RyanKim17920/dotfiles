@@ -44,6 +44,20 @@ A feature that is off leaves WezTerm's defaults for its keys. The click
 add-ons (`finder_reveal` to `downloads`) need `paths` and are skipped without
 it. Unknown flags and skipped features are logged as `features:` warnings.
 
+`local.lua` also takes `ssh_bg_hosts`, a list of ssh aliases (as you type
+them) whose WezTerm remote commands (path clicks, downloads, previews, drag)
+use a separate background ControlMaster that WezTerm keeps for itself
+(`~/.ssh/cm-wezbg-%C`), so many ssh tabs to one host no longer exhaust its
+`MaxSessions` for them. WezTerm starts that master with `BatchMode=yes`
+(key auth only, never a prompt or 2FA push), at most once a minute per host
+and less often after failures; until it is up, the tabs' own master is used.
+Hosts behind Duo or that prefer keyboard-interactive/password auth are always
+refused. Port forwards stay on the tabs' master.
+
+```lua
+return { ssh_bg_hosts = { 'myhost' } }
+```
+
 | Flag | Feature |
 | --- | --- |
 | `tab_bar` | Catppuccin retro tab bar (number, icon, name / ssh host / cwd) and pickers |
