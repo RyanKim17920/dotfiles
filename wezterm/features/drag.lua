@@ -180,7 +180,8 @@ end
 -- and `what` name a failure in its toast
 local function run(window, mode, area, what, args, ssh)
   local status = files.new_status()
-  local cmd = { '/usr/bin/env', 'PATH=' .. core.SPAWN_PATH, '/bin/sh', '-c', DRAG_SCRIPT, 'sh', mode, status, HELPER }
+  local cmd = ssh and ssh_lib.master_env(ssh) or { '/usr/bin/env', 'PATH=' .. core.SPAWN_PATH }
+  for _, a in ipairs { '/bin/sh', '-c', DRAG_SCRIPT, 'sh', mode, status, HELPER } do table.insert(cmd, a) end
   for _, a in ipairs(args) do table.insert(cmd, a) end
   for k = 2, #(ssh or {}) do table.insert(cmd, ssh[k]) end
   wezterm.background_child_process(cmd)
