@@ -3,3 +3,4 @@
 *.swp
 *~
 wezterm/local.lua
+macos/wez-drag/wez-drag
