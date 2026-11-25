@@ -20,6 +20,7 @@ local features = {
   pdf_preview = true,      -- CMD+click a PDF opens it in Preview (needs paths)
   downloads = true,        -- right-click a path in an ssh pane (or g m in remote Yazi) downloads it (needs paths)
   port_forward = true,     -- CMD+click localhost URLs / ssh -L commands forwards the port; CMD+SHIFT+L
+  ports = true,            -- CMD+SHIFT+I lists remote/local ports to forward or open; toasts new remote ports
   layout_repair = true,    -- CMD+SHIFT+= and window resizes refit panes that spill off the window
   fullscreen_refit = true, -- refit a fullscreen window after a monitor is unplugged
   pane_moves = true,       -- CMD+OPT+T/N/1..9 move panes, CMD+SHIFT+M merges windows
@@ -113,6 +114,7 @@ local ORDER = {
   'pdf_preview',
   'downloads',
   'port_forward',
+  'ports',
   'layout_repair',
   'fullscreen_refit',
   'pane_moves',
