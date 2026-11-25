@@ -17,6 +17,7 @@ local layout = require 'lib.layout'
 local paths = require 'lib.paths'
 local files = require 'lib.files'
 local links = require 'lib.links'
+local agent_lib = require 'lib.agent'
 local toast, mux_pane, cli, is_dir, pane_cwd = core.toast, core.mux_pane, core.cli, core.is_dir, core.pane_cwd
 local peek_record, set_peek_record = core.peek_record, core.set_peek_record
 local YAZI, YAZI_PATH, with_editor = core.YAZI, core.YAZI_PATH, core.with_editor
@@ -25,6 +26,7 @@ local SSH_PANE, pane_ssh_args = ssh_lib.SSH_PANE, ssh_lib.pane_ssh_args
 local split_fits, tab_geometry = layout.split_fits, layout.tab_geometry
 local PEEK_SCHEME, uri_to_path, resolve_path = paths.PEEK_SCHEME, paths.uri_to_path, paths.resolve_path
 local click_line, remote_cwd, resolve_remote = paths.click_line, paths.remote_cwd, paths.resolve_remote
+local find_spec, find_local = paths.find_spec, paths.find_local
 local path_candidates, search_dirs, remember_dir = paths.path_candidates, paths.search_dirs, paths.remember_dir
 local reveal_local, quicklook_local, preview_file = files.reveal_local, files.quicklook_local, files.preview_file
 local reveal_remote, quicklook_remote, download_remote = files.reveal_remote, files.quicklook_remote, files.download_remote
@@ -32,6 +34,12 @@ local reveal_remote, quicklook_remote, download_remote = files.reveal_remote, fi
 -- Narrowest clicked pane (columns) whose right half is still a useful peek;
 -- a narrower one gets the peek in a new tab instead
 local PEEK_MIN_COLS = 80
+
+-- cwd of the agent CLI (claude, codex, opencode) a local pane runs, or nil
+local function agent_cwd(pane)
+  local info = pane:get_foreground_process_info()
+  return info and agent_lib.is_agent(info) and info.cwd or nil
+end
 
 -- Back to the pane the peek was opened from (and its tab), zoomed again if
 -- it was before
@@ -157,29 +165,26 @@ local function open_path(window, pane, uri, click, ctx)
   local text, host = uri_to_path(uri)
   if not text then return end -- web URL etc.: default opener
   local custom = uri:sub(1, #PEEK_SCHEME) == PEEK_SCHEME
+  local relative = custom and text:sub(1, 1) ~= '/' and text:sub(1, 1) ~= '~'
   -- Directories besides the cwd that a relative path may be in (see
-  -- search_dirs), keyed by host so recent clicks on one don't leak to another
+  -- search_dirs), keyed by host so recent clicks on one don't leak to
+  -- another, and a find for it as the last resort (find_spec)
   local host_key = ssh and ('ssh ' .. table.concat(ssh, ' ', 2)) or 'local'
-  local dirs = {}
-  if custom and text:sub(1, 1) ~= '/' and text:sub(1, 1) ~= '~' then dirs = search_dirs(pane, text, host_key) end
+  local dirs = relative and search_dirs(pane, text, host_key) or {}
+  local find = relative and find_spec(text) or nil
+  -- The longer spellings with spaces or across a hard wrap (see
+  -- path_candidates), then the clicked text: the first that exists wins,
+  -- so the longest one beats the clicked piece even when that exists
+  local texts = custom and path_candidates(pane, text) or {}
+  table.insert(texts, text)
 
   if ssh then
-    -- The longer spellings (see path_candidates) and the clicked text, in
-    -- one round trip; the first that exists wins
-    local texts, wrapped = {}, false
-    if custom then texts, wrapped = path_candidates(pane, text) end
-    table.insert(texts, text)
-    local kind, path, which = resolve_remote(ssh, texts, remote_cwd(pane), dirs)
-    if which and which < #texts then
-      text = texts[which]
-    elseif kind == 'd' and wrapped then
-      toast(window, "Path: couldn't resolve wrapped path: " .. text)
-      return false
-    end
+    local kind, path, which = resolve_remote(ssh, texts, remote_cwd(pane), dirs, find)
     if not kind then
       toast(window, path)
       return false
     end
+    text = texts[which]
     remember_dir(host_key, path, kind == 'd')
     if download then
       download_remote(window, ssh, { path })
@@ -195,27 +200,21 @@ local function open_path(window, pane, uri, click, ctx)
     return false
   end
   -- Outside ssh a file:// host is this Mac under some name (OSC 7 / ls
-  -- --hyperlink use the DHCP name, which changes): use the path if it exists
-  local cwd = pane_cwd(pane)
-  local path = pane:get_domain_name() == 'local' and resolve_path(text, cwd, dirs)
-  if custom and path ~= false then
-    -- The longest existing spelling with spaces or across a wrap (see
-    -- path_candidates) beats the clicked piece, even one that exists
-    local cands, wrapped = path_candidates(pane, text)
-    local full
-    for _, c in ipairs(cands) do
-      full = resolve_path(c, cwd, dirs)
-      if full then
+  -- --hyperlink use the DHCP name, which changes): use the path if it
+  -- exists. A relative one is also looked for under the cwd of an agent CLI
+  -- running in the pane, right after the pane's own (OSC 7) cwd.
+  local path
+  if pane:get_domain_name() == 'local' then
+    local cwd, agent = pane_cwd(pane), agent_cwd(pane)
+    if relative and agent and agent ~= cwd then table.insert(dirs, 1, agent) end
+    for _, c in ipairs(texts) do
+      path = resolve_path(c, cwd, dirs)
+      if path then
         text = c
         break
       end
     end
-    if full then
-      path = full
-    elseif path and is_dir(path) and wrapped then
-      toast(window, "Path: couldn't resolve wrapped path: " .. text)
-      return false
-    end
+    if not path and find then path = find_local(find, { cwd, agent or '' }) end
   end
   if not path then
     if custom then
